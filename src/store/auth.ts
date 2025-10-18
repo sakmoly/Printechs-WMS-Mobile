@@ -40,6 +40,22 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   login: async (credentials) => {
     set({ isLoading: true, error: null });
 
+    // Update HTTP client with server configuration before login
+    const currentConfig = get().serverConfig;
+    if (currentConfig.serverUrl || (currentConfig.hostname && currentConfig.port)) {
+      let serverUrl: string;
+      if (currentConfig.serverUrl) {
+        serverUrl = currentConfig.serverUrl;
+      } else {
+        const protocol = currentConfig.isHttps ? "https" : "http";
+        serverUrl = `${protocol}://${currentConfig.hostname}:${currentConfig.port}`;
+      }
+      
+      // Import http dynamically to avoid circular dependency
+      const { http } = await import("../api/http");
+      http.setBaseUrl(serverUrl);
+    }
+
     const result = await authApi.login(credentials);
 
     if (result.success) {
@@ -75,9 +91,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   updateServerConfig: async (config: Partial<ServerConfig>) => {
     const currentConfig = get().serverConfig;
     const newConfig = { ...currentConfig, ...config };
-    
+
     set({ serverConfig: newConfig });
-    
+
     try {
       await AsyncStorage.setItem("serverConfig", JSON.stringify(newConfig));
     } catch (error) {

@@ -1,5 +1,12 @@
 import React, { useState } from "react";
-import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Alert,
+  ScrollView,
+} from "react-native";
 import { router } from "expo-router";
 import { useAuthStore } from "../../src/store/auth";
 import { Ionicons } from "@expo/vector-icons";
@@ -66,7 +73,7 @@ export default function SettingsScreen() {
           </Text>
         </View>
 
-        <TouchableOpacity 
+        <TouchableOpacity
           style={styles.editButton}
           onPress={() => setShowServerConfig(!showServerConfig)}
         >

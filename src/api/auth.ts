@@ -2,7 +2,6 @@ import { http } from "./http";
 import { storage } from "./storage";
 import { LoginResponseSchema } from "./schemas";
 import { USE_MOCK_DATA } from "./mock";
-import { useAuthStore } from "../store/auth";
 
 export interface LoginCredentials {
   usr: string;
@@ -42,20 +41,8 @@ export const authApi = {
         return { success: true, data: mockResponse };
       }
 
-      // Get server configuration
-      const serverConfig = useAuthStore.getState().serverConfig;
-      
-      // Build the full server URL
-      let serverUrl: string;
-      if (serverConfig.serverUrl) {
-        serverUrl = serverConfig.serverUrl;
-      } else {
-        const protocol = serverConfig.isHttps ? "https" : "http";
-        serverUrl = `${protocol}://${serverConfig.hostname}:${serverConfig.port}`;
-      }
-
-      // Update HTTP client base URL
-      http.setBaseUrl(serverUrl);
+      // For now, use the environment base URL
+      // The server configuration will be handled by the store
 
       const response = await http.post<any>("/api/method/login", {
         usr: credentials.usr,

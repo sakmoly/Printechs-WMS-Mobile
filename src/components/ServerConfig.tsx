@@ -61,7 +61,9 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
       return serverUrl || "No server configured";
     } else {
       const protocol = isHttps ? "https" : "http";
-      return hostname && port ? `${protocol}://${hostname}:${port}` : "No server configured";
+      return hostname && port
+        ? `${protocol}://${hostname}:${port}`
+        : "No server configured";
     }
   };
 
@@ -75,7 +77,9 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
       <View style={styles.switchContainer}>
         <Text style={styles.switchLabel}>Configuration Mode:</Text>
         <View style={styles.switchRow}>
-          <Text style={[styles.switchText, isUrlMode && styles.activeSwitchText]}>
+          <Text
+            style={[styles.switchText, isUrlMode && styles.activeSwitchText]}
+          >
             URL
           </Text>
           <Switch
@@ -84,7 +88,9 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
             trackColor={{ false: "#e5e7eb", true: "#667eea" }}
             thumbColor="#ffffff"
           />
-          <Text style={[styles.switchText, !isUrlMode && styles.activeSwitchText]}>
+          <Text
+            style={[styles.switchText, !isUrlMode && styles.activeSwitchText]}
+          >
             Hostname
           </Text>
         </View>
@@ -146,7 +152,9 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
 
       <View style={styles.currentServer}>
         <Text style={styles.currentServerLabel}>Current Server:</Text>
-        <Text style={styles.currentServerValue}>{getCurrentServerDisplay()}</Text>
+        <Text style={styles.currentServerValue}>
+          {getCurrentServerDisplay()}
+        </Text>
       </View>
 
       <TouchableOpacity style={styles.saveButton} onPress={handleSave}>
