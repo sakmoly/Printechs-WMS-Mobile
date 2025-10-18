@@ -12,7 +12,7 @@ export type Env = z.infer<typeof envSchema>;
 const getRawEnv = (): Record<string, string | undefined> => {
   // TODO: Replace with your ERPNext instance URL
   return {
-    ERP_BASE_URL: "https://demo.erpnext.com",
+    ERP_BASE_URL: "https://printechs.com",
     BUILD_VARIANT: "dev",
   };
 };
