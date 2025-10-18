@@ -32,13 +32,7 @@ export default function SettingsScreen() {
   };
 
   const getCurrentServerDisplay = () => {
-    if (serverConfig.serverUrl) {
-      return serverConfig.serverUrl;
-    } else if (serverConfig.hostname && serverConfig.port) {
-      const protocol = serverConfig.isHttps ? "https" : "http";
-      return `${protocol}://${serverConfig.hostname}:${serverConfig.port}`;
-    }
-    return "No server configured";
+    return serverConfig.serverUrl || "No server configured";
   };
 
   return (

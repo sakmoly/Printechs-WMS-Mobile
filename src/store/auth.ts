@@ -42,18 +42,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     // Update HTTP client with server configuration before login
     const currentConfig = get().serverConfig;
-    if (currentConfig.serverUrl || (currentConfig.hostname && currentConfig.port)) {
-      let serverUrl: string;
-      if (currentConfig.serverUrl) {
-        serverUrl = currentConfig.serverUrl;
-      } else {
-        const protocol = currentConfig.isHttps ? "https" : "http";
-        serverUrl = `${protocol}://${currentConfig.hostname}:${currentConfig.port}`;
-      }
-      
+    if (currentConfig.serverUrl) {
       // Import http dynamically to avoid circular dependency
       const { http } = await import("../api/http");
-      http.setBaseUrl(serverUrl);
+      http.setBaseUrl(currentConfig.serverUrl);
     }
 
     const result = await authApi.login(credentials);

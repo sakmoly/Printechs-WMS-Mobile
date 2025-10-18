@@ -27,9 +27,7 @@ export default function LoginScreen() {
     }
 
     // Check if server is configured
-    const hasServerConfig =
-      serverConfig.serverUrl || (serverConfig.hostname && serverConfig.port);
-    if (!hasServerConfig) {
+    if (!serverConfig.serverUrl) {
       Alert.alert(
         "Server Not Configured",
         "Please configure your ERPNext server in Settings before logging in."
@@ -48,13 +46,7 @@ export default function LoginScreen() {
   };
 
   const getServerDisplay = () => {
-    if (serverConfig.serverUrl) {
-      return serverConfig.serverUrl;
-    } else if (serverConfig.hostname && serverConfig.port) {
-      const protocol = serverConfig.isHttps ? "https" : "http";
-      return `${protocol}://${serverConfig.hostname}:${serverConfig.port}`;
-    }
-    return "No server configured";
+    return serverConfig.serverUrl || "No server configured";
   };
 
   return (
