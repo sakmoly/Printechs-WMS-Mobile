@@ -33,9 +33,12 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
 
     // Basic URL validation
     const trimmedUrl = serverUrl.trim();
-    if (!trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) {
+    if (
+      !trimmedUrl.startsWith("http://") &&
+      !trimmedUrl.startsWith("https://")
+    ) {
       Alert.alert(
-        "Invalid URL", 
+        "Invalid URL",
         "URL must start with http:// or https://\n\nExamples:\n• https://erp.example.com\n• http://192.168.1.100:8000"
       );
       return;
@@ -45,9 +48,9 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
       serverUrl: trimmedUrl,
       hostname: "",
       port: 0,
-      isHttps: trimmedUrl.startsWith('https://'),
+      isHttps: trimmedUrl.startsWith("https://"),
     });
-    
+
     Alert.alert("Success", "Server configuration saved successfully!");
     onSave?.();
   };
@@ -65,9 +68,14 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
           </View>
 
           <View style={styles.infoCard}>
-            <Ionicons name="information-circle-outline" size={20} color="#667eea" />
+            <Ionicons
+              name="information-circle-outline"
+              size={20}
+              color="#667eea"
+            />
             <Text style={styles.infoText}>
-              Enter your complete ERPNext server URL. Include port number if needed.
+              Enter your complete ERPNext server URL. Include port number if
+              needed.
             </Text>
           </View>
 
@@ -84,10 +92,8 @@ export const ServerConfig: React.FC<ServerConfigProps> = ({ onSave }) => {
               autoCorrect={false}
             />
             <Text style={styles.helpText}>
-              Examples:{"\n"}
-              • https://erp.example.com{"\n"}
-              • https://erp.example.com:443{"\n"}
-              • http://192.168.1.100:8000
+              Examples:{"\n"}• https://erp.example.com{"\n"}•
+              https://erp.example.com:443{"\n"}• http://192.168.1.100:8000
             </Text>
           </View>
 

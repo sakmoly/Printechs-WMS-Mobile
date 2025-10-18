@@ -8,16 +8,20 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  Modal,
+  ScrollView,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
 import { useAuthStore } from "../../src/store/auth";
 import { Ionicons } from "@expo/vector-icons";
+import { ServerConfig } from "../../src/components/ServerConfig";
 
 export default function LoginScreen() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [showServerConfig, setShowServerConfig] = useState(false);
   const { login, isLoading, error, clearError, serverConfig } = useAuthStore();
 
   const handleLogin = async () => {
@@ -147,10 +151,21 @@ export default function LoginScreen() {
               </TouchableOpacity>
 
               {/* Server Info */}
-              <View style={styles.serverContainer}>
-                <Text style={styles.serverLabel}>Connected to:</Text>
-                <Text style={styles.serverText}>{getServerDisplay()}</Text>
-              </View>
+              <TouchableOpacity
+                style={styles.serverContainer}
+                onPress={() => setShowServerConfig(true)}
+              >
+                <View style={styles.serverInfo}>
+                  <Ionicons name="server-outline" size={16} color="#667eea" />
+                  <View style={styles.serverTextContainer}>
+                    <Text style={styles.serverLabel}>Server:</Text>
+                    <Text style={styles.serverText} numberOfLines={1}>
+                      {getServerDisplay()}
+                    </Text>
+                  </View>
+                </View>
+                <Ionicons name="settings-outline" size={20} color="#667eea" />
+              </TouchableOpacity>
 
               {/* Demo Credentials */}
               <View style={styles.demoContainer}>
@@ -163,6 +178,29 @@ export default function LoginScreen() {
           <Text style={styles.footer}>Powered by Printechs</Text>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Server Configuration Modal */}
+      <Modal
+        visible={showServerConfig}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowServerConfig(false)}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Server Configuration</Text>
+            <TouchableOpacity
+              onPress={() => setShowServerConfig(false)}
+              style={styles.closeButton}
+            >
+              <Ionicons name="close" size={28} color="#374151" />
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.modalContent}>
+            <ServerConfig onSave={() => setShowServerConfig(false)} />
+          </ScrollView>
+        </View>
+      </Modal>
     </LinearGradient>
   );
 }
@@ -266,13 +304,26 @@ const styles = StyleSheet.create({
   },
   serverContainer: {
     marginTop: 16,
+    flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     backgroundColor: "#f3f4f6",
     borderRadius: 8,
     padding: 12,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  serverInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    gap: 8,
+  },
+  serverTextContainer: {
+    flex: 1,
   },
   serverLabel: {
-    fontSize: 12,
+    fontSize: 11,
     color: "#6b7280",
     fontWeight: "600",
   },
@@ -295,5 +346,29 @@ const styles = StyleSheet.create({
     color: "rgba(255, 255, 255, 0.8)",
     fontSize: 14,
     marginBottom: 20,
+  },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: "#f9fafb",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 16,
+    backgroundColor: "#ffffff",
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e7eb",
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#1f2937",
+  },
+  closeButton: {
+    padding: 4,
+  },
+  modalContent: {
+    flex: 1,
   },
 });
