@@ -90,7 +90,11 @@ export const erpApi = {
       console.log("API Response:", JSON.stringify(response, null, 2));
       console.log("Response Message:", response.message);
 
-      const parsed = KpiResponseSchema.parse(response.message || response);
+      // Handle nested message structure from API
+      const apiData = response.message?.message || response.message || response;
+      console.log("Extracted API Data:", JSON.stringify(apiData, null, 2));
+      
+      const parsed = KpiResponseSchema.parse(apiData);
       console.log("Parsed Data:", JSON.stringify(parsed, null, 2));
       return parsed;
     } catch (error) {
