@@ -38,14 +38,38 @@ export default function DashboardScreen() {
   }
 
   if (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    const isNetworkError = errorMessage.includes("Network Error") || errorMessage.includes("timeout");
+    
     return (
       <View style={styles.errorContainer}>
         <Ionicons name="alert-circle" size={64} color="#ef4444" />
-        <Text style={styles.errorTitle}>Failed to load dashboard</Text>
-        <Text style={styles.errorMessage}>
-          {error instanceof Error ? error.message : "Please try again"}
-        </Text>
+        <Text style={styles.errorTitle}>Failed to Load Dashboard</Text>
+        <Text style={styles.errorMessage}>{errorMessage}</Text>
+        
+        {isNetworkError && (
+          <View style={styles.troubleshootCard}>
+            <Ionicons name="bulb-outline" size={20} color="#f59e0b" />
+            <View style={styles.troubleshootContent}>
+              <Text style={styles.troubleshootTitle}>Troubleshooting Tips:</Text>
+              <Text style={styles.troubleshootItem}>
+                • Check your server URL in Settings
+              </Text>
+              <Text style={styles.troubleshootItem}>
+                • Ensure your ERPNext server is running
+              </Text>
+              <Text style={styles.troubleshootItem}>
+                • Verify your device has internet access
+              </Text>
+              <Text style={styles.troubleshootItem}>
+                • Try logging out and back in
+              </Text>
+            </View>
+          </View>
+        )}
+        
         <TouchableOpacity style={styles.retryButton} onPress={() => refetch()}>
+          <Ionicons name="refresh-outline" size={20} color="#ffffff" />
           <Text style={styles.retryButtonText}>Retry</Text>
         </TouchableOpacity>
       </View>
@@ -174,11 +198,39 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginBottom: 24,
   },
+  troubleshootCard: {
+    backgroundColor: "#fffbeb",
+    borderRadius: 12,
+    padding: 16,
+    marginVertical: 16,
+    maxWidth: "100%",
+    borderWidth: 1,
+    borderColor: "#fde68a",
+  },
+  troubleshootContent: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  troubleshootTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#92400e",
+    marginBottom: 8,
+  },
+  troubleshootItem: {
+    fontSize: 13,
+    color: "#78350f",
+    marginBottom: 4,
+    lineHeight: 18,
+  },
   retryButton: {
     backgroundColor: "#667eea",
     paddingHorizontal: 32,
     paddingVertical: 12,
     borderRadius: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   retryButtonText: {
     color: "#ffffff",
