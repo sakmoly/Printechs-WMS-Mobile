@@ -14,7 +14,7 @@ export const SalesChart: React.FC<SalesChartProps> = ({
   data,
   title = "Sales Trend",
 }) => {
-  const values = data.map((d) => d.v);
+  const values = data.map((d: DataPoint) => d.v);
 
   return (
     <View style={styles.container}>
@@ -24,7 +24,7 @@ export const SalesChart: React.FC<SalesChartProps> = ({
         {values.length > 0 ? (
           <LineChart
             data={{
-              labels: data.map((_, index) => `${index + 1}`),
+              labels: data.map((_: DataPoint, index: number) => `${index + 1}`),
               datasets: [
                 {
                   data: values,
@@ -71,7 +71,7 @@ export const SalesChart: React.FC<SalesChartProps> = ({
             <Text style={styles.statLabel}>Avg</Text>
             <Text style={styles.statValue}>
               {Math.round(
-                values.reduce((a, b) => a + b, 0) / values.length
+                values.reduce((a: number, b: number) => a + b, 0) / values.length
               ).toLocaleString()}
             </Text>
           </View>
