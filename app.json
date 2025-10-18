@@ -42,8 +42,11 @@
     "scheme": "erpnext",
     "plugins": ["expo-router", "expo-secure-store"],
     "extra": {
+      "router": {
+        "origin": false
+      },
       "eas": {
-        "projectId": "your-project-id-here"
+        "projectId": "4b7ff664-d43c-40ba-844e-d3a910e45c8f"
       }
     }
   }

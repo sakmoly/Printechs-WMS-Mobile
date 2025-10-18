@@ -1,7 +1,6 @@
 import React from "react";
 import { View, Text, StyleSheet, Dimensions } from "react-native";
-import { LineChart } from "react-native-svg-charts";
-import * as shape from "d3-shape";
+import { LineChart } from "react-native-chart-kit";
 import { DataPoint } from "../api/schemas";
 
 interface SalesChartProps {
@@ -24,15 +23,35 @@ export const SalesChart: React.FC<SalesChartProps> = ({
       <View style={styles.chartContainer}>
         {values.length > 0 ? (
           <LineChart
-            style={styles.chart}
-            data={values}
-            svg={{
-              stroke: "#667eea",
-              strokeWidth: 3,
+            data={{
+              labels: data.map((_, index) => `${index + 1}`),
+              datasets: [
+                {
+                  data: values,
+                  strokeWidth: 3,
+                },
+              ],
             }}
-            contentInset={{ top: 20, bottom: 20, left: 10, right: 10 }}
-            curve={shape.curveNatural}
-          ></LineChart>
+            width={width - 80}
+            height={180}
+            chartConfig={{
+              backgroundColor: "#ffffff",
+              backgroundGradientFrom: "#ffffff",
+              backgroundGradientTo: "#ffffff",
+              decimalPlaces: 0,
+              color: (opacity = 1) => `rgba(102, 126, 234, ${opacity})`,
+              labelColor: (opacity = 1) => `rgba(107, 114, 128, ${opacity})`,
+              style: {
+                borderRadius: 16,
+              },
+              propsForDots: {
+                r: "4",
+                strokeWidth: "2",
+                stroke: "#667eea",
+              },
+            }}
+            style={styles.chart}
+          />
         ) : (
           <View style={styles.emptyState}>
             <Text style={styles.emptyText}>No data available</Text>
