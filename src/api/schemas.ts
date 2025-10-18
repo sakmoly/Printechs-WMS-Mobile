@@ -27,10 +27,14 @@ export const EmployeeDetailSchema = z.object({
 // KPI schemas
 export const KpiCardSchema = z.object({
   id: z.string(),
-  label: z.string(),
-  value: z.number(),
-  delta: z.number().nullable(),
-  format: z.enum(["currency", "number", "percentage"]).optional(),
+  title: z.string(),
+  value: z.number().nullable(),
+  currency: z.string().optional(),
+  unit: z.string().optional(),
+  change_percentage: z.number().optional(),
+  change_direction: z.enum(["up", "down"]).optional(),
+  change_period: z.string().optional(),
+  background_gradient: z.array(z.string()).length(2),
 });
 
 export const DataPointSchema = z.object({
@@ -40,14 +44,8 @@ export const DataPointSchema = z.object({
 });
 
 export const KpiResponseSchema = z.object({
-  period: z.object({
-    from: z.string(),
-    to: z.string(),
-    compare_from: z.string().optional(),
-    compare_to: z.string().optional(),
-  }),
-  cards: z.array(KpiCardSchema),
-  series: z.record(z.array(DataPointSchema)),
+  date: z.string(),
+  kpis: z.array(KpiCardSchema),
 });
 
 // Approval schemas

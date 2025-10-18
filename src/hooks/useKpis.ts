@@ -22,7 +22,7 @@ export const useKpis = (params: KpiParams = {}) => {
 // Selector hooks for specific KPI data
 export const useKpiCards = (params: KpiParams = {}) => {
   const { data } = useKpis(params);
-  return data?.cards || [];
+  return data?.kpis || [];
 };
 
 export const useSalesDailyChart = (params: KpiParams = {}) => {

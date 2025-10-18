@@ -6,83 +6,56 @@ import { KpiResponse, EmployeeListItem, ApprovalInboxItem } from "./schemas";
  */
 
 export const mockKpiData: KpiResponse = {
-  period: {
-    from: "2025-10-01",
-    to: "2025-10-17",
-    compare_from: "2024-10-01",
-    compare_to: "2024-10-17",
-  },
-  cards: [
+  date: "Saturday, October 18, 2025",
+  kpis: [
     {
       id: "sales_mtd",
-      label: "Sales MTD",
-      value: 1245678.5,
-      delta: 8.2,
-      format: "currency",
+      title: "SALES MTD",
+      value: 1245678.50,
+      currency: "SAR",
+      change_percentage: 8.2,
+      change_direction: "up",
+      change_period: "vs last period",
+      background_gradient: ["#667eea", "#8e74e8"]
     },
     {
       id: "sales_ytd",
-      label: "Sales YTD",
-      value: 8945000.0,
-      delta: 12.5,
-      format: "currency",
+      title: "SALES YTD",
+      value: 8945000.00,
+      currency: "SAR",
+      change_percentage: 12.5,
+      change_direction: "up",
+      change_period: "vs last period",
+      background_gradient: ["#ff6b81", "#ff4757"]
     },
     {
       id: "gross_margin",
-      label: "Gross Margin",
+      title: "GROSS MARGIN",
       value: 22.3,
-      delta: -1.1,
-      format: "percentage",
+      unit: "%",
+      change_percentage: 1.1,
+      change_direction: "down",
+      change_period: "vs last period",
+      background_gradient: ["#48dbfb", "#1dd1a1"]
     },
     {
       id: "outstanding_ar",
-      label: "Outstanding AR",
-      value: 567890.0,
-      delta: -5.3,
-      format: "currency",
+      title: "OUTSTANDING AR",
+      value: 567890.00,
+      currency: "SAR",
+      change_percentage: 5.3,
+      change_direction: "down",
+      change_period: "vs last period",
+      background_gradient: ["#2ed573", "#7bed9f"]
     },
     {
       id: "inventory_value",
-      label: "Inventory Value",
-      value: 3456789.0,
-      delta: 2.1,
-      format: "currency",
-    },
-    {
-      id: "collections",
-      label: "Collections",
-      value: 890123.0,
-      delta: 15.7,
-      format: "currency",
-    },
-  ],
-  series: {
-    sales_daily: [
-      { d: "2025-10-01", v: 65000 },
-      { d: "2025-10-02", v: 72000 },
-      { d: "2025-10-03", v: 68000 },
-      { d: "2025-10-04", v: 78000 },
-      { d: "2025-10-05", v: 82000 },
-      { d: "2025-10-06", v: 75000 },
-      { d: "2025-10-07", v: 88000 },
-      { d: "2025-10-08", v: 91000 },
-      { d: "2025-10-09", v: 85000 },
-      { d: "2025-10-10", v: 89000 },
-      { d: "2025-10-11", v: 94000 },
-      { d: "2025-10-12", v: 87000 },
-      { d: "2025-10-13", v: 92000 },
-      { d: "2025-10-14", v: 96000 },
-      { d: "2025-10-15", v: 89000 },
-      { d: "2025-10-16", v: 93000 },
-      { d: "2025-10-17", v: 98000 },
-    ],
-    sales_by_territory: [
-      { d: "Riyadh", v: 550000, label: "Riyadh" },
-      { d: "Jeddah", v: 420000, label: "Jeddah" },
-      { d: "Dammam", v: 180000, label: "Dammam" },
-      { d: "Makkah", v: 95678, label: "Makkah" },
-    ],
-  },
+      title: "INVENTORY VALUE",
+      value: null,
+      currency: "SAR",
+      background_gradient: ["#ffa502", "#ffc048"]
+    }
+  ]
 };
 
 export const mockEmployees: EmployeeListItem[] = [
@@ -154,4 +127,4 @@ export const mockApprovals: ApprovalInboxItem[] = [
  * Toggle to enable/disable mock mode
  * Set to true for development without ERPNext
  */
-export const USE_MOCK_DATA = true;
+export const USE_MOCK_DATA = false;

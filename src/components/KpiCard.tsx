@@ -5,21 +5,31 @@ import { Ionicons } from "@expo/vector-icons";
 
 interface KpiCardProps {
   label: string;
-  value: number;
+  value: number | null;
   delta?: number | null;
   format?: "currency" | "number" | "percentage";
+  currency?: string;
+  unit?: string;
+  changeDirection?: "up" | "down";
   colors?: string[];
 }
 
-const formatValue = (value: number, format: string = "number"): string => {
+const formatValue = (
+  value: number | null,
+  format: string = "number",
+  currency?: string,
+  unit?: string
+): string => {
+  if (value === null) return "N/A";
+  
   switch (format) {
     case "currency":
-      return `SAR ${value.toLocaleString("en-US", {
+      return `${currency || "SAR"} ${value.toLocaleString("en-US", {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       })}`;
     case "percentage":
-      return `${value.toFixed(1)}%`;
+      return `${value.toFixed(1)}${unit || "%"}`;
     default:
       return value.toLocaleString("en-US");
   }
@@ -30,9 +40,12 @@ export const KpiCard: React.FC<KpiCardProps> = ({
   value,
   delta,
   format = "number",
+  currency,
+  unit,
+  changeDirection,
   colors = ["#667eea", "#764ba2"],
 }) => {
-  const isPositive = delta && delta > 0;
+  const isPositive = changeDirection === "up" || (delta && delta > 0);
   const deltaColor = isPositive ? "#10b981" : "#ef4444";
   const deltaIcon = isPositive ? "trending-up" : "trending-down";
 
@@ -45,7 +58,7 @@ export const KpiCard: React.FC<KpiCardProps> = ({
     >
       <View style={styles.content}>
         <Text style={styles.label}>{label}</Text>
-        <Text style={styles.value}>{formatValue(value, format)}</Text>
+        <Text style={styles.value}>{formatValue(value, format, currency, unit)}</Text>
 
         {delta !== null && delta !== undefined && (
           <View style={styles.deltaContainer}>

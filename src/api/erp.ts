@@ -63,7 +63,7 @@ export const erpApi = {
 
   async getKpis(params: KpiParams = {}): Promise<KpiResponse> {
     const response = await http.post<any>(
-      "/api/method/printechs.mobile.kpis.sales_summary",
+      "/api/method/printechs_utility.sales_kpis.get_dashboard_kpis",
       params
     );
 

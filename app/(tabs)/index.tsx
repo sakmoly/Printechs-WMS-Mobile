@@ -97,7 +97,7 @@ export default function DashboardScreen() {
       <View style={styles.header}>
         <Text style={styles.greeting}>Welcome Back!</Text>
         <Text style={styles.date}>
-          {new Date().toLocaleDateString("en-US", {
+          {kpiData?.date || new Date().toLocaleDateString("en-US", {
             weekday: "long",
             year: "numeric",
             month: "long",
@@ -108,33 +108,20 @@ export default function DashboardScreen() {
 
       {/* KPI Cards */}
       <View style={styles.kpiGrid}>
-        {kpiData?.cards.map((card, index) => (
+        {kpiData?.kpis.map((kpi, index) => (
           <KpiCard
-            key={card.id}
-            label={card.label}
-            value={card.value}
-            delta={card.delta}
-            format={card.format}
-            colors={GRADIENT_COLORS[index % GRADIENT_COLORS.length]}
+            key={kpi.id}
+            label={kpi.title}
+            value={kpi.value}
+            delta={kpi.change_percentage}
+            format={kpi.unit ? "percentage" : "currency"}
+            currency={kpi.currency}
+            unit={kpi.unit}
+            changeDirection={kpi.change_direction}
+            colors={kpi.background_gradient}
           />
         ))}
       </View>
-
-      {/* Sales Chart */}
-      {salesDaily.length > 0 && (
-        <SalesChart data={salesDaily} title="Daily Sales Trend" />
-      )}
-
-      {/* Period Info */}
-      {kpiData?.period && (
-        <View style={styles.periodCard}>
-          <Ionicons name="calendar-outline" size={20} color="#667eea" />
-          <Text style={styles.periodText}>
-            Period: {new Date(kpiData.period.from).toLocaleDateString()} -{" "}
-            {new Date(kpiData.period.to).toLocaleDateString()}
-          </Text>
-        </View>
-      )}
     </ScrollView>
   );
 }
