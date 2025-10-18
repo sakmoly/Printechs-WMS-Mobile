@@ -38,20 +38,25 @@ export default function DashboardScreen() {
   }
 
   if (error) {
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    const isNetworkError = errorMessage.includes("Network Error") || errorMessage.includes("timeout");
-    
+    const errorMessage =
+      error instanceof Error ? error.message : "Unknown error";
+    const isNetworkError =
+      errorMessage.includes("Network Error") ||
+      errorMessage.includes("timeout");
+
     return (
       <View style={styles.errorContainer}>
         <Ionicons name="alert-circle" size={64} color="#ef4444" />
         <Text style={styles.errorTitle}>Failed to Load Dashboard</Text>
         <Text style={styles.errorMessage}>{errorMessage}</Text>
-        
+
         {isNetworkError && (
           <View style={styles.troubleshootCard}>
             <Ionicons name="bulb-outline" size={20} color="#f59e0b" />
             <View style={styles.troubleshootContent}>
-              <Text style={styles.troubleshootTitle}>Troubleshooting Tips:</Text>
+              <Text style={styles.troubleshootTitle}>
+                Troubleshooting Tips:
+              </Text>
               <Text style={styles.troubleshootItem}>
                 • Check your server URL in Settings
               </Text>
@@ -67,7 +72,7 @@ export default function DashboardScreen() {
             </View>
           </View>
         )}
-        
+
         <TouchableOpacity style={styles.retryButton} onPress={() => refetch()}>
           <Ionicons name="refresh-outline" size={20} color="#ffffff" />
           <Text style={styles.retryButtonText}>Retry</Text>

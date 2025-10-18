@@ -154,4 +154,4 @@ export const mockApprovals: ApprovalInboxItem[] = [
  * Toggle to enable/disable mock mode
  * Set to true for development without ERPNext
  */
-export const USE_MOCK_DATA = false;
+export const USE_MOCK_DATA = true;
