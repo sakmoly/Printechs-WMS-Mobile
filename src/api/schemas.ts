@@ -1,0 +1,78 @@
+import { z } from "zod";
+
+// Employee schemas
+export const EmployeeListItemSchema = z.object({
+  name: z.string(),
+  employee_name: z.string(),
+  designation: z.string().nullable(),
+  image: z.string().nullable(),
+  department: z.string().nullable(),
+  company: z.string(),
+});
+
+export const EmployeeDetailSchema = z.object({
+  name: z.string(),
+  employee_name: z.string(),
+  user_id: z.string().nullable().optional(),
+  reports_to: z.string().nullable().optional(),
+  company: z.string(),
+  department: z.string().nullable(),
+  designation: z.string().nullable(),
+  image: z.string().nullable(),
+  mobile_no: z.string().nullable().optional(),
+  personal_email: z.string().nullable().optional(),
+  date_of_joining: z.string().nullable().optional(),
+});
+
+// KPI schemas
+export const KpiCardSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  value: z.number(),
+  delta: z.number().nullable(),
+  format: z.enum(["currency", "number", "percentage"]).optional(),
+});
+
+export const DataPointSchema = z.object({
+  d: z.string(), // date
+  v: z.number(), // value
+  label: z.string().optional(),
+});
+
+export const KpiResponseSchema = z.object({
+  period: z.object({
+    from: z.string(),
+    to: z.string(),
+    compare_from: z.string().optional(),
+    compare_to: z.string().optional(),
+  }),
+  cards: z.array(KpiCardSchema),
+  series: z.record(z.array(DataPointSchema)),
+});
+
+// Approval schemas
+export const ApprovalInboxItemSchema = z.object({
+  doctype: z.string(),
+  name: z.string(),
+  title: z.string(),
+  amount: z.number().nullable().optional(),
+  currency: z.string().nullable().optional(),
+  aging_days: z.number(),
+  workflow_state: z.string(),
+});
+
+// Auth schemas
+export const LoginResponseSchema = z.object({
+  message: z.string(),
+  home_page: z.string().optional(),
+  full_name: z.string().optional(),
+});
+
+// Export types
+export type EmployeeListItem = z.infer<typeof EmployeeListItemSchema>;
+export type EmployeeDetail = z.infer<typeof EmployeeDetailSchema>;
+export type KpiCard = z.infer<typeof KpiCardSchema>;
+export type DataPoint = z.infer<typeof DataPointSchema>;
+export type KpiResponse = z.infer<typeof KpiResponseSchema>;
+export type ApprovalInboxItem = z.infer<typeof ApprovalInboxItemSchema>;
+export type LoginResponse = z.infer<typeof LoginResponseSchema>;

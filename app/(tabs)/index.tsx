@@ -1,0 +1,188 @@
+import React, { useState } from "react";
+import {
+  View,
+  Text,
+  ScrollView,
+  RefreshControl,
+  StyleSheet,
+  TouchableOpacity,
+} from "react-native";
+import { useKpis, useSalesDailyChart } from "../../src/hooks/useKpis";
+import { KpiCard } from "../../src/components/KpiCard";
+import { SalesChart } from "../../src/components/SalesChart";
+import { LoadingScreen } from "../../src/components/LoadingScreen";
+import { Ionicons } from "@expo/vector-icons";
+
+const GRADIENT_COLORS = [
+  ["#667eea", "#764ba2"],
+  ["#f093fb", "#f5576c"],
+  ["#4facfe", "#00f2fe"],
+  ["#43e97b", "#38f9d7"],
+  ["#fa709a", "#fee140"],
+  ["#30cfd0", "#330867"],
+];
+
+export default function DashboardScreen() {
+  const [refreshing, setRefreshing] = useState(false);
+  const { data: kpiData, isLoading, error, refetch } = useKpis();
+  const salesDaily = useSalesDailyChart();
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await refetch();
+    setRefreshing(false);
+  };
+
+  if (isLoading && !kpiData) {
+    return <LoadingScreen message="Loading analytics..." />;
+  }
+
+  if (error) {
+    return (
+      <View style={styles.errorContainer}>
+        <Ionicons name="alert-circle" size={64} color="#ef4444" />
+        <Text style={styles.errorTitle}>Failed to load dashboard</Text>
+        <Text style={styles.errorMessage}>
+          {error instanceof Error ? error.message : "Please try again"}
+        </Text>
+        <TouchableOpacity style={styles.retryButton} onPress={() => refetch()}>
+          <Text style={styles.retryButtonText}>Retry</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={onRefresh}
+          tintColor="#667eea"
+        />
+      }
+    >
+      {/* Header */}
+      <View style={styles.header}>
+        <Text style={styles.greeting}>Welcome Back!</Text>
+        <Text style={styles.date}>
+          {new Date().toLocaleDateString("en-US", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          })}
+        </Text>
+      </View>
+
+      {/* KPI Cards */}
+      <View style={styles.kpiGrid}>
+        {kpiData?.cards.map((card, index) => (
+          <KpiCard
+            key={card.id}
+            label={card.label}
+            value={card.value}
+            delta={card.delta}
+            format={card.format}
+            colors={GRADIENT_COLORS[index % GRADIENT_COLORS.length]}
+          />
+        ))}
+      </View>
+
+      {/* Sales Chart */}
+      {salesDaily.length > 0 && (
+        <SalesChart data={salesDaily} title="Daily Sales Trend" />
+      )}
+
+      {/* Period Info */}
+      {kpiData?.period && (
+        <View style={styles.periodCard}>
+          <Ionicons name="calendar-outline" size={20} color="#667eea" />
+          <Text style={styles.periodText}>
+            Period: {new Date(kpiData.period.from).toLocaleDateString()} -{" "}
+            {new Date(kpiData.period.to).toLocaleDateString()}
+          </Text>
+        </View>
+      )}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#f9fafb",
+  },
+  content: {
+    padding: 16,
+    paddingBottom: 32,
+  },
+  header: {
+    marginBottom: 24,
+  },
+  greeting: {
+    fontSize: 28,
+    fontWeight: "bold",
+    color: "#1f2937",
+    marginBottom: 4,
+  },
+  date: {
+    fontSize: 14,
+    color: "#6b7280",
+  },
+  kpiGrid: {
+    marginBottom: 8,
+  },
+  periodCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 12,
+    padding: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginTop: 8,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  periodText: {
+    fontSize: 14,
+    color: "#4b5563",
+    fontWeight: "500",
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 32,
+    backgroundColor: "#f9fafb",
+  },
+  errorTitle: {
+    fontSize: 20,
+    fontWeight: "bold",
+    color: "#1f2937",
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  errorMessage: {
+    fontSize: 14,
+    color: "#6b7280",
+    textAlign: "center",
+    marginBottom: 24,
+  },
+  retryButton: {
+    backgroundColor: "#667eea",
+    paddingHorizontal: 32,
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  retryButtonText: {
+    color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+});
