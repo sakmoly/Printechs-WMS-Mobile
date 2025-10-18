@@ -71,7 +71,8 @@ export const SalesChart: React.FC<SalesChartProps> = ({
             <Text style={styles.statLabel}>Avg</Text>
             <Text style={styles.statValue}>
               {Math.round(
-                values.reduce((a: number, b: number) => a + b, 0) / values.length
+                values.reduce((a: number, b: number) => a + b, 0) /
+                  values.length
               ).toLocaleString()}
             </Text>
           </View>

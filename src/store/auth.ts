@@ -1,24 +1,41 @@
 import { create } from "zustand";
 import { authApi, type LoginCredentials } from "../api/auth";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+export interface ServerConfig {
+  serverUrl: string;
+  hostname: string;
+  port: number;
+  isHttps: boolean;
+}
 
 interface AuthState {
   isAuthenticated: boolean;
   user: any | null;
   isLoading: boolean;
   error: string | null;
+  serverConfig: ServerConfig;
 
   // Actions
   login: (credentials: LoginCredentials) => Promise<boolean>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   clearError: () => void;
+  updateServerConfig: (config: Partial<ServerConfig>) => void;
+  loadServerConfig: () => Promise<void>;
 }
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   isAuthenticated: false,
   user: null,
   isLoading: true,
   error: null,
+  serverConfig: {
+    serverUrl: "",
+    hostname: "",
+    port: 8000,
+    isHttps: true,
+  },
 
   login: async (credentials) => {
     set({ isLoading: true, error: null });
@@ -54,4 +71,29 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   clearError: () => set({ error: null }),
+
+  updateServerConfig: async (config: Partial<ServerConfig>) => {
+    const currentConfig = get().serverConfig;
+    const newConfig = { ...currentConfig, ...config };
+    
+    set({ serverConfig: newConfig });
+    
+    try {
+      await AsyncStorage.setItem("serverConfig", JSON.stringify(newConfig));
+    } catch (error) {
+      console.error("Failed to save server config:", error);
+    }
+  },
+
+  loadServerConfig: async () => {
+    try {
+      const savedConfig = await AsyncStorage.getItem("serverConfig");
+      if (savedConfig) {
+        const config = JSON.parse(savedConfig);
+        set({ serverConfig: config });
+      }
+    } catch (error) {
+      console.error("Failed to load server config:", error);
+    }
+  },
 }));

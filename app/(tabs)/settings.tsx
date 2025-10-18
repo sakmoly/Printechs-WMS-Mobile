@@ -1,12 +1,14 @@
-import React from "react";
-import { View, Text, StyleSheet, TouchableOpacity, Alert } from "react-native";
+import React, { useState } from "react";
+import { View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView } from "react-native";
 import { router } from "expo-router";
 import { useAuthStore } from "../../src/store/auth";
 import { Ionicons } from "@expo/vector-icons";
 import { env } from "../../src/config/env";
+import { ServerConfig } from "../../src/components/ServerConfig";
 
 export default function SettingsScreen() {
-  const { user, logout } = useAuthStore();
+  const { user, logout, serverConfig } = useAuthStore();
+  const [showServerConfig, setShowServerConfig] = useState(false);
 
   const handleLogout = () => {
     Alert.alert("Logout", "Are you sure you want to logout?", [
@@ -22,8 +24,18 @@ export default function SettingsScreen() {
     ]);
   };
 
+  const getCurrentServerDisplay = () => {
+    if (serverConfig.serverUrl) {
+      return serverConfig.serverUrl;
+    } else if (serverConfig.hostname && serverConfig.port) {
+      const protocol = serverConfig.isHttps ? "https" : "http";
+      return `${protocol}://${serverConfig.hostname}:${serverConfig.port}`;
+    }
+    return "No server configured";
+  };
+
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container}>
       {/* User Info */}
       <View style={styles.userCard}>
         <View style={styles.avatar}>
@@ -35,13 +47,16 @@ export default function SettingsScreen() {
         <Text style={styles.userEmail}>{user?.username}</Text>
       </View>
 
+      {/* Server Configuration */}
+      <ServerConfig onSave={() => setShowServerConfig(false)} />
+
       {/* Settings Options */}
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Configuration</Text>
+        <Text style={styles.sectionTitle}>Current Configuration</Text>
 
         <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Server URL:</Text>
-          <Text style={styles.infoValue}>{env.ERP_BASE_URL}</Text>
+          <Text style={styles.infoValue}>{getCurrentServerDisplay()}</Text>
         </View>
 
         <View style={styles.infoRow}>
@@ -50,6 +65,14 @@ export default function SettingsScreen() {
             {env.BUILD_VARIANT.toUpperCase()}
           </Text>
         </View>
+
+        <TouchableOpacity 
+          style={styles.editButton}
+          onPress={() => setShowServerConfig(!showServerConfig)}
+        >
+          <Ionicons name="settings-outline" size={20} color="#667eea" />
+          <Text style={styles.editButtonText}>Configure Server</Text>
+        </TouchableOpacity>
       </View>
 
       {/* Logout Button */}
@@ -59,8 +82,8 @@ export default function SettingsScreen() {
       </TouchableOpacity>
 
       {/* Version */}
-      <Text style={styles.version}>Version 1.0.0</Text>
-    </View>
+      <Text style={styles.version}>Version 2.0.0</Text>
+    </ScrollView>
   );
 }
 
@@ -143,6 +166,21 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: "#ef4444",
+  },
+  editButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#f3f4f6",
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 12,
+    gap: 8,
+  },
+  editButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#667eea",
   },
   version: {
     textAlign: "center",

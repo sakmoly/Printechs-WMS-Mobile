@@ -18,6 +18,10 @@ export class HttpClient {
     this.setupInterceptors();
   }
 
+  setBaseUrl(baseURL: string) {
+    this.client.defaults.baseURL = baseURL;
+  }
+
   private setupInterceptors() {
     // Request interceptor - add auth token
     this.client.interceptors.request.use(

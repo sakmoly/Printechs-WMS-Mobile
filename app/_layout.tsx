@@ -14,10 +14,14 @@ const queryClient = new QueryClient({
 });
 
 export default function RootLayout() {
-  const { isLoading, checkAuth } = useAuthStore();
+  const { isLoading, checkAuth, loadServerConfig } = useAuthStore();
 
   useEffect(() => {
-    checkAuth();
+    const initialize = async () => {
+      await loadServerConfig();
+      await checkAuth();
+    };
+    initialize();
   }, []);
 
   if (isLoading) {

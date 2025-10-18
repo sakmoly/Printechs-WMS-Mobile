@@ -18,11 +18,21 @@ export default function LoginScreen() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const { login, isLoading, error, clearError } = useAuthStore();
+  const { login, isLoading, error, clearError, serverConfig } = useAuthStore();
 
   const handleLogin = async () => {
     if (!username || !password) {
       Alert.alert("Error", "Please enter both username and password");
+      return;
+    }
+
+    // Check if server is configured
+    const hasServerConfig = serverConfig.serverUrl || (serverConfig.hostname && serverConfig.port);
+    if (!hasServerConfig) {
+      Alert.alert(
+        "Server Not Configured", 
+        "Please configure your ERPNext server in Settings before logging in."
+      );
       return;
     }
 
@@ -34,6 +44,16 @@ export default function LoginScreen() {
     } else {
       Alert.alert("Login Failed", error || "Invalid credentials");
     }
+  };
+
+  const getServerDisplay = () => {
+    if (serverConfig.serverUrl) {
+      return serverConfig.serverUrl;
+    } else if (serverConfig.hostname && serverConfig.port) {
+      const protocol = serverConfig.isHttps ? "https" : "http";
+      return `${protocol}://${serverConfig.hostname}:${serverConfig.port}`;
+    }
+    return "No server configured";
   };
 
   return (
@@ -132,6 +152,12 @@ export default function LoginScreen() {
                   </Text>
                 </LinearGradient>
               </TouchableOpacity>
+
+              {/* Server Info */}
+              <View style={styles.serverContainer}>
+                <Text style={styles.serverLabel}>Connected to:</Text>
+                <Text style={styles.serverText}>{getServerDisplay()}</Text>
+              </View>
 
               {/* Demo Credentials */}
               <View style={styles.demoContainer}>
@@ -244,6 +270,24 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     fontSize: 18,
     fontWeight: "bold",
+  },
+  serverContainer: {
+    marginTop: 16,
+    alignItems: "center",
+    backgroundColor: "#f3f4f6",
+    borderRadius: 8,
+    padding: 12,
+  },
+  serverLabel: {
+    fontSize: 12,
+    color: "#6b7280",
+    fontWeight: "600",
+  },
+  serverText: {
+    fontSize: 12,
+    color: "#374151",
+    fontWeight: "500",
+    marginTop: 2,
   },
   demoContainer: {
     marginTop: 16,
