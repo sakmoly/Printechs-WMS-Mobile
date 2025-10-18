@@ -21,7 +21,7 @@ const formatValue = (
   unit?: string
 ): string => {
   if (value === null) return "N/A";
-  
+
   switch (format) {
     case "currency":
       return `${currency || "SAR"} ${value.toLocaleString("en-US", {
@@ -58,7 +58,9 @@ export const KpiCard: React.FC<KpiCardProps> = ({
     >
       <View style={styles.content}>
         <Text style={styles.label}>{label}</Text>
-        <Text style={styles.value}>{formatValue(value, format, currency, unit)}</Text>
+        <Text style={styles.value}>
+          {formatValue(value, format, currency, unit)}
+        </Text>
 
         {delta !== null && delta !== undefined && (
           <View style={styles.deltaContainer}>

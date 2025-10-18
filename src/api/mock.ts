@@ -11,22 +11,22 @@ export const mockKpiData: KpiResponse = {
     {
       id: "sales_mtd",
       title: "SALES MTD",
-      value: 1245678.50,
+      value: 1245678.5,
       currency: "SAR",
       change_percentage: 8.2,
       change_direction: "up",
       change_period: "vs last period",
-      background_gradient: ["#667eea", "#8e74e8"]
+      background_gradient: ["#667eea", "#8e74e8"],
     },
     {
       id: "sales_ytd",
       title: "SALES YTD",
-      value: 8945000.00,
+      value: 8945000.0,
       currency: "SAR",
       change_percentage: 12.5,
       change_direction: "up",
       change_period: "vs last period",
-      background_gradient: ["#ff6b81", "#ff4757"]
+      background_gradient: ["#ff6b81", "#ff4757"],
     },
     {
       id: "gross_margin",
@@ -36,26 +36,26 @@ export const mockKpiData: KpiResponse = {
       change_percentage: 1.1,
       change_direction: "down",
       change_period: "vs last period",
-      background_gradient: ["#48dbfb", "#1dd1a1"]
+      background_gradient: ["#48dbfb", "#1dd1a1"],
     },
     {
       id: "outstanding_ar",
       title: "OUTSTANDING AR",
-      value: 567890.00,
+      value: 567890.0,
       currency: "SAR",
       change_percentage: 5.3,
       change_direction: "down",
       change_period: "vs last period",
-      background_gradient: ["#2ed573", "#7bed9f"]
+      background_gradient: ["#2ed573", "#7bed9f"],
     },
     {
       id: "inventory_value",
       title: "INVENTORY VALUE",
       value: null,
       currency: "SAR",
-      background_gradient: ["#ffa502", "#ffc048"]
-    }
-  ]
+      background_gradient: ["#ffa502", "#ffc048"],
+    },
+  ],
 };
 
 export const mockEmployees: EmployeeListItem[] = [

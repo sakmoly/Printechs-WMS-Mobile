@@ -62,13 +62,41 @@ export const erpApi = {
   // ========== KPI / Analytics APIs ==========
 
   async getKpis(params: KpiParams = {}): Promise<KpiResponse> {
-    const response = await http.post<any>(
-      "/api/method/printechs_utility.sales_kpis.get_dashboard_kpis",
-      params
-    );
+    try {
+      // Import http and auth store to get configured server URL
+      const { http } = await import("./http");
+      const { useAuthStore } = await import("../store/auth");
 
-    const parsed = KpiResponseSchema.parse(response.message || response);
-    return parsed;
+      // Get the configured server URL from auth store
+      const serverConfig = useAuthStore.getState().serverConfig;
+      if (serverConfig.serverUrl) {
+        http.setBaseUrl(serverConfig.serverUrl);
+        console.log("Updated HTTP base URL to:", serverConfig.serverUrl);
+      }
+
+      console.log("Current HTTP base URL:", http.client.defaults.baseURL);
+      console.log(
+        "Calling API endpoint:",
+        "/api/method/printechs_utility.sales_kpis.get_dashboard_kpis"
+      );
+      console.log("With params:", params);
+
+      const response = await http.post<any>(
+        "/api/method/printechs_utility.sales_kpis.get_dashboard_kpis",
+        params
+      );
+
+      // Debug logging
+      console.log("API Response:", JSON.stringify(response, null, 2));
+      console.log("Response Message:", response.message);
+
+      const parsed = KpiResponseSchema.parse(response.message || response);
+      console.log("Parsed Data:", JSON.stringify(parsed, null, 2));
+      return parsed;
+    } catch (error) {
+      console.error("API Error Details:", error);
+      throw error;
+    }
   },
 
   // ========== Approvals APIs ==========

@@ -97,12 +97,13 @@ export default function DashboardScreen() {
       <View style={styles.header}>
         <Text style={styles.greeting}>Welcome Back!</Text>
         <Text style={styles.date}>
-          {kpiData?.date || new Date().toLocaleDateString("en-US", {
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-          })}
+          {kpiData?.date ||
+            new Date().toLocaleDateString("en-US", {
+              weekday: "long",
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+            })}
         </Text>
       </View>
 
