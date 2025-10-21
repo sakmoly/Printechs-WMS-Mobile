@@ -22,16 +22,24 @@ let cachedEnv: Env | null = null;
 export const getEnv = (): Env => {
   if (cachedEnv) return cachedEnv;
 
-  const raw = getRawEnv();
-  const parsed = envSchema.safeParse(raw);
+  try {
+    const raw = getRawEnv();
+    console.log("🔧 Environment config:", raw);
 
-  if (!parsed.success) {
-    console.error("❌ Invalid environment config:", parsed.error.format());
-    throw new Error("Invalid environment configuration");
+    const parsed = envSchema.safeParse(raw);
+
+    if (!parsed.success) {
+      console.error("❌ Invalid environment config:", parsed.error.format());
+      throw new Error("Invalid environment configuration");
+    }
+
+    cachedEnv = parsed.data;
+    console.log("✅ Environment config loaded successfully:", cachedEnv);
+    return cachedEnv;
+  } catch (error) {
+    console.error("❌ Error loading environment config:", error);
+    throw new Error("Failed to load environment configuration");
   }
-
-  cachedEnv = parsed.data;
-  return cachedEnv;
 };
 
 export const env = getEnv();

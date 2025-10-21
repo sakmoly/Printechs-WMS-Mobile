@@ -1,0 +1,180 @@
+{
+  "dashboard_api_response": {
+    "kpis": [
+      {
+        "id": "sales_mtd",
+        "title": "SALES MTD",
+        "value": 1983829,
+        "change_percentage": 15.5,
+        "change_direction": "up",
+        "currency": "SAR"
+      },
+      {
+        "id": "sales_ytd",
+        "title": "SALES YTD",
+        "value": 29949868,
+        "change_percentage": 35.4,
+        "change_direction": "up",
+        "currency": "SAR"
+      },
+      {
+        "id": "gross_margin",
+        "title": "GROSS MARGIN",
+        "value": 25.8,
+        "change_percentage": 2.1,
+        "change_direction": "up",
+        "unit": "%"
+      }
+    ],
+    "charts": {
+      "sales_daily": [
+        {
+          "date": "2025-01-15",
+          "value": 125000
+        },
+        {
+          "date": "2025-01-16",
+          "value": 150000
+        },
+        {
+          "date": "2025-01-17",
+          "value": 175000
+        }
+      ],
+      "sales_by_territory": [
+        {
+          "territory": "Riyadh",
+          "value": 850000,
+          "percentage": 42.5
+        },
+        {
+          "territory": "Jeddah",
+          "value": 650000,
+          "percentage": 32.5
+        },
+        {
+          "territory": "Dammam",
+          "value": 500000,
+          "percentage": 25.0
+        }
+      ],
+      "sales_by_division": [
+        {
+          "division": "Sales",
+          "value": 1200000,
+          "percentage": 60.0
+        },
+        {
+          "division": "Marketing",
+          "value": 500000,
+          "percentage": 25.0
+        },
+        {
+          "division": "Support",
+          "value": 300000,
+          "percentage": 15.0
+        }
+      ]
+    },
+    "user_profile": {
+      "image_url": "http://printechs.com/files/Sakeer.png",
+      "name": "Sakeer",
+      "designation": "Manager",
+      "department": "Sales"
+    },
+    "date": "Tuesday, January 21, 2025",
+    "from_date": "2025-01-01",
+    "to_date": "2025-01-21"
+  },
+
+  "employees_api_response": {
+    "employees": [
+      {
+        "name": "EMP-001",
+        "employee_name": "Sakeer Ahmed",
+        "designation": "Manager",
+        "department": "Sales",
+        "company": "Printechs",
+        "photo_url": "http://printechs.com/files/Sakeer.png",
+        "company_email": "sakeer@printechs.com",
+        "cell_number": "+966501234567",
+        "branch": "Main Branch"
+      },
+      {
+        "name": "EMP-002",
+        "employee_name": "Ahmed Ali",
+        "designation": "Sales Executive",
+        "department": "Sales",
+        "company": "Printechs",
+        "photo_url": "http://printechs.com/files/Ahmed.png",
+        "company_email": "ahmed@printechs.com",
+        "cell_number": "+966501234568",
+        "branch": "Main Branch"
+      }
+    ],
+    "total_count": 150,
+    "departments": ["Sales", "Marketing", "HR", "IT", "Finance"],
+    "designations": [
+      "Manager",
+      "Sales Executive",
+      "Marketing Executive",
+      "HR Executive",
+      "Developer"
+    ]
+  },
+
+  "approvals_api_response": {
+    "approvals": [
+      {
+        "id": "TODO-001",
+        "doctype": "ToDo",
+        "name": "TODO-001",
+        "title": "Approve Sales Invoice SI-001",
+        "status": "Open",
+        "priority": "High",
+        "submitted_by": "sales@printechs.com",
+        "submitted_on": "2025-01-21 10:30:00",
+        "description": "Please approve the sales invoice SI-001 for customer ABC Company"
+      },
+      {
+        "id": "TODO-002",
+        "doctype": "ToDo",
+        "name": "TODO-002",
+        "title": "Review Purchase Order PO-001",
+        "status": "Open",
+        "priority": "Medium",
+        "submitted_by": "purchase@printechs.com",
+        "submitted_on": "2025-01-21 09:15:00",
+        "description": "Please review and approve the purchase order PO-001"
+      }
+    ],
+    "total_pending": 25,
+    "total_approved": 120,
+    "total_rejected": 5
+  },
+
+  "profile_api_response": {
+    "user_info": {
+      "username": "sakeer",
+      "full_name": "Sakeer Ahmed",
+      "email": "sakeer@printechs.com",
+      "mobile_no": "+966501234567",
+      "designation": "Manager",
+      "department": "Sales",
+      "company": "Printechs",
+      "image_url": "http://printechs.com/files/Sakeer.png"
+    },
+    "employee_info": {
+      "employee_name": "Sakeer Ahmed",
+      "company_email": "sakeer@printechs.com",
+      "cell_number": "+966501234567",
+      "designation": "Manager",
+      "department": "Sales",
+      "company": "Printechs",
+      "branch": "Main Branch",
+      "current_address": "Riyadh, Saudi Arabia",
+      "photo_url": "http://printechs.com/files/Sakeer.png"
+    },
+    "qr_data": "BEGIN:VCARD\nVERSION:3.0\nFN:Sakeer Ahmed\nEMAIL:sakeer@printechs.com\nTEL:+966501234567\nTITLE:Manager\nORG:Printechs\nADR:;;Riyadh, Saudi Arabia\nEND:VCARD"
+  }
+}

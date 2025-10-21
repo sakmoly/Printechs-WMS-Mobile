@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useRef } from "react";
 import {
   View,
   Text,
@@ -9,108 +9,30 @@ import {
   Animated,
   Dimensions,
   Image,
+  Alert,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import { useKpis, useSalesDailyChart } from "../../src/hooks/useKpis";
 import { KpiCard } from "../../src/components/KpiCard";
-import { SalesChart } from "../../src/components/SalesChart";
 import { LoadingScreen } from "../../src/components/LoadingScreen";
 import { useAuthStore } from "../../src/store/auth";
-import { erpApi } from "../../src/api/erp";
 import { Ionicons } from "@expo/vector-icons";
+import { useDashboardData } from "../../src/hooks/useOptimizedApis";
 
 const { width } = Dimensions.get("window");
 
-const GRADIENT_COLORS = [
-  ["#667eea", "#764ba2"],
-  ["#f093fb", "#f5576c"],
-  ["#4facfe", "#00f2fe"],
-  ["#43e97b", "#38f9d7"],
-  ["#fa709a", "#fee140"],
-  ["#30cfd0", "#330867"],
-];
-
-export default function DashboardScreen() {
+export default function OptimizedDashboardScreen() {
   const [refreshing, setRefreshing] = useState(false);
-  const [employeeData, setEmployeeData] = useState<any>(null);
-  const { data: kpiData, isLoading, error, refetch } = useKpis();
-  const salesDaily = useSalesDailyChart();
   const { user, logout } = useAuthStore();
 
-  // Fetch employee data for profile image
-  useEffect(() => {
-    const fetchEmployeeData = async () => {
-      if (user) {
-        try {
-          const employee = await erpApi.getCurrentUserEmployee();
-          if (employee) {
-            setEmployeeData(employee);
-            console.log(
-              "✅ HOME SCREEN - Employee data fetched:",
-              employee.photo_url
-            );
-          }
-        } catch (error) {
-          console.log("❌ HOME SCREEN - Error fetching employee data:", error);
-        }
-      }
-    };
-
-    fetchEmployeeData();
-  }, [user]);
-
-  // Debug: Log user image data
-  useEffect(() => {
-    if (user) {
-      console.log("==============================================");
-      console.log("=== USER IMAGE DEBUG - HOME SCREEN ===");
-      console.log("==============================================");
-      console.log("user.image:", user.image);
-      console.log("user.user_image:", user.user_image);
-      console.log("user.photo_url:", user.photo_url);
-      console.log("employeeData.photo_url:", employeeData?.photo_url);
-      console.log("----------------------------------------------");
-      console.log("Expected URL: http://printechs.com/files/Sakeer.png");
-
-      // Use employee data if available, otherwise fall back to user data
-      const displayImageUrl =
-        employeeData?.photo_url ||
-        user.image ||
-        user.user_image ||
-        user.photo_url;
-      console.log("Actual URI being used:", displayImageUrl);
-      console.log("----------------------------------------------");
-      console.log(
-        "Server Config:",
-        JSON.stringify(useAuthStore.getState().serverConfig, null, 2)
-      );
-      console.log("----------------------------------------------");
-      console.log("All user object keys:", Object.keys(user).join(", "));
-      console.log("==============================================");
-
-      // Test if the image URL is accessible
-      if (displayImageUrl) {
-        console.log("Testing image URL accessibility...");
-        fetch(displayImageUrl, { method: "HEAD" })
-          .then((response) => {
-            console.log("✅ Image URL is accessible, status:", response.status);
-          })
-          .catch((error) => {
-            console.log("❌ Image URL is not accessible:", error.message);
-            console.log(
-              "❌ This might be why the image shows as white placeholder"
-            );
-          });
-      }
-    }
-  }, [user, employeeData]);
+  // 🎯 SINGLE API CALL - Gets ALL dashboard data in one request
+  const { data: dashboardData, isLoading, error, refetch } = useDashboardData();
 
   // Animation values
   const headerFadeAnim = useRef(new Animated.Value(0)).current;
   const headerSlideAnim = useRef(new Animated.Value(-20)).current;
 
-  useEffect(() => {
+  React.useEffect(() => {
     Animated.parallel([
       Animated.timing(headerFadeAnim, {
         toValue: 1,
@@ -146,46 +68,18 @@ export default function DashboardScreen() {
     ]);
   };
 
-  if (isLoading && !kpiData) {
-    return <LoadingScreen message="Loading analytics..." />;
+  if (isLoading && !dashboardData) {
+    return <LoadingScreen message="Loading dashboard..." />;
   }
 
   if (error) {
     const errorMessage =
       error instanceof Error ? error.message : "Unknown error";
-    const isNetworkError =
-      errorMessage.includes("Network Error") ||
-      errorMessage.includes("timeout");
-
     return (
       <View style={styles.errorContainer}>
         <Ionicons name="alert-circle" size={64} color="#ef4444" />
         <Text style={styles.errorTitle}>Failed to Load Dashboard</Text>
         <Text style={styles.errorMessage}>{errorMessage}</Text>
-
-        {isNetworkError && (
-          <View style={styles.troubleshootCard}>
-            <Ionicons name="bulb-outline" size={20} color="#f59e0b" />
-            <View style={styles.troubleshootContent}>
-              <Text style={styles.troubleshootTitle}>
-                Troubleshooting Tips:
-              </Text>
-              <Text style={styles.troubleshootItem}>
-                • Check your server URL in Settings
-              </Text>
-              <Text style={styles.troubleshootItem}>
-                • Ensure your ERPNext server is running
-              </Text>
-              <Text style={styles.troubleshootItem}>
-                • Verify your device has internet access
-              </Text>
-              <Text style={styles.troubleshootItem}>
-                • Try logging out and back in
-              </Text>
-            </View>
-          </View>
-        )}
-
         <TouchableOpacity style={styles.retryButton} onPress={() => refetch()}>
           <Ionicons name="refresh-outline" size={20} color="#ffffff" />
           <Text style={styles.retryButtonText}>Retry</Text>
@@ -229,7 +123,7 @@ export default function DashboardScreen() {
             <View style={styles.headerLeft}>
               <Text style={styles.greeting}>📊 Dashboard</Text>
               <Text style={styles.date}>
-                {kpiData?.date ||
+                {dashboardData?.date ||
                   new Date().toLocaleDateString("en-US", {
                     weekday: "long",
                     year: "numeric",
@@ -240,65 +134,32 @@ export default function DashboardScreen() {
             </View>
 
             <View style={styles.headerRight}>
-              {/* User Profile Photo */}
+              {/* User Profile Photo - Data comes from single API */}
               <TouchableOpacity
                 style={styles.profileButton}
                 onPress={() => router.push("/user-profile")}
               >
                 <View style={styles.profilePhotoContainer}>
-                  {employeeData?.photo_url ||
-                  user?.image ||
-                  user?.user_image ||
-                  user?.photo_url ? (
+                  {dashboardData?.user_profile?.image_url ? (
                     <Image
-                      source={{
-                        uri:
-                          employeeData?.photo_url ||
-                          user.image ||
-                          user.user_image ||
-                          user.photo_url,
-                      }}
+                      source={{ uri: dashboardData.user_profile.image_url }}
                       style={styles.profilePhoto}
                       resizeMode="cover"
                       onError={(error) => {
                         console.log(
-                          "❌ HOME SCREEN - Image load error:",
+                          "❌ Profile image load error:",
                           error.nativeEvent?.error
-                        );
-                        console.log(
-                          "❌ Failed URI:",
-                          employeeData?.photo_url ||
-                            user.image ||
-                            user.user_image ||
-                            user.photo_url
-                        );
-                        console.log(
-                          "❌ Server Config:",
-                          JSON.stringify(
-                            useAuthStore.getState().serverConfig,
-                            null,
-                            2
-                          )
                         );
                       }}
                       onLoad={() => {
-                        console.log(
-                          "✅ HOME SCREEN - Image loaded successfully!"
-                        );
-                        console.log(
-                          "✅ Loaded URI:",
-                          employeeData?.photo_url ||
-                            user.image ||
-                            user.user_image ||
-                            user.photo_url
-                        );
+                        console.log("✅ Profile image loaded successfully!");
                       }}
                       defaultSource={require("../../assets/icon.png")}
                     />
                   ) : (
                     <View style={styles.profilePhotoPlaceholder}>
                       <Text style={styles.profileInitials}>
-                        {user?.full_name?.charAt(0) ||
+                        {dashboardData?.user_profile?.name?.charAt(0) ||
                           user?.username?.charAt(0) ||
                           "U"}
                       </Text>
@@ -335,9 +196,9 @@ export default function DashboardScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* KPI Cards */}
+        {/* KPI Cards - Data comes from single API */}
         <View style={styles.kpiGrid}>
-          {kpiData?.kpis.map((kpi, index) => (
+          {dashboardData?.kpis.map((kpi, index) => (
             <View key={kpi.id} style={styles.kpiCardWrapper}>
               <KpiCard
                 label={kpi.title}
@@ -350,23 +211,25 @@ export default function DashboardScreen() {
                 colors={["#3b82f6", "#2563eb"]}
                 onPress={() => {
                   console.log("KPI tapped:", kpi.id, kpi.title);
-                  console.log("KPI value:", kpi.value);
-                  console.log(
-                    "KPI change:",
-                    kpi.change_percentage,
-                    kpi.change_direction
-                  );
-
-                  // Navigate to KPI details screen
-                  router.push({
-                    pathname: "/kpi-details",
-                    params: { kpiId: kpi.id },
-                  });
                 }}
               />
             </View>
           ))}
         </View>
+
+        {/* Charts Section - Data comes from single API */}
+        {dashboardData?.charts && (
+          <View style={styles.chartsSection}>
+            <Text style={styles.sectionTitle}>Charts</Text>
+            {/* Add your chart components here using dashboardData.charts */}
+            <View style={styles.chartPlaceholder}>
+              <Text style={styles.chartPlaceholderText}>
+                Charts data loaded:{" "}
+                {JSON.stringify(dashboardData.charts, null, 2)}
+              </Text>
+            </View>
+          </View>
+        )}
       </ScrollView>
     </View>
   );
@@ -517,6 +380,22 @@ const styles = StyleSheet.create({
   kpiCardWrapper: {
     marginBottom: 16,
   },
+  chartsSection: {
+    marginTop: 32,
+  },
+  chartPlaceholder: {
+    backgroundColor: "#ffffff",
+    padding: 20,
+    borderRadius: 12,
+    marginTop: 16,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  chartPlaceholderText: {
+    fontSize: 12,
+    color: "#6b7280",
+    fontFamily: "monospace",
+  },
   errorContainer: {
     flex: 1,
     justifyContent: "center",
@@ -536,31 +415,6 @@ const styles = StyleSheet.create({
     color: "#6b7280",
     textAlign: "center",
     marginBottom: 24,
-  },
-  troubleshootCard: {
-    backgroundColor: "#fffbeb",
-    borderRadius: 12,
-    padding: 16,
-    marginVertical: 16,
-    maxWidth: "100%",
-    borderWidth: 1,
-    borderColor: "#fde68a",
-  },
-  troubleshootContent: {
-    flex: 1,
-    marginLeft: 12,
-  },
-  troubleshootTitle: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#92400e",
-    marginBottom: 8,
-  },
-  troubleshootItem: {
-    fontSize: 13,
-    color: "#78350f",
-    marginBottom: 4,
-    lineHeight: 18,
   },
   retryButton: {
     backgroundColor: "#667eea",

@@ -61,35 +61,68 @@ export const mockKpiData: KpiResponse = {
 export const mockEmployees: EmployeeListItem[] = [
   {
     name: "EMP-001",
-    employee_name: "Ahmed Al-Rashid",
+    employee_name: "Sakeer",
     designation: "Sales Manager",
-    image: null,
+    image: "http://printechs.com/files/Sakeer.png",
     department: "Sales",
     company: "Printechs",
+    cell_number: "+966501234567",
+    company_email: "sakeer@printechs.com",
   },
   {
     name: "EMP-002",
     employee_name: "Fatima Al-Zahrani",
     designation: "Finance Controller",
-    image: null,
+    image:
+      "https://images.unsplash.com/photo-1494790108755-2616b612b786?w=400&h=400&fit=crop&crop=face",
     department: "Finance",
     company: "Printechs",
+    cell_number: "+966507654321",
+    company_email: "fatima.zahrani@printechs.com",
   },
   {
     name: "EMP-003",
     employee_name: "Mohammed Al-Mutairi",
     designation: "Operations Manager",
-    image: null,
+    image:
+      "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=400&h=400&fit=crop&crop=face",
     department: "Operations",
     company: "Printechs",
+    cell_number: "+966509876543",
+    company_email: "mohammed.mutairi@printechs.com",
   },
   {
     name: "EMP-004",
     employee_name: "Sara Al-Qahtani",
     designation: "HR Manager",
-    image: null,
+    image:
+      "https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=400&h=400&fit=crop&crop=face",
     department: "Human Resources",
     company: "Printechs",
+    cell_number: "+966501112233",
+    company_email: "sara.qahtani@printechs.com",
+  },
+  {
+    name: "EMP-005",
+    employee_name: "Omar Al-Shehri",
+    designation: "IT Manager",
+    image:
+      "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=400&h=400&fit=crop&crop=face",
+    department: "IT",
+    company: "Printechs",
+    cell_number: "+966505556677",
+    company_email: "omar.shehri@printechs.com",
+  },
+  {
+    name: "EMP-006",
+    employee_name: "Noura Al-Dosari",
+    designation: "Marketing Specialist",
+    image:
+      "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400&h=400&fit=crop&crop=face",
+    department: "Marketing",
+    company: "Printechs",
+    cell_number: "+966508889990",
+    company_email: "noura.dosari@printechs.com",
   },
 ];
 
@@ -126,5 +159,6 @@ export const mockApprovals: ApprovalInboxItem[] = [
 /**
  * Toggle to enable/disable mock mode
  * Set to true for development without ERPNext
+ * Note: Both Dashboard and Employees now use LIVE data
  */
-export const USE_MOCK_DATA = false;
+export const USE_MOCK_DATA = true; // Set to false when backend APIs are ready

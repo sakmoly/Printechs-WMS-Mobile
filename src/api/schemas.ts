@@ -4,24 +4,31 @@ import { z } from "zod";
 export const EmployeeListItemSchema = z.object({
   name: z.string(),
   employee_name: z.string(),
-  designation: z.string().nullable(),
-  image: z.string().nullable(),
-  department: z.string().nullable(),
+  designation: z.string().nullable().optional(),
+  photo_url: z.string().nullable().optional(),
+  image: z.string().nullable().optional(),
+  cell_number: z.string().nullable().optional(),
+  company_email: z.string().nullable().optional(),
+  branch: z.string().nullable().optional(),
+  department: z.string().nullable().optional(),
   company: z.string(),
+  current_address: z.string().nullable().optional(),
+  current_address_display: z.string().nullable().optional(),
 });
 
 export const EmployeeDetailSchema = z.object({
   name: z.string(),
   employee_name: z.string(),
-  user_id: z.string().nullable().optional(),
-  reports_to: z.string().nullable().optional(),
+  designation: z.string().nullable().optional(),
+  photo_url: z.string().nullable().optional(),
+  image: z.string().nullable().optional(),
+  cell_number: z.string().nullable().optional(),
+  company_email: z.string().nullable().optional(),
+  branch: z.string().nullable().optional(),
+  department: z.string().nullable().optional(),
   company: z.string(),
-  department: z.string().nullable(),
-  designation: z.string().nullable(),
-  image: z.string().nullable(),
-  mobile_no: z.string().nullable().optional(),
-  personal_email: z.string().nullable().optional(),
-  date_of_joining: z.string().nullable().optional(),
+  current_address: z.string().nullable().optional(),
+  current_address_display: z.string().nullable().optional(),
 });
 
 // KPI schemas

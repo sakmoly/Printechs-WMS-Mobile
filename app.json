@@ -19,7 +19,10 @@
       "buildNumber": "1",
       "infoPlist": {
         "NSCameraUsageDescription": "This app needs access to camera to scan QR codes",
-        "NSPhotoLibraryUsageDescription": "This app needs access to photo library to select images"
+        "NSPhotoLibraryUsageDescription": "This app needs access to photo library to select images",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
       }
     },
     "android": {
@@ -35,7 +38,8 @@
         "WRITE_EXTERNAL_STORAGE",
         "INTERNET",
         "ACCESS_NETWORK_STATE"
-      ]
+      ],
+      "usesCleartextTraffic": true
     },
     "web": {
       "favicon": "./assets/favicon.png"

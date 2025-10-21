@@ -6,7 +6,9 @@ import {
   StyleSheet,
   Image,
   RefreshControl,
+  TouchableOpacity,
 } from "react-native";
+import { router } from "expo-router";
 import { useEmployees } from "../../src/hooks/useEmployees";
 import { LoadingScreen } from "../../src/components/LoadingScreen";
 import { Ionicons } from "@expo/vector-icons";
@@ -14,6 +16,14 @@ import { Ionicons } from "@expo/vector-icons";
 export default function EmployeesScreen() {
   const { data: employees, isLoading, refetch } = useEmployees();
   const [refreshing, setRefreshing] = React.useState(false);
+
+  // Debug: Log employee data
+  React.useEffect(() => {
+    if (employees) {
+      console.log("Employees data:", JSON.stringify(employees, null, 2));
+      console.log("First employee image:", employees[0]?.image);
+    }
+  }, [employees]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -31,15 +41,25 @@ export default function EmployeesScreen() {
         data={employees}
         keyExtractor={(item) => item.name}
         renderItem={({ item }) => (
-          <View style={styles.card}>
+          <TouchableOpacity
+            style={styles.card}
+            onPress={() => router.push(`/employee-profile/${item.name}`)}
+          >
             <View style={styles.avatar}>
               {item.image ? (
                 <Image
                   source={{ uri: item.image }}
                   style={styles.avatarImage}
+                  resizeMode="cover"
+                  onError={(error) => console.log("Image load error:", error)}
+                  onLoad={() => console.log("Image loaded:", item.image)}
                 />
               ) : (
-                <Ionicons name="person" size={32} color="#667eea" />
+                <View style={styles.avatarPlaceholder}>
+                  <Text style={styles.avatarText}>
+                    {item.employee_name?.charAt(0) || "?"}
+                  </Text>
+                </View>
               )}
             </View>
             <View style={styles.info}>
@@ -48,8 +68,12 @@ export default function EmployeesScreen() {
                 {item.designation || "N/A"}
               </Text>
               <Text style={styles.department}>{item.department || "N/A"}</Text>
+              {item.cell_number && (
+                <Text style={styles.contact}>{item.cell_number}</Text>
+              )}
             </View>
-          </View>
+            <Ionicons name="chevron-forward" size={20} color="#9ca3af" />
+          </TouchableOpacity>
         )}
         contentContainerStyle={styles.list}
         refreshControl={
@@ -105,6 +129,19 @@ const styles = StyleSheet.create({
     height: 60,
     borderRadius: 30,
   },
+  avatarPlaceholder: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: "#667eea",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  avatarText: {
+    color: "#ffffff",
+    fontSize: 20,
+    fontWeight: "600",
+  },
   info: {
     flex: 1,
   },
@@ -122,6 +159,11 @@ const styles = StyleSheet.create({
   department: {
     fontSize: 12,
     color: "#6b7280",
+    marginBottom: 2,
+  },
+  contact: {
+    fontSize: 11,
+    color: "#9ca3af",
   },
   emptyState: {
     alignItems: "center",
