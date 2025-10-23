@@ -9,12 +9,12 @@ import {
   TouchableOpacity,
 } from "react-native";
 import { router } from "expo-router";
-import { useEmployees } from "../../src/hooks/useEmployees";
+import { useEmployeesList } from "../../src/hooks/useOptimizedApis";
 import { LoadingScreen } from "../../src/components/LoadingScreen";
 import { Ionicons } from "@expo/vector-icons";
 
 export default function EmployeesScreen() {
-  const { data: employees, isLoading, refetch } = useEmployees();
+  const { data: employees, isLoading, refetch } = useEmployeesList();
   const [refreshing, setRefreshing] = React.useState(false);
 
   // Debug: Log employee data

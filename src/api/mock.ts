@@ -29,18 +29,8 @@ export const mockKpiData: KpiResponse = {
       background_gradient: ["#ff6b81", "#ff4757"],
     },
     {
-      id: "gross_margin",
-      title: "GROSS MARGIN",
-      value: 22.3,
-      unit: "%",
-      change_percentage: 1.1,
-      change_direction: "down",
-      change_period: "vs last period",
-      background_gradient: ["#48dbfb", "#1dd1a1"],
-    },
-    {
-      id: "outstanding_ar",
-      title: "OUTSTANDING AR",
+      id: "receivable",
+      title: "RECEIVABLE",
       value: 567890.0,
       currency: "SAR",
       change_percentage: 5.3,
@@ -161,4 +151,4 @@ export const mockApprovals: ApprovalInboxItem[] = [
  * Set to true for development without ERPNext
  * Note: Both Dashboard and Employees now use LIVE data
  */
-export const USE_MOCK_DATA = true; // Set to false when backend APIs are ready
+export const USE_MOCK_DATA = false; // Set to false to use real API data (API should be whitelisted now)

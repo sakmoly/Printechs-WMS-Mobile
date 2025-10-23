@@ -92,9 +92,6 @@ export const GaugeChart: React.FC<GaugeChartProps> = ({
             strokeLinecap="round"
             strokeDasharray={strokeDasharray}
             strokeDashoffset={strokeDashoffset}
-            style={{
-              filter: `drop-shadow(0 4px 8px ${getColor()}40)`,
-            }}
           />
 
           {/* Needle */}

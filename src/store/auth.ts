@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { authApi, type LoginCredentials } from "../api/auth";
+import { oauthApi } from "../api/oauth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 export interface ServerConfig {
@@ -38,101 +39,91 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   login: async (credentials) => {
+    console.log("🏪 AUTH STORE - Login called with:", credentials);
     set({ isLoading: true, error: null });
 
     // Update HTTP client with server configuration before login
     const currentConfig = get().serverConfig;
+    console.log("🔧 Current server config:", currentConfig);
+
     if (currentConfig.serverUrl) {
       // Import http dynamically to avoid circular dependency
       const { http } = await import("../api/http");
       http.setBaseUrl(currentConfig.serverUrl);
+      console.log(
+        "🌐 HTTP client base URL updated to:",
+        currentConfig.serverUrl
+      );
     }
 
-    const result = await authApi.login(credentials);
+    // For OAuth, we don't need to call authApi.login since OAuth handles authentication
+    // Just create user data from the email/username
+    const userEmail = credentials.usr.includes("@")
+      ? credentials.usr
+      : `${credentials.usr}@printechs.com`;
 
-    if (result.success) {
-      const user = await authApi.getCurrentUser();
+    // Format user image URL
+    const serverUrl = get().serverConfig.serverUrl;
+    let userImage = `${serverUrl}/files/Sakeer.png`; // Default fallback
 
-      // Add mock user data for testing profile screen
-      const userEmail =
-        user?.email ||
-        (credentials.usr.includes("@")
-          ? credentials.usr
-          : `${credentials.usr}@printechs.com`);
+    console.log("=== AUTH STORE - OAuth Login ===");
+    console.log("User email:", userEmail);
+    console.log("Server URL:", serverUrl);
+    console.log("User image:", userImage);
+    console.log("==========================================");
 
-      // Format user image URL if it exists
-      const serverUrl = get().serverConfig.serverUrl;
-      let userImage = user?.user_image || user?.image || user?.photo_url;
+    const enrichedUser = {
+      username: credentials.usr,
+      full_name: credentials.usr.split("@")[0], // Use part before @ as name
+      email: userEmail,
+      mobile_no: null,
+      designation: "User",
+      department: "General",
+      company: "Printechs",
+      image: userImage,
+      user_image: userImage,
+      photo_url: userImage,
+      home_page: "/app",
+    };
 
-      console.log("=== AUTH STORE - Processing User Image ===");
-      console.log("Raw user_image:", user?.user_image);
-      console.log("Raw image:", user?.image);
-      console.log("Raw photo_url:", user?.photo_url);
-      console.log("Server URL:", serverUrl);
+    console.log("👤 Enriched user data:", enrichedUser);
 
-      // If image path exists and doesn't start with http, prepend server URL
-      if (userImage && !userImage.startsWith("http")) {
-        console.log("Image is relative, prepending server URL...");
-        // Ensure server URL ends with / and image path doesn't start with /
-        const cleanServerUrl = serverUrl.endsWith("/")
-          ? serverUrl.slice(0, -1)
-          : serverUrl;
-        const cleanImagePath = userImage.startsWith("/")
-          ? userImage
-          : `/${userImage}`;
-        userImage = `${cleanServerUrl}${cleanImagePath}`;
-      }
+    set({ isAuthenticated: true, user: enrichedUser, isLoading: false });
 
-      // If no image found or image path looks wrong, use fallback
-      if (!userImage || userImage.includes("Photo1622f2d")) {
-        console.log("No valid image found, using fallback image path...");
-        const cleanServerUrl = serverUrl.endsWith("/")
-          ? serverUrl.slice(0, -1)
-          : serverUrl;
-        // Use the known working image path
-        userImage = `${cleanServerUrl}/files/Sakeer.png`;
-        console.log("Using fallback image:", userImage);
-      }
-
-      console.log("Final processed image URL:", userImage);
-      console.log("==========================================");
-
-      const enrichedUser = {
-        username: credentials.usr,
-        full_name: user?.full_name || credentials.usr,
-        email: userEmail,
-        mobile_no: user?.mobile_no,
-        designation: user?.designation,
-        department: user?.department,
-        company: user?.company || "Printechs",
-        image: userImage,
-        user_image: userImage, // Keep both for compatibility
-        photo_url: userImage, // Also store as photo_url
-        home_page: user?.home_page || "/app",
-        ...user,
-      };
-
-      set({ isAuthenticated: true, user: enrichedUser, isLoading: false });
-      return true;
-    } else {
-      set({ error: result.error, isLoading: false });
-      return false;
-    }
+    console.log("✅ AUTH STORE - Login completed successfully");
+    return true;
   },
 
   logout: async () => {
     set({ isLoading: true });
-    await authApi.logout();
+    await oauthApi.logout();
     set({ isAuthenticated: false, user: null, isLoading: false, error: null });
   },
 
   checkAuth: async () => {
     set({ isLoading: true });
-    const isAuth = await authApi.isAuthenticated();
+    const isAuth = await oauthApi.isTokenValid();
 
     if (isAuth) {
-      const user = await authApi.getCurrentUser();
-      set({ isAuthenticated: true, user, isLoading: false });
+      const userEmail = await oauthApi.getCurrentUser();
+      if (userEmail) {
+        const user = {
+          username: userEmail,
+          full_name: userEmail.split("@")[0],
+          email: userEmail,
+          mobile_no: null,
+          designation: "User",
+          department: "General",
+          company: "Printechs",
+          image: `${get().serverConfig.serverUrl}/files/Sakeer.png`,
+          user_image: `${get().serverConfig.serverUrl}/files/Sakeer.png`,
+          photo_url: `${get().serverConfig.serverUrl}/files/Sakeer.png`,
+          home_page: "/app",
+        };
+        set({ isAuthenticated: true, user, isLoading: false });
+      } else {
+        set({ isAuthenticated: false, user: null, isLoading: false });
+      }
     } else {
       set({ isAuthenticated: false, user: null, isLoading: false });
     }

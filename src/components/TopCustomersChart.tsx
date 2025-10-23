@@ -19,6 +19,7 @@ interface CustomerData {
 interface TopCustomersChartProps {
   data: CustomerData[];
   title?: string;
+  lastYearData?: CustomerData[];
 }
 
 const { width } = Dimensions.get("window");
@@ -26,8 +27,22 @@ const { width } = Dimensions.get("window");
 export const TopCustomersChart: React.FC<TopCustomersChartProps> = ({
   data,
   title = "Top 10 Customers",
+  lastYearData,
 }) => {
   const [metric, setMetric] = useState<"sales" | "invoices">("sales");
+
+  // Debug: Log customer data structure
+  console.log("🔍 TopCustomersChart Data:", {
+    currentData: data?.slice(0, 3).map((item) => ({
+      customer: item.customer,
+      customer_name: item.customer_name,
+      total_sales: item.total_sales,
+      invoice_count: item.invoice_count,
+    })),
+    lastYearData: lastYearData?.slice(0, 3),
+    hasCurrentData: !!data?.length,
+    hasLastYearData: !!lastYearData?.length,
+  });
 
   const formatCurrency = (value: number): string => {
     if (value >= 1000000) {
@@ -43,12 +58,44 @@ export const TopCustomersChart: React.FC<TopCustomersChartProps> = ({
   };
 
   const chartData = {
-    labels: data.map((item, index) => `#${index + 1}`),
+    labels: data.map((item, index) => {
+      // Show customer names in chart labels for better identification
+      // Truncate long names to fit chart
+      const name =
+        item.customer_name || item.customer || `Customer ${index + 1}`;
+      return name.length > 8 ? name.substring(0, 8) + "..." : name;
+    }),
     datasets: [
       {
         data: data.map((item) => getMetricValue(item)),
+        colors: data.map((item, index) => {
+          // Assign consistent darker colors to each bar
+          const darkColors = [
+            () => "#1e3a8a", // Deep Blue
+            () => "#581c87", // Deep Purple
+            () => "#9f1239", // Deep Rose
+            () => "#065f46", // Deep Emerald
+            () => "#991b1b", // Deep Red
+            () => "#164e63", // Deep Cyan
+            () => "#713f12", // Deep Amber
+            () => "#0c4a6e", // Deep Sky
+            () => "#4c1d95", // Deep Violet
+            () => "#78350f", // Deep Orange
+          ];
+          return darkColors[index % darkColors.length];
+        }),
       },
     ],
+  };
+
+  // Format values on top of bars - compact format
+  const formatBarValue = (value: number): string => {
+    if (Math.abs(value) >= 1000000) {
+      return `${(value / 1000000).toFixed(1)}M`;
+    } else if (Math.abs(value) >= 1000) {
+      return `${(value / 1000).toFixed(0)}K`;
+    }
+    return value.toFixed(0);
   };
 
   const chartConfig = {
@@ -56,27 +103,41 @@ export const TopCustomersChart: React.FC<TopCustomersChartProps> = ({
     backgroundGradientFrom: "#ffffff",
     backgroundGradientTo: "#f9fafb",
     decimalPlaces: 0,
+    formatTopBarValue: formatBarValue,
     color: (opacity = 1) => {
-      const gradientColors = [
-        "#4338ca", // Dark Indigo
-        "#6b21a8", // Dark Purple
-        "#be185d", // Dark Pink
-        "#b91c1c", // Dark Red
-        "#1e40af", // Dark Blue
-        "#0e7490", // Dark Cyan
-        "#047857", // Dark Green
-        "#0f766e", // Dark Teal
+      // Much darker, richer colors for better visibility
+      const darkColors = [
+        "#1e3a8a", // Deep Blue
+        "#581c87", // Deep Purple
+        "#9f1239", // Deep Rose
+        "#991b1b", // Deep Red
+        "#164e63", // Deep Cyan
+        "#065f46", // Deep Emerald
+        "#713f12", // Deep Amber
+        "#0c4a6e", // Deep Sky
       ];
-      const colorIndex = Math.floor(Math.random() * gradientColors.length);
-      return gradientColors[colorIndex];
+      const colorIndex = Math.floor(Math.random() * darkColors.length);
+      return darkColors[colorIndex];
     },
-    labelColor: (opacity = 1) => `rgba(55, 65, 81, ${opacity})`,
+    labelColor: (opacity = 1) => `rgba(17, 24, 39, ${opacity})`, // Much darker labels
     strokeWidth: 2,
-    barPercentage: 0.7,
-    fillShadowGradient: "#4338ca",
-    fillShadowGradientOpacity: 0.9,
+    barPercentage: 0.75,
+    fillShadowGradient: "#1e3a8a", // Deep blue gradient
+    fillShadowGradientOpacity: 1, // Full opacity for darker bars
     propsForLabels: {
-      fontSize: 10,
+      fontSize: 13, // Larger font for better readability
+      fontWeight: "700", // Bolder font weight
+      fontFamily: "System",
+    },
+    propsForBackgroundLines: {
+      strokeDasharray: "", // Solid lines
+      stroke: "#e5e7eb",
+      strokeWidth: 1,
+    },
+    propsForVerticalLabels: {
+      fontSize: 12, // Larger Y-axis labels
+      fontWeight: "700",
+      fill: "#111827", // Very dark gray for Y-axis
     },
   };
 
@@ -132,12 +193,23 @@ export const TopCustomersChart: React.FC<TopCustomersChartProps> = ({
           <BarChart
             data={chartData}
             width={width - 80}
-            height={220}
+            height={240}
             chartConfig={chartConfig}
             showValuesOnTopOfBars={true}
             fromZero
             withInnerLines={true}
             style={styles.chart}
+            yAxisLabel=""
+            yAxisSuffix=""
+            withCustomBarColorFromData={true}
+            flatColor={true}
+            formatYLabel={(value) => {
+              const num = parseFloat(value);
+              if (metric === "invoices") return num.toFixed(0);
+              if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
+              if (num >= 1000) return `${(num / 1000).toFixed(0)}K`;
+              return num.toFixed(0);
+            }}
           />
         ) : (
           <View style={styles.emptyState}>
@@ -159,7 +231,7 @@ export const TopCustomersChart: React.FC<TopCustomersChartProps> = ({
                 <Text style={styles.rankText}>#{index + 1}</Text>
               </View>
               <Text style={styles.customerName} numberOfLines={3}>
-                {item.customer_name}
+                {item.customer_name || item.customer || `Customer ${index + 1}`}
               </Text>
               <View style={styles.cardStats}>
                 <View style={styles.cardStat}>
@@ -232,8 +304,9 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 20,
-    fontWeight: "700",
-    color: "#1f2937",
+    fontWeight: "800",
+    color: "#111827",
+    letterSpacing: -0.5,
   },
   toggleContainer: {
     flexDirection: "row",
@@ -250,12 +323,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   toggleButtonActive: {
-    backgroundColor: "#667eea",
+    backgroundColor: "#4338ca",
   },
   toggleText: {
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: "600",
-    color: "#6b7280",
+    color: "#4b5563",
   },
   toggleTextActive: {
     color: "#ffffff",
@@ -287,13 +360,13 @@ const styles = StyleSheet.create({
     marginRight: 12,
     width: 220,
     borderLeftWidth: 4,
-    borderLeftColor: "#667eea",
+    borderLeftColor: "#4338ca",
   },
   rankBadge: {
     position: "absolute",
     top: 8,
     right: 8,
-    backgroundColor: "#667eea",
+    backgroundColor: "#4338ca",
     borderRadius: 12,
     paddingHorizontal: 8,
     paddingVertical: 4,
@@ -304,11 +377,13 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   customerName: {
-    fontSize: 15,
-    fontWeight: "700",
-    color: "#1f2937",
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#111827",
     marginBottom: 12,
     minHeight: 60,
+    lineHeight: 20,
+    textAlign: "center",
   },
   cardStats: {
     gap: 8,
@@ -319,15 +394,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   cardLabel: {
-    fontSize: 11,
+    fontSize: 10,
     color: "#6b7280",
     textTransform: "uppercase",
-    letterSpacing: 0.5,
+    letterSpacing: 0.8,
+    fontWeight: "700",
   },
   cardValue: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: "#1f2937",
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#111827",
   },
   footer: {
     flexDirection: "row",
@@ -348,13 +424,16 @@ const styles = StyleSheet.create({
     backgroundColor: "#e5e7eb",
   },
   statLabel: {
-    fontSize: 12,
+    fontSize: 11,
     color: "#6b7280",
     marginBottom: 4,
+    fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
   },
   statValue: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#667eea",
+    fontSize: 17,
+    fontWeight: "800",
+    color: "#4338ca",
   },
 });

@@ -1,6 +1,7 @@
 import axios, { AxiosInstance, AxiosError } from "axios";
 import { env } from "../config/env";
 import { storage } from "./storage";
+import { oauthApi } from "./oauth";
 
 export class HttpClient {
   private client: AxiosInstance;
@@ -57,15 +58,38 @@ export class HttpClient {
             throw new Error("Invalid request configuration");
           }
 
-          const token = await storage.getToken();
-          if (token) {
-            config.headers = config.headers || {};
-            config.headers.Authorization = `token ${token}`;
+          // Check if this is a protected API endpoint that needs authentication
+          const isProtectedEndpoint =
+            config.url.includes("/api/method/") &&
+            !config.url.includes("printechs_utility.auth_otp") &&
+            !config.url.includes("frappe.integrations.oauth2");
+
+          if (isProtectedEndpoint) {
+            // Get access token for protected endpoints
+            const accessToken = await storage.getToken();
+
+            if (accessToken) {
+              config.headers = config.headers || {};
+              config.headers.Authorization = `Bearer ${accessToken}`;
+              console.log("🔑 Adding access token to protected endpoint");
+            } else {
+              console.log(
+                "⚠️ No access token available for protected endpoint"
+              );
+            }
+          } else {
+            // For OAuth endpoints, ensure no auth header
+            if (config.headers) {
+              delete config.headers.Authorization;
+              delete config.headers.authorization;
+            }
+            console.log("🌐 Making unauthenticated request for OAuth endpoint");
           }
 
           console.log(
             `🚀 HTTP Request: ${config.method?.toUpperCase()} ${config.url}`
           );
+          console.log("🔍 Request headers:", config.headers);
           return config;
         } catch (error) {
           console.error("❌ Request interceptor error:", error);
@@ -86,7 +110,7 @@ export class HttpClient {
         );
         return response;
       },
-      (error: AxiosError) => {
+      async (error: AxiosError) => {
         const url = error.config?.url || "";
         const status = error.response?.status;
 
@@ -105,17 +129,45 @@ export class HttpClient {
           });
         }
 
-        if (status === 401) {
-          // Unauthorized - trigger logout
-          console.log("🔒 Unauthorized access - triggering logout");
-          this.onUnauthorized?.();
-        }
+        if (status === 401 || (status === 403 && !isExpected403)) {
+          // Try to refresh token for protected endpoints
+          const isProtectedEndpoint =
+            url.includes("/api/method/") &&
+            !url.includes("printechs_utility.auth_otp") &&
+            !url.includes("frappe.integrations.oauth2");
 
-        if (status === 403 && !isExpected403) {
-          console.log(
-            "🚫 403 Forbidden - Check authentication and permissions"
-          );
-          console.log("URL:", url);
+          if (isProtectedEndpoint) {
+            console.log("🔄 Token expired or invalid - attempting refresh...");
+
+            try {
+              const refreshResult = await oauthApi.refreshToken();
+
+              if (refreshResult.success && refreshResult.data) {
+                console.log(
+                  "✅ Token refreshed successfully - retrying request"
+                );
+
+                // Retry the original request with new token
+                const newToken = refreshResult.data.access_token;
+                if (error.config) {
+                  error.config.headers = error.config.headers || {};
+                  error.config.headers.Authorization = `Bearer ${newToken}`;
+
+                  // Retry the request
+                  return this.client.request(error.config);
+                }
+              } else {
+                console.log("❌ Token refresh failed - triggering logout");
+                this.onUnauthorized?.();
+              }
+            } catch (refreshError) {
+              console.error("❌ Token refresh error:", refreshError);
+              this.onUnauthorized?.();
+            }
+          } else {
+            console.log("🔒 Unauthorized access - triggering logout");
+            this.onUnauthorized?.();
+          }
         }
 
         // Handle network errors

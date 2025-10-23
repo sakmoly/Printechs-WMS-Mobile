@@ -7,12 +7,12 @@ import {
   TouchableOpacity,
   RefreshControl,
 } from "react-native";
-import { useApprovalsInbox } from "../../src/hooks/useApprovals";
+import { useApprovalsList } from "../../src/hooks/useOptimizedApis";
 import { LoadingScreen } from "../../src/components/LoadingScreen";
 import { Ionicons } from "@expo/vector-icons";
 
 export default function ApprovalsScreen() {
-  const { data: approvals, isLoading, error, refetch } = useApprovalsInbox();
+  const { data: approvals, isLoading, error, refetch } = useApprovalsList();
   const [refreshing, setRefreshing] = React.useState(false);
 
   const onRefresh = async () => {

@@ -31,6 +31,19 @@ export const storage = {
     await SecureStore.deleteItemAsync(USER_KEY);
   },
 
+  // Generic item storage
+  async setItem(key: string, value: string): Promise<void> {
+    await SecureStore.setItemAsync(key, value);
+  },
+
+  async getItem(key: string): Promise<string | null> {
+    return await SecureStore.getItemAsync(key);
+  },
+
+  async removeItem(key: string): Promise<void> {
+    await SecureStore.deleteItemAsync(key);
+  },
+
   // Clear all
   async clear(): Promise<void> {
     await this.removeToken();

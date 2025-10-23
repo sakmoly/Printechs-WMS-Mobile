@@ -14,13 +14,13 @@ import { router, useLocalSearchParams } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import QRCode from "react-native-qrcode-svg";
-import { useEmployees } from "../../src/hooks/useEmployees";
+import { useEmployeesList } from "../../src/hooks/useOptimizedApis";
 
 const { width } = Dimensions.get("window");
 
 export default function EmployeeProfileScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { data: employees } = useEmployees();
+  const { data: employees } = useEmployeesList();
 
   const employee = employees?.find((emp) => emp.name === id);
 

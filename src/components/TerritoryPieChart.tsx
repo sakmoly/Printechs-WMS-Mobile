@@ -12,7 +12,7 @@ import { Ionicons } from "@expo/vector-icons";
 interface TerritoryData {
   territory: string;
   total_sales: number;
-  invoice_count: number;
+  invoice_count?: number; // Make optional
 }
 
 interface TerritoryPieChartProps {
@@ -55,7 +55,7 @@ export const TerritoryPieChart: React.FC<TerritoryPieChartProps> = ({
   // Prepare pie chart data
   const pieData = data.map((item, index) => ({
     name: item.territory,
-    population: showSales ? item.total_sales : item.invoice_count,
+    population: showSales ? item.total_sales : item.invoice_count || 0,
     color: colors[index % colors.length],
     legendFontColor: "#374151",
     legendFontSize: 12,
@@ -63,7 +63,10 @@ export const TerritoryPieChart: React.FC<TerritoryPieChartProps> = ({
 
   // Calculate statistics
   const totalSales = data.reduce((sum, item) => sum + item.total_sales, 0);
-  const totalInvoices = data.reduce((sum, item) => sum + item.invoice_count, 0);
+  const totalInvoices = data.reduce(
+    (sum, item) => sum + (item.invoice_count || 0),
+    0
+  );
   const avgSales = totalSales / data.length;
 
   const chartConfig = {
@@ -126,7 +129,7 @@ export const TerritoryPieChart: React.FC<TerritoryPieChartProps> = ({
             <Text style={styles.legendValue}>
               {showSales
                 ? formatCurrency(item.total_sales)
-                : item.invoice_count.toString()}
+                : (item.invoice_count || 0).toString()}
             </Text>
           </View>
         ))}
@@ -174,12 +177,16 @@ export const TerritoryPieChart: React.FC<TerritoryPieChartProps> = ({
                 </View>
                 <View style={styles.cardStat}>
                   <Text style={styles.cardLabel}>Invoices</Text>
-                  <Text style={styles.cardValue}>{item.invoice_count}</Text>
+                  <Text style={styles.cardValue}>
+                    {item.invoice_count || "N/A"}
+                  </Text>
                 </View>
                 <View style={styles.cardStat}>
                   <Text style={styles.cardLabel}>Avg/Invoice</Text>
                   <Text style={styles.cardValue}>
-                    {formatCurrency(item.total_sales / item.invoice_count)}
+                    {item.invoice_count && item.invoice_count > 0
+                      ? formatCurrency(item.total_sales / item.invoice_count)
+                      : "N/A"}
                   </Text>
                 </View>
               </View>
@@ -193,9 +200,12 @@ export const TerritoryPieChart: React.FC<TerritoryPieChartProps> = ({
                 >
                   {showSales
                     ? `${((item.total_sales / totalSales) * 100).toFixed(1)}%`
-                    : `${((item.invoice_count / totalInvoices) * 100).toFixed(
-                        1
-                      )}%`}
+                    : totalInvoices > 0
+                    ? `${(
+                        ((item.invoice_count || 0) / totalInvoices) *
+                        100
+                      ).toFixed(1)}%`
+                    : "0%"}
                 </Text>
               </View>
             </View>

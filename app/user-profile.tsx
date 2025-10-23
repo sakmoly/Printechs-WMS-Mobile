@@ -16,45 +16,57 @@ import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import QRCode from "react-native-qrcode-svg";
 import { useAuthStore } from "../src/store/auth";
-import { erpApi } from "../src/api/erp";
-import type { EmployeeListItem } from "../src/api/schemas";
+import {
+  useUserInfo,
+  useEmployeeInfo,
+  useProfileQRData,
+} from "../src/hooks/useOptimizedApis";
 
 const { width } = Dimensions.get("window");
 
 export default function UserProfileScreen() {
   const { user, logout } = useAuthStore();
-  const [employeeData, setEmployeeData] = useState<EmployeeListItem | null>(
-    null
-  );
-  const [loading, setLoading] = useState(true);
+  const {
+    data: userInfo,
+    isLoading: userLoading,
+    error: userError,
+  } = useUserInfo();
+  const {
+    data: employeeInfo,
+    isLoading: employeeLoading,
+    error: employeeError,
+  } = useEmployeeInfo();
+  const {
+    data: qrData,
+    isLoading: qrLoading,
+    error: qrError,
+  } = useProfileQRData();
 
-  // Fetch employee data for current user
+  const loading = userLoading || employeeLoading || qrLoading;
+  const hasError = userError || employeeError || qrError;
+
+  // Debug: Log user data and API responses
   useEffect(() => {
-    const fetchEmployeeData = async () => {
-      try {
-        setLoading(true);
-        const employee = await erpApi.getCurrentUserEmployee();
-        if (employee) {
-          setEmployeeData(employee);
-          console.log(
-            "Fetched employee data:",
-            JSON.stringify(employee, null, 2)
-          );
-        }
-      } catch (error) {
-        console.error("Error fetching employee data:", error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchEmployeeData();
-  }, []);
-
-  // Debug: Log user data
-  useEffect(() => {
-    console.log("User Profile Data:", JSON.stringify(user, null, 2));
-  }, [user]);
+    console.log("=== USER PROFILE DEBUG ===");
+    console.log("User:", JSON.stringify(user, null, 2));
+    console.log("UserInfo:", JSON.stringify(userInfo, null, 2));
+    console.log("EmployeeInfo:", JSON.stringify(employeeInfo, null, 2));
+    console.log("QRData:", qrData);
+    console.log("Loading:", { userLoading, employeeLoading, qrLoading });
+    console.log("Errors:", { userError, employeeError, qrError });
+    console.log("=========================");
+  }, [
+    user,
+    userInfo,
+    employeeInfo,
+    qrData,
+    userLoading,
+    employeeLoading,
+    qrLoading,
+    userError,
+    employeeError,
+    qrError,
+  ]);
 
   if (!user) {
     return (
@@ -71,23 +83,62 @@ export default function UserProfileScreen() {
     );
   }
 
-  // Use employee data if available, otherwise fall back to user data
-  const displayData = employeeData || user;
+  // Show error state if there are API errors
+  if (hasError) {
+    return (
+      <View style={styles.errorContainer}>
+        <Ionicons name="warning-outline" size={64} color="#ef4444" />
+        <Text style={styles.errorText}>Failed to load profile data</Text>
+        <Text style={styles.errorSubtext}>
+          {userError?.message ||
+            employeeError?.message ||
+            qrError?.message ||
+            "Unknown error"}
+        </Text>
+        <TouchableOpacity
+          style={styles.backButton}
+          onPress={() => router.back()}
+        >
+          <Text style={styles.backButtonText}>Go Back</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // Use API data if available, otherwise fall back to user data
+  // Add safety checks to prevent undefined errors
+  const displayData = employeeInfo || userInfo || user;
   const displayName =
-    employeeData?.employee_name || user.full_name || user.username;
-  const displayEmail = employeeData?.company_email || user.email;
-  const displayPhone = employeeData?.cell_number || user.mobile_no;
-  const displayDesignation = employeeData?.designation || user.designation;
-  const displayDepartment = employeeData?.department || user.department;
-  const displayCompany = employeeData?.company || user.company || "Printechs";
+    employeeInfo?.employee_name ||
+    userInfo?.full_name ||
+    user?.full_name ||
+    user?.username ||
+    "Unknown User";
+  const displayEmail =
+    employeeInfo?.company_email || userInfo?.email || user?.email || "";
+  const displayPhone =
+    employeeInfo?.cell_number || userInfo?.mobile_no || user?.mobile_no || "";
+  const displayDesignation =
+    employeeInfo?.designation ||
+    userInfo?.designation ||
+    user?.designation ||
+    "";
+  const displayDepartment =
+    employeeInfo?.department || userInfo?.department || user?.department || "";
+  const displayCompany =
+    employeeInfo?.company || userInfo?.company || user?.company || "Printechs";
   const displayImage =
-    employeeData?.photo_url || employeeData?.image || user.image;
-  const displayBranch = employeeData?.branch;
-  const displayAddress =
-    employeeData?.current_address || employeeData?.current_address_display;
+    employeeInfo?.photo_url || userInfo?.image_url || user?.image || "";
+  const displayBranch = employeeInfo?.branch || "";
+  const displayAddress = employeeInfo?.current_address || "";
 
   // Generate vCard data for QR code
   const generateVCard = () => {
+    // Use pre-generated QR data if available, otherwise generate from current data
+    if (qrData && typeof qrData === "string" && qrData.length > 0) {
+      return qrData;
+    }
+
     // Clean address for vCard (remove extra newlines and format)
     const cleanAddress = displayAddress
       ? displayAddress.replace(/\n+/g, ", ").replace(/,\s*,/g, ",").trim()
@@ -96,7 +147,7 @@ export default function UserProfileScreen() {
     const vcard = [
       "BEGIN:VCARD",
       "VERSION:3.0",
-      `FN:${displayName}`,
+      `FN:${displayName || "Unknown User"}`,
       displayEmail ? `EMAIL:${displayEmail}` : "",
       displayPhone ? `TEL:${displayPhone}` : "",
       displayDesignation ? `TITLE:${displayDesignation}` : "",
@@ -588,7 +639,14 @@ const styles = StyleSheet.create({
     fontSize: 18,
     color: "#6b7280",
     marginTop: 16,
+    marginBottom: 8,
+  },
+  errorSubtext: {
+    fontSize: 14,
+    color: "#9ca3af",
+    textAlign: "center",
     marginBottom: 24,
+    paddingHorizontal: 20,
   },
   backButton: {
     backgroundColor: "#667eea",
