@@ -1,0 +1,1948 @@
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
+  Alert,
+  FlatList,
+  ActivityIndicator,
+  Modal,
+} from "react-native";
+import { useNavigation, useFocusEffect } from "@react-navigation/native";
+import { useApp } from "../context/AppContext";
+import { BarcodeScanner } from "../components/BarcodeScanner";
+import { StatusBadge } from "../components/StatusBadge";
+import { ProgressIndicator } from "../components/ProgressIndicator";
+import { dataService } from "../services/data.service";
+import { apiService } from "../services/api.service";
+import { addEvent, syncEvents } from "../services/event-queue.service";
+import { getSettings } from "../services/settings.service";
+import { normalizeASN } from "../utils/asn";
+import { TransferCarton } from "../types";
+import { getDatabase } from "../database/database";
+
+// Put Away workflow states
+type PutAwayWorkflowState =
+  | "PUTAWAY_LIST" // Step 10: List of sealed TCs ready for put away
+  | "SCAN_TC_FOR_PUTAWAY" // Step 11: Scan or select TC for put away
+  | "SCAN_LOCATION" // Step 12: Scan Location
+  | "COMPLETE_PUTAWAY" // Step 13: Complete Put Away
+  | "PUTAWAY_TRANSACTIONS"; // View Put Away transactions
+
+// Put Away transaction interface
+interface PutAwayTransaction {
+  offline_uuid: string;
+  tc_id: string;
+  rack: string;
+  synced: number;
+  event_time: string;
+  asn_no?: string;
+}
+
+export default function PutAwayScreen() {
+  console.log("🔄 PutAwayScreen: Component rendered");
+  const navigation = useNavigation();
+  const { activeASN, activeSession, settings } = useApp();
+  const [loading, setLoading] = useState(false);
+
+  // Workflow state
+  const [workflowState, setWorkflowState] =
+    useState<PutAwayWorkflowState>("PUTAWAY_LIST");
+
+  // Put Away state
+  const [sealedTCs, setSealedTCs] = useState<TransferCarton[]>([]);
+  const [remainingItems, setRemainingItems] = useState<any[]>([]); // Items without TC that need putaway
+  const [selectedTC, setSelectedTC] = useState<string | null>(null);
+  const [selectedTCObj, setSelectedTCObj] = useState<TransferCarton | null>(
+    null
+  );
+  const [putawayTask, setPutawayTask] = useState<string | null>(null); // Store putaway task from API response
+  const [selectedRack, setSelectedRack] = useState<string | null>(null); // Store rack/location from scan
+  const [selectedBin, setSelectedBin] = useState<string | null>(null); // Store bin from location scan
+  const [lastTap, setLastTap] = useState<{ tcId: string; time: number } | null>(
+    null
+  );
+  const [transactions, setTransactions] = useState<PutAwayTransaction[]>([]);
+  const [errorModal, setErrorModal] = useState<{
+    visible: boolean;
+    title: string;
+    message: string;
+  } | null>(null);
+
+  // Load sealed TCs for put away list
+  const loadSealedTCs = useCallback(async () => {
+    console.warn("🔄 PutAwayScreen: Loading warehouse TCs for putaway...", { activeASN });
+    setLoading(true);
+    try {
+      const db = await getDatabase();
+      if (!db) {
+        console.error("❌ PutAwayScreen: Database not initialized");
+        setSealedTCs([]);
+        setLoading(false);
+        return;
+      }
+
+      // Load all TCs with "Sealed" or "Dispatched" status (both need putaway)
+      // Explicitly exclude "Completed" status to ensure completed putaways don't show
+      // We'll filter by warehouse_type after loading
+      const allTCs = await db.getAllAsync<TransferCarton>(
+        `SELECT * FROM tc_cache 
+         WHERE status IN ("Sealed", "Dispatched") 
+           AND status != "Completed" 
+         ORDER BY updated_on DESC`
+      );
+      
+      console.warn(`📦 PutAwayScreen: Found ${allTCs.length} TCs with Sealed/Dispatched status`);
+      console.warn(`📦 PutAwayScreen: TC details:`, allTCs.map(tc => ({ 
+        tc_id: tc.tc_id, 
+        asn_no: tc.asn_no, 
+        store: tc.store, 
+        status: tc.status 
+      })));
+      
+      // NEW: Also load Putaway BOXes (boxes with purpose="PUTAWAY")
+      // These boxes have BOX ID = TC ID (same identifier)
+      const putawayBoxes = await db.getAllAsync<{
+        box_id: string;
+        asn_no: string;
+        store: string;
+        status: string;
+        updated_on: string;
+      }>(
+        `SELECT box_id, asn_no, store, status, updated_on 
+         FROM box_cache 
+         WHERE purpose = 'PUTAWAY' 
+           AND status IN ('Closed', 'Sealed')
+         ORDER BY updated_on DESC`
+      );
+      
+      console.warn(`📦 PutAwayScreen: Found ${putawayBoxes.length} Putaway boxes`);
+      
+      // Convert Putaway boxes to TransferCarton format (BOX ID = TC ID)
+      const putawayTCs: TransferCarton[] = putawayBoxes.map(box => ({
+        tc_id: box.box_id, // BOX ID = TC ID
+        asn_no: box.asn_no,
+        to_no: null,
+        store: box.store,
+        status: box.status === "Sealed" ? "Sealed" : "Sealed", // Putaway boxes are treated as Sealed
+        updated_on: box.updated_on,
+      }));
+      
+      // Get list of TCs that have already been assigned a location (have PUTAWAY_TO_RACK events)
+      // These should NOT appear in the list as they've already been scanned
+      const alreadyAssignedTCs = await db.getAllAsync<{ tc_id: string }>(
+        `SELECT DISTINCT tc_id 
+         FROM event_queue 
+         WHERE event_type = 'PUTAWAY_TO_RACK' 
+           AND tc_id IS NOT NULL 
+           AND tc_id != ''`
+      );
+      const assignedTCSet = new Set(alreadyAssignedTCs.map(t => t.tc_id.toUpperCase()));
+      console.warn(`📦 PutAwayScreen: Found ${assignedTCSet.size} TCs already assigned to locations (will be excluded)`);
+      
+      // Filter by warehouse_type and optionally by ASN
+      // Also deduplicate TCs by tc_id to prevent duplicates
+      // Exclude TCs that have already been assigned a location
+      const warehouseTCs: TransferCarton[] = [];
+      const seenTCIds = new Set<string>();
+      
+      for (const tc of allTCs) {
+        // Skip if already seen (deduplication)
+        if (seenTCIds.has(tc.tc_id)) {
+          console.warn(`⚠️ PutAwayScreen: Skipped duplicate TC ${tc.tc_id}`);
+          continue;
+        }
+        
+        // Skip if status is Completed (shouldn't happen due to query, but double-check)
+        if (tc.status === "Completed") {
+          console.warn(`⚠️ PutAwayScreen: Skipped completed TC ${tc.tc_id}`);
+          continue;
+        }
+        
+        // Skip if TC has already been assigned a location
+        if (assignedTCSet.has(tc.tc_id.toUpperCase())) {
+          console.warn(`⚠️ PutAwayScreen: Skipped TC ${tc.tc_id} - already assigned to a location`);
+          continue;
+        }
+        
+        // If activeASN is set, only include TCs for that ASN
+        if (activeASN && tc.asn_no && tc.asn_no.toUpperCase().trim() !== activeASN.toUpperCase().trim()) {
+          console.warn(`⚠️ PutAwayScreen: Skipped TC ${tc.tc_id} - ASN mismatch (TC ASN: ${tc.asn_no}, Active ASN: ${activeASN})`);
+          continue; // Skip TCs that don't match active ASN
+        }
+        
+        const isWarehouse = await dataService.isWarehouse(tc.store || "");
+        if (isWarehouse) {
+          warehouseTCs.push(tc);
+          seenTCIds.add(tc.tc_id);
+          console.warn(`✅ PutAwayScreen: Added warehouse TC ${tc.tc_id} (Store: ${tc.store}, Status: ${tc.status}, ASN: ${tc.asn_no})`);
+        } else {
+          console.warn(`⚠️ PutAwayScreen: Skipped non-warehouse TC ${tc.tc_id} (Store: ${tc.store}, Status: ${tc.status})`);
+        }
+      }
+      
+      // Also check for warehouse boxes that are closed but not yet packed into a TC
+      // These should appear in PutawayScreen if they're warehouse boxes
+      // Exclude boxes that have already been assigned a location
+      const warehouseBoxes = await db.getAllAsync<{
+        box_id: string;
+        asn_no: string;
+        store: string;
+        status: string;
+        updated_on: string;
+      }>(
+        `SELECT box_id, asn_no, store, status, updated_on 
+         FROM box_cache 
+         WHERE (store LIKE 'WH-%' OR store = 'WAREHOUSE')
+           AND status = 'Closed'
+           AND (purpose IS NULL OR purpose != 'PUTAWAY')
+         ORDER BY updated_on DESC`
+      );
+      
+      console.warn(`📦 PutAwayScreen: Found ${warehouseBoxes.length} closed warehouse boxes (non-Putaway)`);
+      
+      // Check which boxes are packed into TCs
+      for (const box of warehouseBoxes) {
+        // If activeASN is set, only include boxes for that ASN
+        if (activeASN && box.asn_no && box.asn_no.toUpperCase().trim() !== activeASN.toUpperCase().trim()) {
+          continue;
+        }
+        
+        // Skip if box has already been assigned a location (using box_id as tc_id for putaway boxes)
+        if (assignedTCSet.has(box.box_id.toUpperCase())) {
+          console.warn(`⚠️ PutAwayScreen: Skipped box ${box.box_id} - already assigned to a location`);
+          continue;
+        }
+        
+        // Check if this box is packed into a TC
+        const packedIntoTC = await db.getFirstAsync<{ tc_id: string }>(
+          `SELECT tc_id 
+           FROM event_queue 
+           WHERE event_type = 'PACK_BOX_TO_TC' 
+             AND box_id = ?
+           LIMIT 1`,
+          [box.box_id]
+        );
+        
+        if (!packedIntoTC) {
+          // Box is not packed into a TC yet - it should appear in PackingScreen, not PutawayScreen
+          console.warn(`⚠️ PutAwayScreen: Box ${box.box_id} is not packed into a TC yet - should appear in PackingScreen`);
+        } else {
+          // Check if the TC is sealed/dispatched
+          const tc = await db.getFirstAsync<{ status: string }>(
+            `SELECT status FROM tc_cache WHERE tc_id = ?`,
+            [packedIntoTC.tc_id]
+          );
+          
+          if (tc && (tc.status === "Sealed" || tc.status === "Dispatched")) {
+            // Box is packed into a sealed/dispatched TC - the TC should appear in PutawayScreen
+            // But skip if TC has already been assigned a location
+            if (!assignedTCSet.has(packedIntoTC.tc_id.toUpperCase())) {
+              const tcExists = warehouseTCs.find(t => t.tc_id === packedIntoTC.tc_id);
+              if (!tcExists) {
+                console.warn(`⚠️ PutAwayScreen: Box ${box.box_id} is packed into TC ${packedIntoTC.tc_id} (status: ${tc.status}), but TC not found in list`);
+              }
+            } else {
+              console.warn(`⚠️ PutAwayScreen: Box ${box.box_id} is packed into TC ${packedIntoTC.tc_id} (status: ${tc.status}), but TC already assigned to location`);
+            }
+          } else {
+            console.warn(`⚠️ PutAwayScreen: Box ${box.box_id} is packed into TC ${packedIntoTC.tc_id} (status: ${tc?.status || 'unknown'}) - TC not sealed yet, should appear in PackingScreen`);
+          }
+        }
+      }
+      
+      // Add Putaway boxes (filtered by ASN if needed)
+      // Exclude Putaway boxes that have already been assigned a location
+      for (const putawayTC of putawayTCs) {
+        // Skip if already seen (deduplication)
+        if (seenTCIds.has(putawayTC.tc_id)) {
+          console.warn(`⚠️ PutAwayScreen: Skipped duplicate Putaway box ${putawayTC.tc_id}`);
+          continue;
+        }
+        
+        // Skip if Putaway box has already been assigned a location
+        if (assignedTCSet.has(putawayTC.tc_id.toUpperCase())) {
+          console.warn(`⚠️ PutAwayScreen: Skipped Putaway box ${putawayTC.tc_id} - already assigned to a location`);
+          continue;
+        }
+        
+        if (activeASN && putawayTC.asn_no && putawayTC.asn_no.toUpperCase().trim() !== activeASN.toUpperCase().trim()) {
+          continue; // Skip boxes that don't match active ASN
+        }
+        
+        const isWarehouse = await dataService.isWarehouse(putawayTC.store || "");
+        if (isWarehouse) {
+          // Check if this box ID already exists as a TC (avoid duplicates)
+          const exists = warehouseTCs.find(tc => tc.tc_id === putawayTC.tc_id);
+          if (!exists) {
+            warehouseTCs.push(putawayTC);
+            seenTCIds.add(putawayTC.tc_id);
+            console.warn(`✅ PutAwayScreen: Added Putaway box ${putawayTC.tc_id} (BOX ID = TC ID, Store: ${putawayTC.store}, ASN: ${putawayTC.asn_no})`);
+          }
+        }
+      }
+      
+      console.warn(`📦 PutAwayScreen: Found ${warehouseTCs.length} warehouse TCs + Putaway boxes for putaway${activeASN ? ` (filtered by ASN: ${activeASN})` : ""}`);
+      
+      setSealedTCs(warehouseTCs);
+      
+      // Option 1: Check for putaway tasks from backend API (for remaining items)
+      // This ensures we show tasks created by the backend even if they're not in TCs yet
+      if (activeASN) {
+        try {
+          // Try to get putaway tasks from backend
+          // Note: Backend may not support source_type parameter, so we try without it first
+          let putawayTasks: any = null;
+          try {
+            // Try without source_type first (most backends don't support it)
+            putawayTasks = await apiService.getPutawayTasks({
+              status: "Open",
+              advance_shipping_notice: activeASN,
+            });
+          } catch (tasksError: any) {
+            // Check both message and details fields for source_type errors
+            const errorMessage = tasksError.message || "";
+            const errorDetails = tasksError.details || "";
+            const errorCode = tasksError.code || "";
+            const fullError = `${errorMessage} ${errorDetails} ${errorCode}`.toLowerCase();
+            
+            // If error is about source_type or unknown column, it's expected - backend doesn't support it
+            if (fullError.includes("source_type") || 
+                fullError.includes("unknown column") ||
+                fullError.includes("pt.source_type") ||
+                (errorCode === "DATABASE_ERROR" && fullError.includes("source_type"))) {
+              // Backend doesn't support source_type - this is expected, suppress error
+              // Don't log as error, just continue without tasks
+              putawayTasks = null;
+            } else {
+              // For other errors, log but don't block the screen
+              console.warn(`⚠️ Error fetching putaway tasks:`, tasksError.message || tasksError);
+              putawayTasks = null;
+            }
+          }
+          
+          let tasksList: any[] = [];
+          if (Array.isArray(putawayTasks)) {
+            tasksList = putawayTasks;
+          } else if (putawayTasks?.data && Array.isArray(putawayTasks.data)) {
+            tasksList = putawayTasks.data;
+          } else if (putawayTasks?.tasks && Array.isArray(putawayTasks.tasks)) {
+            tasksList = putawayTasks.tasks;
+          }
+          
+          // Deduplicate tasks by task title/ID to prevent duplicates
+          const uniqueTasks = new Map<string, any>();
+          for (const task of tasksList) {
+            const taskId = task.putaway_task || task.task_title || task.id || task.task_id;
+            if (taskId && !uniqueTasks.has(taskId)) {
+              uniqueTasks.set(taskId, task);
+            }
+          }
+          const deduplicatedTasks = Array.from(uniqueTasks.values());
+          
+          if (deduplicatedTasks.length > 0) {
+            console.warn(`✅ PutAwayScreen: Found ${deduplicatedTasks.length} unique putaway task(s) from backend API for ASN ${activeASN} (${tasksList.length} total, ${tasksList.length - deduplicatedTasks.length} duplicates removed)`);
+            // Tasks are available - they will be shown when user scans TC/Box
+            // The tasks are created by backend and will be used when scanning location
+          } else {
+            console.warn(`ℹ️ PutAwayScreen: No putaway tasks found in backend for ASN ${activeASN}`);
+            console.warn(`   This is normal if all items were allocated to TO or if tasks haven't been created yet.`);
+          }
+        } catch (tasksError: any) {
+          // Don't block if tasks API fails - app can still work with TCs and remaining items
+          const errorMessage = tasksError.message || "";
+          const errorDetails = tasksError.details || "";
+          const fullError = `${errorMessage} ${errorDetails}`;
+          
+          if (tasksError.message?.includes("404") || tasksError.message?.includes("not found")) {
+            console.warn(`⚠️ Putaway tasks API endpoint not available (404) - this is optional`);
+          } else if (fullError.includes("source_type") || 
+                     fullError.includes("Unknown column") ||
+                     fullError.includes("pt.source_type")) {
+            // Backend doesn't support source_type - this is expected, suppress error
+            console.warn(`⚠️ Backend database doesn't support source_type column - this is expected and can be ignored`);
+          } else {
+            console.warn(`⚠️ Error fetching putaway tasks:`, tasksError.message);
+          }
+        }
+      }
+      
+      // Remaining items section removed - user prefers to see only TCs/Boxes, not individual items
+      // await loadRemainingItems(); // Not needed anymore
+    } catch (error: any) {
+      console.error("❌ PutAwayScreen: Error loading warehouse TCs:", error);
+      setSealedTCs([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [activeASN, loadRemainingItems]);
+
+  // Load remaining items (items in warehouse boxes that haven't been packed into TCs yet)
+  // Enhanced to use dataService.getRemainingItems for full details (shipped_qty, allocated_qty, remaining_qty)
+  const loadRemainingItems = useCallback(async () => {
+    if (!activeASN) {
+      setRemainingItems([]);
+      return;
+    }
+
+    try {
+      // Use dataService.getRemainingItems to get full details
+      const allRemainingItems = await dataService.getRemainingItems(activeASN);
+      
+      const db = await getDatabase();
+      if (!db) {
+        setRemainingItems([]);
+        return;
+      }
+
+      // Get items in warehouse boxes that haven't been packed into TCs yet
+      const warehouseStores = await db.getAllAsync<{ code: string }>(
+        `SELECT code FROM warehouse_store_cache WHERE warehouse_type = 'Warehouse'`
+      );
+      const warehouseStoreCodes = warehouseStores.map(ws => ws.code);
+      const warehousePatterns = ['WAREHOUSE', 'WH-MAIN', 'WH-', ...warehouseStoreCodes];
+      const placeholders = warehousePatterns.map(() => '?').join(',');
+
+      const warehouseBoxItems = await db.getAllAsync<{
+        item_code: string;
+        box_id: string;
+        scanned_qty: number;
+        asn_no: string;
+      }>(
+        `SELECT 
+          si.item_code, 
+          si.box_id, 
+          SUM(si.scanned_qty) as scanned_qty, 
+          si.asn_no
+        FROM scanned_items si
+        WHERE si.asn_no = ? 
+          AND (
+            UPPER(si.store) = 'WAREHOUSE' 
+            OR UPPER(si.store) LIKE 'WH-%'
+            OR si.store IN (${placeholders})
+          )
+          AND si.box_id IS NOT NULL
+          AND si.box_id != ''
+          AND si.box_id NOT IN (
+            SELECT DISTINCT box_id 
+            FROM event_queue 
+            WHERE event_type = 'PACK_BOX_TO_TC' 
+              AND box_id IS NOT NULL 
+              AND box_id != ''
+          )
+        GROUP BY si.item_code, si.box_id, si.asn_no
+        HAVING scanned_qty > 0
+        ORDER BY si.item_code, si.box_id
+      `, [activeASN, ...warehousePatterns]);
+
+      // Merge: Use full details from getRemainingItems, add box_id from warehouseBoxItems
+      const boxMap = new Map<string, string>(); // item_code -> box_id
+      warehouseBoxItems.forEach(boxItem => {
+        if (!boxMap.has(boxItem.item_code)) {
+          boxMap.set(boxItem.item_code, boxItem.box_id);
+        }
+      });
+
+      // Combine remaining items with box information
+      const remainingItemsList = allRemainingItems
+        .filter(item => (item.remaining_qty || 0) > 0)
+        .map(item => ({
+          ...item,
+          box_id: boxMap.get(item.item_code) || item.box_id,
+        }));
+
+      console.warn(`📦 PutAwayScreen: Found ${remainingItemsList.length} remaining items with full details`);
+      
+      setRemainingItems(remainingItemsList);
+    } catch (error: any) {
+      console.warn(`⚠️ PutAwayScreen: Error loading remaining items:`, error.message);
+      setRemainingItems([]);
+    }
+  }, [activeASN]);
+
+  // Load Put Away transactions
+  const loadTransactions = useCallback(async () => {
+    console.log("🔄 PutAwayScreen: Loading transactions...");
+    setLoading(true);
+    try {
+      const db = await getDatabase();
+      if (!db) {
+        console.error("❌ PutAwayScreen: Database not initialized");
+        setTransactions([]);
+        setLoading(false);
+        return;
+      }
+
+      // Query PUTAWAY_TO_RACK events only (these have the location/rack info)
+      // PUTAWAY_DISPATCH is just a completion marker, so we don't need to show it separately
+      // Deduplicate by showing only the most recent event for each TC+rack combination
+      // This prevents duplicates when the same TC is scanned multiple times at the same location
+      const putAwayEvents = await db.getAllAsync<PutAwayTransaction>(
+        `SELECT 
+          e1.offline_uuid,
+          e1.tc_id,
+          e1.rack,
+          e1.synced,
+          e1.event_time,
+          e1.asn_no
+        FROM event_queue e1
+        INNER JOIN (
+          SELECT tc_id, rack, MAX(event_time) as max_time
+          FROM event_queue
+          WHERE event_type = 'PUTAWAY_TO_RACK'
+          GROUP BY tc_id, rack
+        ) e2 ON e1.tc_id = e2.tc_id 
+          AND e1.rack = e2.rack 
+          AND e1.event_time = e2.max_time
+        WHERE e1.event_type = 'PUTAWAY_TO_RACK'
+        ORDER BY e1.event_time DESC`
+      );
+
+      console.log(
+        "✅ PutAwayScreen: Loaded transactions:",
+        putAwayEvents.length
+      );
+      setTransactions(putAwayEvents);
+    } catch (error: any) {
+      console.error("❌ PutAwayScreen: Error loading transactions:", error);
+      setTransactions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Load sealed TCs when screen is focused
+  useFocusEffect(
+    useCallback(() => {
+      if (workflowState === "PUTAWAY_LIST") {
+        loadSealedTCs();
+      } else if (workflowState === "PUTAWAY_TRANSACTIONS") {
+        loadTransactions();
+      }
+    }, [loadSealedTCs, loadTransactions, workflowState])
+  );
+
+  // Also load on initial mount
+  useEffect(() => {
+    if (workflowState === "PUTAWAY_LIST") {
+      loadSealedTCs();
+    }
+  }, [loadSealedTCs, workflowState]);
+
+  // Step 11: Handle TC selection (double tap or scan)
+  const handleTCSelection = async (tcId: string) => {
+    const now = Date.now();
+    const tc = sealedTCs.find((t) => t.tc_id === tcId);
+
+    if (!tc) {
+      Alert.alert("Error", `Transfer Carton ${tcId} not found`);
+      return;
+    }
+
+    const selectTC = async () => {
+      setSelectedTC(tcId);
+      setSelectedTCObj(tc);
+      setPutawayTask(null); // Reset putaway task when selecting new TC
+      
+      // Note: We don't fetch putaway task here because the API requires a location (rack)
+      // Instead, we'll get the putaway_task when location is scanned (Workflow 1)
+      // Then if location is scanned again, we'll use the stored putaway_task (Workflow 2)
+      
+      setWorkflowState("SCAN_LOCATION");
+    };
+
+    if (lastTap && lastTap.tcId === tcId && now - lastTap.time < 500) {
+      // Double tap detected
+      setLastTap(null);
+      await selectTC();
+    } else {
+      // First tap - set timer for potential double tap
+      setLastTap({ tcId, time: now });
+
+      // If no second tap within 500ms, treat as single tap (select)
+      setTimeout(() => {
+        setLastTap((prev) => {
+          if (prev && prev.tcId === tcId && Date.now() - prev.time >= 500) {
+            // Single tap - select TC
+            selectTC();
+            return null;
+          }
+          return prev;
+        });
+      }, 500);
+    }
+  };
+
+  // Step 11: Scan TC
+  const handleTCScan = async (barcode: string) => {
+    const scannedValue = barcode.trim().toUpperCase();
+    
+    // Check if scanned value is a BOX ID (starts with "BOX-")
+    if (scannedValue.startsWith("BOX-")) {
+      // User scanned a BOX - check if it's a Putaway box (BOX ID = TC ID)
+      try {
+        const db = await getDatabase();
+        if (!db) {
+          Alert.alert("Error", "Database not available");
+          return;
+        }
+
+        // NEW WORKFLOW: Check if this is a Putaway box (purpose="PUTAWAY")
+        // For Putaway boxes, BOX ID = TC ID, so we can use it directly
+        const putawayBox = await db.getFirstAsync<{ 
+          box_id: string; 
+          purpose: string; 
+          store: string; 
+          status: string;
+          asn_no: string;
+        }>(
+          `SELECT box_id, purpose, store, status, asn_no 
+           FROM box_cache 
+           WHERE box_id = ? AND purpose = 'PUTAWAY'`,
+          [scannedValue]
+        );
+
+        if (putawayBox) {
+          // This is a Putaway box - BOX ID = TC ID
+          // Check if it's in the sealed list (as a TC)
+          const tc = sealedTCs.find((t) => t.tc_id === scannedValue);
+          if (tc) {
+            // Found in sealed list - use it directly
+            setSelectedTC(scannedValue); // BOX ID = TC ID
+            setSelectedTCObj(tc);
+            setPutawayTask(null);
+            setWorkflowState("SCAN_LOCATION");
+            console.warn(`✅ Putaway box ${scannedValue} scanned (BOX ID = TC ID)`);
+            return;
+          } else {
+            // Putaway box exists but not in sealed list - check status
+            if (putawayBox.status === "Closed") {
+              Alert.alert(
+                "Box Not Sealed",
+                `Putaway box ${scannedValue} is closed but not sealed.\n\nPlease seal this box in the Packing screen first.`
+              );
+            } else {
+              Alert.alert(
+                "Box Not Available",
+                `Putaway box ${scannedValue} is not available for putaway.\n\nStatus: ${putawayBox.status}\n\nPlease ensure the box is sealed.`
+              );
+            }
+            return;
+          }
+        }
+
+        // Not a Putaway box - check if it's part of a regular TC
+        const tcForBox = await db.getFirstAsync<{ tc_id: string }>(
+          `SELECT DISTINCT tc_id 
+           FROM event_queue 
+           WHERE event_type = 'PACK_BOX_TO_TC' 
+             AND box_id = ? 
+             AND tc_id IS NOT NULL 
+             AND tc_id != ''
+           ORDER BY event_time DESC
+           LIMIT 1`,
+          [scannedValue]
+        );
+
+        if (tcForBox && tcForBox.tc_id) {
+          // Box is part of a TC - find that TC in sealed list
+          const tc = sealedTCs.find((t) => t.tc_id === tcForBox.tc_id);
+          if (tc) {
+            Alert.alert(
+              "Box Found in TC",
+              `Box ${scannedValue} is part of Transfer Carton ${tcForBox.tc_id}.\n\nUsing TC ${tcForBox.tc_id} for putaway.`,
+              [
+                {
+                  text: "OK",
+                  onPress: () => {
+                    setSelectedTC(tcForBox.tc_id);
+                    setSelectedTCObj(tc);
+                    setPutawayTask(null);
+                    setWorkflowState("SCAN_LOCATION");
+                  },
+                },
+              ]
+            );
+            return;
+          } else {
+            Alert.alert(
+              "TC Not Available",
+              `Box ${scannedValue} is part of Transfer Carton ${tcForBox.tc_id}, but that TC is not available for putaway.\n\nPlease ensure the TC is sealed and belongs to a warehouse.`
+            );
+            return;
+          }
+        } else {
+          // Box is not part of any TC and not a Putaway box
+          Alert.alert(
+            "Box Not Packed",
+            `You scanned a BOX (${scannedValue}), but Put Away requires a Transfer Carton (TC) or Putaway box.\n\nThis box needs to be:\n• Packed into a TC (for store boxes), OR\n• Sealed as a Putaway box (for warehouse items)\n\nGo to Packing screen to pack or seal.`
+          );
+          return;
+        }
+      } catch (error: any) {
+        console.error("❌ Error checking box:", error);
+        Alert.alert("Error", `Failed to process box scan: ${error.message}`);
+        return;
+      }
+    }
+
+    // Scanned value is not a BOX - treat as TC ID
+    const tc = sealedTCs.find((t) => t.tc_id === scannedValue);
+
+    if (!tc) {
+      // Check if it might be a TC that exists but isn't sealed/dispatched
+      try {
+        const db = await getDatabase();
+        const existingTC = await db.getFirstAsync<{ tc_id: string; status: string; store: string }>(
+          `SELECT tc_id, status, store FROM tc_cache WHERE tc_id = ?`,
+          [scannedValue]
+        );
+
+        if (existingTC) {
+          // TC exists but not in sealed list
+          const isWarehouse = await dataService.isWarehouse(existingTC.store || "");
+          if (!isWarehouse) {
+            Alert.alert(
+              "Not a Warehouse TC",
+              `Transfer Carton ${scannedValue} belongs to ${existingTC.store}, which is not a warehouse.\n\nOnly warehouse Transfer Cartons can be put away.`
+            );
+          } else if (existingTC.status !== "Sealed" && existingTC.status !== "Dispatched") {
+            Alert.alert(
+              "TC Not Ready",
+              `Transfer Carton ${scannedValue} is ${existingTC.status}, but needs to be "Sealed" or "Dispatched" for putaway.\n\nCurrent status: ${existingTC.status}\n\nPlease seal or dispatch the TC first.`
+            );
+          } else {
+            Alert.alert(
+              "TC Not Found",
+              `Transfer Carton ${scannedValue} exists but is not available for putaway.\n\nStatus: ${existingTC.status}\nStore: ${existingTC.store}\n\nPlease ensure the TC is sealed/dispatched and belongs to a warehouse.`
+            );
+          }
+        } else {
+          Alert.alert(
+            "Transfer Carton Not Found",
+            `Transfer Carton ${scannedValue} not found.\n\nPlease ensure:\n• The TC exists\n• The TC is sealed or dispatched\n• The TC belongs to a warehouse\n• You have synced the latest data`
+          );
+        }
+      } catch (error: any) {
+        console.error("❌ Error checking TC:", error);
+        Alert.alert(
+          "Error",
+          `Transfer Carton ${scannedValue} not found in sealed list. Please ensure it is sealed and belongs to warehouse.`
+        );
+      }
+      return;
+    }
+
+    setSelectedTC(scannedValue);
+    setSelectedTCObj(tc);
+    setPutawayTask(null); // Reset putaway task when selecting new TC
+    
+    // Note: We don't fetch putaway task here because the API requires a location (rack)
+    // Instead, we'll get the putaway_task when location is scanned (Workflow 1)
+    // Then if location is scanned again, we'll use the stored putaway_task (Workflow 2)
+    
+    setWorkflowState("SCAN_LOCATION");
+  };
+
+  // Step 12: Scan Location
+  const handleLocationScan = async (locationId: string) => {
+    if (!selectedTC || !selectedTCObj) {
+      Alert.alert("Error", "No Transfer Carton selected");
+      return;
+    }
+
+    // Check if this TC has already been assigned a location
+    const db = await getDatabase();
+    if (db) {
+      const existingAssignment = await db.getFirstAsync<{ rack: string; event_time: string }>(
+        `SELECT rack, event_time 
+         FROM event_queue 
+         WHERE event_type = 'PUTAWAY_TO_RACK' 
+           AND tc_id = ? 
+         ORDER BY event_time DESC 
+         LIMIT 1`,
+        [selectedTC]
+      );
+      
+      if (existingAssignment) {
+        Alert.alert(
+          "Already Assigned",
+          `Transfer Carton ${selectedTC} has already been assigned to location ${existingAssignment.rack}.\n\n` +
+          `Assignment time: ${new Date(existingAssignment.event_time).toLocaleString()}\n\n` +
+          `This TC will not appear in the Putaway list anymore.`
+        );
+        // Refresh the list to remove this TC
+        await loadSealedTCs();
+        setWorkflowState("PUTAWAY_LIST");
+        return;
+      }
+    }
+
+    const locationIdUpper = locationId.trim().toUpperCase();
+    setLoading(true);
+
+    try {
+      const settings = await getSettings();
+      // Use ASN from the selected TC, fallback to active ASN or settings
+      const asn = selectedTCObj.asn_no || activeASN || settings?.active_asn;
+      // Use active session or settings session, or empty string if not available
+      const session = activeSession || settings?.active_session || "";
+
+      if (!asn) {
+        Alert.alert(
+          "Error",
+          "Unable to determine ASN for this Transfer Carton"
+        );
+        setLoading(false);
+        return;
+      }
+
+      const normalizedASN = normalizeASN(asn);
+
+      // Validate location exists in location_cache (synced from tablocation table)
+      let location = await dataService.getLocation(locationIdUpper);
+      if (!location) {
+        // Location not found in cache - try to fetch from backend
+        try {
+          console.warn(`⚠️ Location ${locationIdUpper} not found in cache, checking backend...`);
+          // Trigger a sync of locations to ensure we have latest data
+          const { syncMasterDataFromDesktop } = await import("../services/master-data-sync.service");
+          await syncMasterDataFromDesktop();
+          
+          // Check again after sync
+          location = await dataService.getLocation(locationIdUpper);
+          
+          if (!location) {
+            // Still not found - location doesn't exist in backend
+            setErrorModal({
+              visible: true,
+              title: "Invalid Location",
+              message: `Location "${locationIdUpper}" is not a valid warehouse location.\n\nPlease scan a valid location code (location_id) that exists in the location master data.`,
+            });
+            setLoading(false);
+            return;
+          }
+        } catch (syncError: any) {
+          console.error("❌ Error syncing locations:", syncError);
+          setErrorModal({
+            visible: true,
+            title: "Validation Error",
+            message: `Unable to validate location "${locationIdUpper}" against backend.\n\nPlease ensure the location exists in the location master data (tablocation table).`,
+          });
+          setLoading(false);
+          return;
+        }
+      }
+
+      // Check if location is available
+      if (location.is_available === 0) {
+        setErrorModal({
+          visible: true,
+          title: "Location Not Available",
+          message: `Location "${locationIdUpper}" is currently not available.\n\nPlease select a different location.`,
+        });
+        setLoading(false);
+        return;
+      }
+
+      // Extract bin from location if available (format: A1-R01-L1-B1 -> bin is B1)
+      // Or use location_id as rack if no bin is specified
+      const bin = location.bin_id || undefined;
+      const rack = locationIdUpper; // Use scanned location_id as rack
+      
+      // Store rack and bin for use in complete putaway
+      setSelectedRack(rack);
+      setSelectedBin(bin || null);
+
+      // Try to call API to scan transfer carton and location
+      // Supports two workflows:
+      // Workflow 1: If putaway_task exists (from previous TC scan), update existing task with location
+      // Workflow 2: If no putaway_task, create/update task with TC + location
+      // If API endpoint doesn't exist (404), fall back to event-based approach
+      let apiSuccess = false;
+      let response: any = null;
+      let apiErrorOccurred = false;
+      
+      try {
+        // If we have a putaway_task from previous step, use it to update location only
+        // Otherwise, use tc_id to create/update task with location
+        const requestBody: any = {
+          rack: rack,
+          bin: bin,
+          user_id: settings.user_id || undefined,
+        };
+        
+        if (putawayTask) {
+          // Workflow 2: Update existing task with location only
+          requestBody.putaway_task = putawayTask;
+          console.warn(`🔄 Updating existing putaway task ${putawayTask} with location ${locationIdUpper}`);
+        } else {
+          // Workflow 1: Create/update task with TC + location
+          requestBody.tc_id = selectedTC;
+          console.warn(`🔄 Creating/updating putaway task for TC ${selectedTC} with location ${locationIdUpper}`);
+        }
+        
+        response = await apiService.scanTransferCarton(requestBody);
+
+        // API call succeeded - mark as success even if response structure is different
+        apiSuccess = true;
+        console.warn(`✅ Putaway API call succeeded`);
+
+        // Store putaway task from response for completion (if available)
+        if (response?.data?.putaway_task) {
+          setPutawayTask(response.data.putaway_task);
+          console.warn(`✅ Putaway task created/updated: ${response.data.putaway_task}`);
+        } else if (response?.putaway_task) {
+          setPutawayTask(response.putaway_task);
+          console.warn(`✅ Putaway task created/updated: ${response.putaway_task}`);
+        } else if (response?.ok === true || response?.success === true) {
+          // API returned success but no putaway_task - that's okay, backend might handle it differently
+          console.warn(`✅ Putaway API returned success (no putaway_task in response - backend may handle differently)`);
+        }
+      } catch (apiError: any) {
+        // API call failed - mark as error occurred
+        apiErrorOccurred = true;
+        apiSuccess = false;
+        
+        // Check if this is a Putaway box (starts with "PAW-") that backend doesn't recognize
+        const isPutawayBox = selectedTC?.startsWith("PAW-");
+        const isTransferCartonNotFound = 
+          apiError.message?.includes("TRANSFER_CARTON_NOT_FOUND") ||
+          apiError.message?.includes("transfer carton not found") ||
+          apiError.message?.includes("Transfer carton") && apiError.message?.includes("not found");
+        
+        // If API endpoint doesn't exist (404), fall back to event-based approach
+        if (apiError.message?.includes("404") || apiError.message?.includes("not found")) {
+          if (isTransferCartonNotFound && isPutawayBox) {
+            console.warn(`⚠️ Putaway box ${selectedTC} not recognized as transfer carton by backend - using event-based approach`);
+            console.warn(`   This is expected for Putaway boxes. Backend may need to handle Putaway boxes separately.`);
+          } else {
+            console.warn(`⚠️ Putaway API endpoint not available (404) - using event-based approach`);
+            console.warn(`   Backend needs to implement: POST /api/putaway/scan-transfer-carton`);
+          }
+          // Continue with event-based approach below
+        } else if (
+          apiError.message?.includes("GROUP BY") || 
+          apiError.message?.includes("sql_mode") || 
+          apiError.message?.includes("DATABASE_ERROR") ||
+          apiError.message?.includes("nonaggregated column") ||
+          apiError.message?.includes("carton_id") ||
+          (apiError.message?.includes("500") && apiError.message?.includes("Failed to process"))
+        ) {
+          // Backend SQL error (e.g., GROUP BY clause issue) - continue with event-based approach
+          console.warn(`⚠️ Putaway API database error (SQL issue) - using event-based approach`);
+          console.warn(`   Backend SQL error: ${apiError.message}`);
+          console.warn(`   This is a backend database schema/query issue. Continuing with event-based tracking.`);
+          // Continue with event-based approach below - don't block user workflow
+        } else if (isTransferCartonNotFound) {
+          // Transfer carton not found error - likely Putaway box not recognized
+          if (isPutawayBox) {
+            console.warn(`⚠️ Putaway box ${selectedTC} not found in backend - using event-based approach`);
+            console.warn(`   Backend may not recognize Putaway boxes (PAW- prefix) as transfer cartons.`);
+          } else {
+            console.warn(`⚠️ Transfer carton ${selectedTC} not found in backend - using event-based approach`);
+          }
+          // Continue with event-based approach below
+        } else {
+          // For other errors, show the error but still allow event-based fallback
+          console.warn(`⚠️ Putaway API error:`, apiError.message);
+          console.warn(`   Continuing with event-based approach for offline support.`);
+        }
+      }
+
+      // Record event for local tracking (always do this, even if API call succeeded)
+      // This ensures offline support and backward compatibility
+      await addEvent({
+        event_type: "PUTAWAY_TO_RACK",
+        asn_no: normalizedASN,
+        inbound_session: session,
+        tc_id: selectedTC,
+        rack: rack,
+        bin: bin,
+        device_id: settings.device_id,
+        user_id: settings.user_id,
+      });
+
+      setWorkflowState("COMPLETE_PUTAWAY");
+      
+      // Refresh the sealed TCs list to remove this TC (it's now assigned)
+      await loadSealedTCs();
+      
+      if (apiSuccess && !apiErrorOccurred) {
+        // API call succeeded - show success message
+        const itemsCount = response?.data?.items_count || response?.items_count || 0;
+        const putawayTaskId = response?.data?.putaway_task || response?.putaway_task;
+        
+        let successMessage = `Transfer Carton ${selectedTC} placed at location ${locationIdUpper}`;
+        if (itemsCount > 0) {
+          successMessage += `\n\n${itemsCount} item(s) assigned to putaway task.`;
+        }
+        if (putawayTaskId) {
+          successMessage += `\n\nPutaway Task: ${putawayTaskId}`;
+        }
+        successMessage += `\n\nThis TC has been removed from the Putaway list.`;
+        
+        Alert.alert("Success", successMessage);
+      } else {
+        // Event-based approach - API failed or not available
+        Alert.alert(
+          "Success",
+          `Transfer Carton ${selectedTC} placed at location ${locationIdUpper}\n\nNote: Backend putaway API not available. Using event-based tracking.\n\nThis TC has been removed from the Putaway list.`
+        );
+      }
+    } catch (error: any) {
+      Alert.alert("Error", error.message || "Failed to scan location");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Step 13: Complete Put Away
+  const handleCompletePutAway = async () => {
+    if (!selectedTC || !selectedTCObj) {
+      Alert.alert("Error", "No Transfer Carton selected");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const settings = await getSettings();
+      const asn = selectedTCObj.asn_no || activeASN || settings?.active_asn;
+      const session = activeSession || settings?.active_session || "";
+      const db = await getDatabase();
+      
+      // Get items from the Transfer Carton
+      // Items are in boxes that were packed into this TC via PACK_BOX_TO_TC events
+      let items: Array<{
+        item_code: string;
+        qty: number;
+        source_bin?: string;
+        target_bin?: string;
+        completed?: boolean;
+      }> = [];
+      
+      if (db) {
+        try {
+          // Get boxes that were packed into this TC
+          const packedBoxes = await db.getAllAsync<{ box_id: string }>(
+            `SELECT DISTINCT box_id 
+             FROM event_queue 
+             WHERE event_type = 'PACK_BOX_TO_TC' 
+               AND tc_id = ? 
+               AND box_id IS NOT NULL 
+               AND box_id != ''`,
+            [selectedTC]
+          );
+          
+          console.warn(`📦 Found ${packedBoxes.length} box(es) packed into TC ${selectedTC}`);
+          
+          // Get scanned items from those boxes
+          if (packedBoxes.length > 0) {
+            const boxIds = packedBoxes.map(b => b.box_id);
+            const placeholders = boxIds.map(() => '?').join(',');
+            
+            const scannedItems = await db.getAllAsync<{
+              item_code: string;
+              scanned_qty: number;
+              box_id: string;
+            }>(
+              `SELECT item_code, SUM(scanned_qty) as scanned_qty, box_id
+               FROM scanned_items
+               WHERE box_id IN (${placeholders})
+                 AND asn_no = ?
+               GROUP BY item_code, box_id
+               HAVING scanned_qty > 0`,
+              [...boxIds, asn || '']
+            );
+            
+            console.warn(`📦 Found ${scannedItems.length} item record(s) in boxes for TC ${selectedTC}`);
+            
+            // Group by item_code and sum quantities
+            const itemMap = new Map<string, number>();
+            for (const item of scannedItems) {
+              const currentQty = itemMap.get(item.item_code) || 0;
+              itemMap.set(item.item_code, currentQty + (item.scanned_qty || 0));
+            }
+            
+            // Build items array for API
+            items = Array.from(itemMap.entries()).map(([item_code, qty]) => ({
+              item_code,
+              qty: Number(qty.toFixed(2)), // Round to 2 decimal places
+              source_bin: "DOCK-01", // Default source bin (can be enhanced to get from settings or event)
+              target_bin: selectedBin || selectedRack || undefined, // Use bin if available, otherwise rack
+              completed: true,
+            }));
+            
+            console.warn(`✅ Built items array with ${items.length} item(s) for putaway completion:`, items);
+          } else {
+            // No boxes found - might be a Putaway box (BOX ID = TC ID)
+            // Try to get items directly from scanned_items using TC ID as box_id
+            const directItems = await db.getAllAsync<{
+              item_code: string;
+              scanned_qty: number;
+            }>(
+              `SELECT item_code, SUM(scanned_qty) as scanned_qty
+               FROM scanned_items
+               WHERE box_id = ?
+                 AND asn_no = ?
+               GROUP BY item_code
+               HAVING scanned_qty > 0`,
+              [selectedTC, asn || '']
+            );
+            
+            if (directItems.length > 0) {
+              items = directItems.map(item => ({
+                item_code: item.item_code,
+                qty: Number((item.scanned_qty || 0).toFixed(2)),
+                source_bin: "DOCK-01",
+                target_bin: selectedBin || selectedRack || undefined,
+                completed: true,
+              }));
+              
+              console.warn(`✅ Found ${items.length} item(s) directly from scanned_items for Putaway box ${selectedTC}`);
+            }
+          }
+        } catch (itemsError: any) {
+          console.warn(`⚠️ Error getting items from TC:`, itemsError.message);
+          // Continue without items - backend might be able to determine items from putaway task
+        }
+      }
+      
+      // Try to call API to complete putaway task (if putawayTask exists)
+      // If no putawayTask, we'll use event-based tracking
+      let apiSuccess = false;
+      let apiErrorOccurred = false;
+      
+      if (putawayTask) {
+        try {
+          const requestBody: any = {
+            putaway_task: putawayTask,
+            performed_by: settings.user_id || undefined,
+          };
+          
+          // Include items array if we have items
+          if (items.length > 0) {
+            requestBody.items = items;
+            console.warn(`📤 Sending ${items.length} item(s) in putaway completion request`);
+          } else {
+            console.warn(`⚠️ No items found for TC ${selectedTC} - sending completion without items array`);
+          }
+          
+          const response = await apiService.completePutaway(requestBody);
+          apiSuccess = true;
+          apiErrorOccurred = false;
+          console.warn(`✅ Putaway task completed via API: ${putawayTask}`);
+          
+          // After successful API call, sync master data back to update status
+          try {
+            console.warn(`🔄 Syncing master data to update status after putaway completion...`);
+            const { syncMasterDataFromDesktop } = await import("../services/master-data-sync.service");
+            await syncMasterDataFromDesktop();
+            console.warn(`✅ Master data synced - status updated back to mobile`);
+          } catch (syncError: any) {
+            console.warn(`⚠️ Error syncing master data:`, syncError.message);
+            // Don't block - status will sync later
+          }
+        } catch (apiError: any) {
+          apiErrorOccurred = true;
+          
+          // Check if this is related to Putaway box not being recognized
+          const isPutawayBox = selectedTC?.startsWith("PAW-");
+          const isTransferCartonNotFound = 
+            apiError.message?.includes("TRANSFER_CARTON_NOT_FOUND") ||
+            apiError.message?.includes("transfer carton not found") ||
+            (apiError.message?.includes("Transfer carton") && apiError.message?.includes("not found"));
+          
+          // If API endpoint doesn't exist (404), fall back to event-based approach
+          if (apiError.message?.includes("404") || apiError.message?.includes("not found")) {
+            if (isTransferCartonNotFound && isPutawayBox) {
+              console.warn(`⚠️ Putaway box ${selectedTC} not recognized during completion - using event-based approach`);
+              console.warn(`   This is expected for Putaway boxes. Backend may need to handle Putaway boxes separately.`);
+            } else {
+              console.warn(`⚠️ Putaway complete API endpoint not available (404) - using event-based approach`);
+              console.warn(`   Backend needs to implement: POST /api/putaway/complete`);
+            }
+            // Continue with event-based approach below
+          } else if (apiError.message?.includes("TASK_NOT_FOUND")) {
+            // Task not found - continue with event-based approach instead of blocking
+            console.warn(`⚠️ Putaway task ${putawayTask} not found in backend - using event-based approach`);
+            // Continue with event-based approach below
+          } else if (isTransferCartonNotFound) {
+            // Transfer carton not found error - likely Putaway box not recognized
+            if (isPutawayBox) {
+              console.warn(`⚠️ Putaway box ${selectedTC} not found in backend during completion - using event-based approach`);
+              console.warn(`   Backend may not recognize Putaway boxes (PAW- prefix) as transfer cartons.`);
+            } else {
+              console.warn(`⚠️ Transfer carton ${selectedTC} not found in backend during completion - using event-based approach`);
+            }
+            // Continue with event-based approach below
+          } else if (apiError.message?.includes("warehouse") || apiError.message?.includes("DATABASE_ERROR")) {
+            // Backend database schema error - continue with event-based approach
+            console.warn(`⚠️ Putaway complete API database error:`, apiError.message);
+            console.warn(`   This is a backend database schema issue. Continuing with event-based tracking.`);
+            // Continue with event-based approach below
+          } else {
+            // For other errors, show warning but continue with event-based approach
+            console.warn(`⚠️ Putaway complete API error:`, apiError.message);
+            console.warn(`   Continuing with event-based approach for offline support.`);
+          }
+        }
+      } else {
+        // No putaway task - use event-based approach
+        console.warn(`ℹ️ No putaway task available - using event-based tracking for putaway completion`);
+      }
+
+      // Always record event for local tracking (backward compatibility and offline support)
+      if (asn) {
+        const normalizedASN = normalizeASN(asn);
+        await addEvent({
+          event_type: "PUTAWAY_DISPATCH",
+          asn_no: normalizedASN,
+          inbound_session: session,
+          tc_id: selectedTC,
+          store: "WAREHOUSE",
+          device_id: settings.device_id,
+          user_id: settings.user_id,
+        });
+      }
+
+      // Update TC status to "Completed"
+      await dataService.updateTransferCartonStatus(selectedTC, "Completed");
+      console.log(`✅ PutAwayScreen: TC ${selectedTC} marked as Completed`);
+
+      // Sync events to backend to ensure putaway transaction appears in backend
+      try {
+        console.warn(`🔄 Syncing putaway events to backend...`);
+        const syncResult = await syncEvents();
+        console.warn(`✅ Synced ${syncResult.synced} event(s), ${syncResult.failed} failed`);
+        
+        if (syncResult.failed > 0) {
+          console.warn(`⚠️ Some events failed to sync. Please check Sync Center.`);
+        }
+      } catch (syncError: any) {
+        console.warn(`⚠️ Error syncing events:`, syncError.message);
+        // Don't block user - events will sync later
+      }
+
+      if (apiSuccess && putawayTask && !apiErrorOccurred) {
+        // API succeeded with putaway task
+        Alert.alert(
+          "Success",
+          `Put Away completed for Transfer Carton ${selectedTC}\n\nPutaway task: ${putawayTask}\n\nEvents synced to backend.`
+        );
+      } else if (putawayTask && apiErrorOccurred) {
+        // Had putaway task but API failed
+        Alert.alert(
+          "Success",
+          `Put Away completed for Transfer Carton ${selectedTC}\n\nNote: Backend putaway API error. Using event-based tracking.\n\nEvents synced to backend.`
+        );
+      } else {
+        // No putaway task - event-based only
+        Alert.alert(
+          "Success",
+          `Put Away completed for Transfer Carton ${selectedTC}\n\nNote: Using event-based tracking.\n\nEvents synced to backend.`
+        );
+      }
+
+      // Reset and reload list (Completed TCs will be filtered out)
+      setSelectedTC(null);
+      setSelectedTCObj(null);
+      setPutawayTask(null);
+      setSelectedRack(null);
+      setSelectedBin(null);
+      
+      // Force refresh the list to ensure Completed TCs are excluded
+      // Add a small delay to ensure database update is committed
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await loadSealedTCs();
+      setWorkflowState("PUTAWAY_LIST");
+    } catch (error: any) {
+      console.error("❌ Error completing putaway:", error);
+      const errorMessage = error.message || "Failed to complete put away";
+      Alert.alert("Error", errorMessage);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Render UI based on workflow state
+  const renderWorkflowStep = () => {
+    console.log("🔄 PutAwayScreen: Rendering workflow step:", workflowState);
+    switch (workflowState) {
+      case "PUTAWAY_LIST":
+        console.log(
+          "📋 PutAwayScreen: Rendering PUTAWAY_LIST, sealedTCs:",
+          sealedTCs.length
+        );
+        return (
+          <View style={styles.section}>
+            <Text style={styles.stepTitle}>Put Away List</Text>
+            <Text style={styles.infoText}>
+              Sealed Transfer Cartons ready for put away
+            </Text>
+            {sealedTCs.length === 0 ? (
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>
+                  No sealed Transfer Cartons available
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  Transfer Cartons must be sealed and belong to WAREHOUSE to
+                  appear here.
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  {activeASN ? `Current ASN: ${activeASN}` : "No active ASN"}
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  To create a Transfer Carton for put away:
+                </Text>
+                <Text style={styles.emptySubtext}>1. Go to Packing screen</Text>
+                <Text style={styles.emptySubtext}>
+                  2. Select WAREHOUSE store
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  3. Create and seal a Transfer Carton
+                </Text>
+              </View>
+            ) : (
+              <>
+                {/* Transfer Cartons Section */}
+                {sealedTCs.length > 0 && (
+                  <>
+                    <Text style={[styles.sectionTitle, { marginBottom: 12, marginTop: 0 }]}>
+                      📦 Transfer Cartons ({sealedTCs.length})
+                    </Text>
+                    <FlatList
+                      data={sealedTCs}
+                      keyExtractor={(item) => item.tc_id}
+                      renderItem={({ item }) => (
+                        <TouchableOpacity
+                          style={styles.tcCard}
+                          onPress={() => handleTCSelection(item.tc_id)}
+                        >
+                          <View style={styles.tcCardHeader}>
+                            <Text style={styles.tcId}>{item.tc_id}</Text>
+                            <StatusBadge status={item.status} />
+                          </View>
+                          <Text style={styles.tcDetail}>ASN: {item.asn_no}</Text>
+                          <Text style={styles.tcDetail}>
+                            Store: {item.store} | Updated:{" "}
+                            {new Date(item.updated_on).toLocaleDateString()}
+                          </Text>
+                          <Text style={styles.tapHint}>
+                            Double tap or scan to select
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                      scrollEnabled={false}
+                    />
+                  </>
+                )}
+
+                {/* Remaining Items Section removed - user prefers to see only TCs/Boxes, not individual items */}
+
+                {/* Scan Section */}
+                <View style={styles.scanSection}>
+                  <Text style={styles.scanSectionTitle}>
+                    Or Scan Transfer Carton
+                  </Text>
+                  <BarcodeScanner
+                    onScan={handleTCScan}
+                    placeholder="Scan Transfer Carton barcode"
+                    title="Transfer Carton"
+                  />
+                </View>
+              </>
+            )}
+            <TouchableOpacity
+              style={styles.transactionButton}
+              onPress={() => {
+                setWorkflowState("PUTAWAY_TRANSACTIONS");
+                loadTransactions();
+              }}
+            >
+              <Text style={styles.transactionButtonText}>
+                View Put Away Transactions
+              </Text>
+            </TouchableOpacity>
+          </View>
+        );
+
+      case "PUTAWAY_TRANSACTIONS":
+        return (
+          <View style={styles.section}>
+            <View style={styles.transactionHeader}>
+              <Text style={styles.stepTitle}>Put Away Transactions</Text>
+              <TouchableOpacity
+                style={styles.backButton}
+                onPress={() => setWorkflowState("PUTAWAY_LIST")}
+              >
+                <Text style={styles.backButtonText}>← Back</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.infoText}>
+              List of all Put Away transactions with sync status
+            </Text>
+            {loading ? (
+              <ActivityIndicator
+                size="large"
+                color="#007AFF"
+                style={styles.loader}
+              />
+            ) : transactions.length === 0 ? (
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>
+                  No Put Away transactions found
+                </Text>
+                <Text style={styles.emptySubtext}>
+                  Transactions will appear here after you complete put away
+                  operations.
+                </Text>
+              </View>
+            ) : (
+              <FlatList
+                data={transactions}
+                keyExtractor={(item) => item.offline_uuid}
+                renderItem={({ item }) => (
+                  <View style={styles.transactionCard}>
+                    <View style={styles.transactionCardHeader}>
+                      <Text style={styles.transactionTCId}>
+                        {item.tc_id || "N/A"}
+                      </Text>
+                      <View
+                        style={[
+                          styles.syncBadge,
+                          item.synced === 1
+                            ? styles.syncBadgeSynced
+                            : styles.syncBadgePending,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.syncBadgeText,
+                            item.synced === 1
+                              ? styles.syncBadgeTextSynced
+                              : styles.syncBadgeTextPending,
+                          ]}
+                        >
+                          {item.synced === 1 ? "Synced" : "Pending"}
+                        </Text>
+                      </View>
+                    </View>
+                    <View style={styles.transactionDetails}>
+                      <View style={styles.transactionDetailRow}>
+                        <Text style={styles.transactionLabel}>Location:</Text>
+                        <Text style={styles.transactionValue}>
+                          {item.rack || "N/A"}
+                        </Text>
+                      </View>
+                      {item.asn_no && (
+                        <View style={styles.transactionDetailRow}>
+                          <Text style={styles.transactionLabel}>ASN:</Text>
+                          <Text style={styles.transactionValue}>
+                            {item.asn_no}
+                          </Text>
+                        </View>
+                      )}
+                      <View style={styles.transactionDetailRow}>
+                        <Text style={styles.transactionLabel}>Date:</Text>
+                        <Text style={styles.transactionValue}>
+                          {new Date(item.event_time).toLocaleString()}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+                )}
+                scrollEnabled={false}
+              />
+            )}
+          </View>
+        );
+
+      case "SCAN_TC_FOR_PUTAWAY":
+        return (
+          <View style={styles.section}>
+            <Text style={styles.stepTitle}>
+              Step 11: Select Transfer Carton
+            </Text>
+            <BarcodeScanner
+              onScan={handleTCScan}
+              placeholder="Scan Transfer Carton barcode"
+              title="Transfer Carton"
+            />
+            <TouchableOpacity
+              style={[styles.button, styles.secondaryButton]}
+              onPress={() => setWorkflowState("PUTAWAY_LIST")}
+            >
+              <Text style={styles.secondaryButtonText}>Back to List</Text>
+            </TouchableOpacity>
+          </View>
+        );
+
+      case "SCAN_LOCATION":
+        return (
+          <View style={styles.section}>
+            <Text style={styles.stepTitle}>Step 12: Scan Location</Text>
+            {selectedTC && (
+              <View style={styles.selectedCard}>
+                <Text style={styles.selectedLabel}>Selected TC:</Text>
+                <Text style={styles.selectedValue}>{selectedTC}</Text>
+              </View>
+            )}
+            <BarcodeScanner
+              onScan={handleLocationScan}
+              placeholder="Scan warehouse location/rack barcode"
+              title="Location"
+            />
+            <TouchableOpacity
+              style={[styles.button, styles.secondaryButton]}
+              onPress={() => {
+                setSelectedTC(null);
+                setSelectedTCObj(null);
+                setPutawayTask(null);
+                setSelectedRack(null);
+                setSelectedBin(null);
+                setWorkflowState("PUTAWAY_LIST");
+              }}
+            >
+              <Text style={styles.secondaryButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        );
+
+      case "COMPLETE_PUTAWAY":
+        return (
+          <View style={styles.section}>
+            <Text style={styles.stepTitle}>Step 13: Complete Put Away</Text>
+            {selectedTC && (
+              <View style={styles.selectedCard}>
+                <Text style={styles.selectedLabel}>Transfer Carton:</Text>
+                <Text style={styles.selectedValue}>{selectedTC}</Text>
+              </View>
+            )}
+            <TouchableOpacity
+              style={styles.button}
+              onPress={handleCompletePutAway}
+              disabled={loading}
+            >
+              <Text style={styles.buttonText}>Complete Put Away</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.button, styles.secondaryButton]}
+              onPress={() => {
+                setSelectedTC(null);
+                setSelectedTCObj(null);
+                setPutawayTask(null);
+                setSelectedRack(null);
+                setSelectedBin(null);
+                setWorkflowState("PUTAWAY_LIST");
+              }}
+            >
+              <Text style={styles.secondaryButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <View style={styles.container}>
+      <ScrollView
+        style={styles.scrollView}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={true}
+      >
+        <View style={styles.header}>
+          <Text style={styles.title}>Put Away</Text>
+          <Text style={styles.subtitle}>
+            Place sealed Transfer Cartons at warehouse locations
+          </Text>
+          {activeASN && (
+            <View style={styles.asnBadge}>
+              <Text style={styles.asnText}>ASN: {activeASN}</Text>
+            </View>
+          )}
+        </View>
+
+        {loading && workflowState === "PUTAWAY_LIST" ? (
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator size="large" color="#007AFF" />
+            <Text style={styles.loadingText}>Loading Transfer Cartons...</Text>
+          </View>
+        ) : (
+          renderWorkflowStep() || (
+            <View style={styles.section}>
+              <Text style={styles.stepTitle}>Put Away</Text>
+              <Text style={styles.infoText}>Initializing...</Text>
+            </View>
+          )
+        )}
+      </ScrollView>
+
+      {/* Styled Error Modal */}
+      <Modal
+        visible={errorModal?.visible || false}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setErrorModal(null)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.errorModalContainer}>
+            <View style={styles.errorModalHeader}>
+              <View style={styles.errorIconContainer}>
+                <Text style={styles.errorIcon}>⚠️</Text>
+              </View>
+              <Text style={styles.errorModalTitle}>
+                {errorModal?.title || "Error"}
+              </Text>
+            </View>
+            <View style={styles.errorModalContent}>
+              <Text style={styles.errorModalMessage}>
+                {errorModal?.message || "An error occurred"}
+              </Text>
+            </View>
+            <View style={styles.errorModalFooter}>
+              <TouchableOpacity
+                style={styles.errorModalButton}
+                onPress={() => setErrorModal(null)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.errorModalButtonText}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#F5F5F5",
+  },
+  scrollView: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingBottom: 40,
+  },
+  header: {
+    backgroundColor: "#fff",
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E0E0E0",
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: "bold",
+    color: "#333",
+    marginBottom: 4,
+  },
+  subtitle: {
+    fontSize: 14,
+    color: "#666",
+  },
+  asnBadge: {
+    marginTop: 8,
+    alignSelf: "flex-start",
+    backgroundColor: "#E3F2FD",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 12,
+  },
+  asnText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#1976D2",
+  },
+  section: {
+    backgroundColor: "#fff",
+    marginTop: 12,
+    padding: 16,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: "#E0E0E0",
+  },
+  stepTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#333",
+    marginBottom: 12,
+  },
+  infoText: {
+    fontSize: 14,
+    color: "#666",
+    marginBottom: 12,
+  },
+  emptyContainer: {
+    padding: 20,
+    alignItems: "center",
+  },
+  emptyText: {
+    fontSize: 18,
+    color: "#666",
+    fontWeight: "600",
+    textAlign: "center",
+    marginBottom: 12,
+  },
+  emptySubtext: {
+    fontSize: 14,
+    color: "#666",
+    textAlign: "center",
+    marginBottom: 4,
+  },
+  loader: {
+    marginVertical: 20,
+  },
+  tcCard: {
+    backgroundColor: "#F9F9F9",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: "#2196F3",
+  },
+  tcCardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  tcId: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#333",
+  },
+  tcDetail: {
+    fontSize: 12,
+    color: "#666",
+    marginTop: 4,
+  },
+  tapHint: {
+    fontSize: 10,
+    color: "#999",
+    marginTop: 4,
+    fontStyle: "italic",
+  },
+  scanSection: {
+    marginTop: 16,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: "#E0E0E0",
+  },
+  scanSectionTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#333",
+    marginBottom: 8,
+  },
+  selectedCard: {
+    backgroundColor: "#E3F2FD",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 12,
+  },
+  selectedLabel: {
+    fontSize: 12,
+    color: "#666",
+    marginBottom: 4,
+  },
+  selectedValue: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#1976D2",
+  },
+  button: {
+    backgroundColor: "#007AFF",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 12,
+  },
+  buttonText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  secondaryButton: {
+    backgroundColor: "#E0E0E0",
+    marginTop: 8,
+  },
+  secondaryButtonText: {
+    color: "#333",
+  },
+  loadingContainer: {
+    padding: 20,
+    alignItems: "center",
+  },
+  loadingText: {
+    marginTop: 12,
+    fontSize: 14,
+    color: "#666",
+  },
+  transactionButton: {
+    backgroundColor: "#4CAF50",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 16,
+  },
+  transactionButtonText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  transactionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  backButton: {
+    padding: 8,
+    paddingHorizontal: 12,
+  },
+  backButtonText: {
+    color: "#007AFF",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  transactionCard: {
+    backgroundColor: "#F9F9F9",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderLeftWidth: 4,
+    borderLeftColor: "#2196F3",
+  },
+  transactionCardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  transactionTCId: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#333",
+  },
+  syncBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  syncBadgeSynced: {
+    backgroundColor: "#4CAF50",
+  },
+  syncBadgePending: {
+    backgroundColor: "#FF9800",
+  },
+  syncBadgeText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  syncBadgeTextSynced: {
+    color: "#fff",
+  },
+  syncBadgeTextPending: {
+    color: "#fff",
+  },
+  transactionDetails: {
+    marginTop: 4,
+  },
+  transactionDetailRow: {
+    flexDirection: "row",
+    marginBottom: 4,
+  },
+  transactionLabel: {
+    fontSize: 12,
+    color: "#666",
+    fontWeight: "600",
+    width: 80,
+  },
+  transactionValue: {
+    fontSize: 12,
+    color: "#333",
+    flex: 1,
+  },
+  // Error Modal Styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
+  errorModalContainer: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    width: "100%",
+    maxWidth: 400,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    overflow: "hidden",
+  },
+  errorModalHeader: {
+    backgroundColor: "#FF5252",
+    padding: 20,
+    alignItems: "center",
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+  },
+  errorIconContainer: {
+    marginBottom: 8,
+  },
+  errorIcon: {
+    fontSize: 48,
+  },
+  errorModalTitle: {
+    fontSize: 22,
+    fontWeight: "bold",
+    color: "#FFFFFF",
+    textAlign: "center",
+  },
+  errorModalContent: {
+    padding: 24,
+    paddingTop: 20,
+  },
+  errorModalMessage: {
+    fontSize: 16,
+    color: "#333333",
+    lineHeight: 24,
+    textAlign: "center",
+  },
+  errorModalFooter: {
+    padding: 16,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#E0E0E0",
+    alignItems: "center",
+  },
+  errorModalButton: {
+    backgroundColor: "#FF5252",
+    paddingVertical: 14,
+    paddingHorizontal: 40,
+    borderRadius: 8,
+    minWidth: 120,
+    alignItems: "center",
+    shadowColor: "#FF5252",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  errorModalButtonText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+});
