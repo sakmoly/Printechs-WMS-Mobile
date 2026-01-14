@@ -1587,11 +1587,12 @@ export default function ReceiveSortScreen() {
         console.log(
           `ℹ️ ReceiveSortScreen: No allocations found in local DB for ASN ${activeASN}, fetching from API...`
         );
-        const toResponse = await apiService.getTransferOrderByASN(activeASN);
-        const toData =
-          toResponse?.data || toResponse?.transfer_order || toResponse;
+        try {
+          const toResponse = await apiService.getTransferOrderByASN(activeASN);
+          const toData =
+            toResponse?.data || toResponse?.transfer_order || toResponse;
 
-        if (toData && (toData.to_no || toData.transfer_order)) {
+          if (toData && (toData.to_no || toData.transfer_order)) {
           const apiAllocations =
             toData.allocations ||
             toData.items ||
@@ -1629,6 +1630,26 @@ export default function ReceiveSortScreen() {
             );
           }
         }
+        } catch (toError: any) {
+          // Handle 404 errors gracefully - ASN can be received without Transfer Order
+          const errorMessage = toError?.message || toError?.toString() || "";
+          const is404Error = 
+            errorMessage.includes("404") ||
+            errorMessage.includes("No transfer order found") ||
+            errorMessage.includes("not found") ||
+            errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+          
+          if (is404Error) {
+            // 404 is expected - ASN can be received without Transfer Order
+            console.log(
+              `ℹ️ ReceiveSortScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+            );
+          } else {
+            // Other errors (network, 500, etc.) - log as warning
+            console.warn("⚠️ ReceiveSortScreen: Could not fetch transfer order from API:", errorMessage);
+          }
+          // Continue - no transfer order is OK
+        }
       }
 
       // Only show stores that are in the Transfer Order allocations
@@ -1644,11 +1665,27 @@ export default function ReceiveSortScreen() {
         `📦 ReceiveSortScreen: Available stores set to:`,
         uniqueStores.length > 0 ? uniqueStores : "(no stores)"
       );
-    } catch (error) {
-      console.error(
-        "❌ ReceiveSortScreen: Error loading transfer order stores:",
-        error
-      );
+    } catch (error: any) {
+      // Handle 404 errors gracefully - ASN can be received without Transfer Order
+      const errorMessage = error?.message || error?.toString() || "";
+      const is404Error = 
+        errorMessage.includes("404") ||
+        errorMessage.includes("No transfer order found") ||
+        errorMessage.includes("not found") ||
+        errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+      
+      if (is404Error) {
+        // 404 is expected - ASN can be received without Transfer Order
+        console.log(
+          `ℹ️ ReceiveSortScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+        );
+      } else {
+        // Other errors (network, 500, etc.) - log as warning
+        console.warn(
+          "⚠️ ReceiveSortScreen: Error loading transfer order stores:",
+          errorMessage
+        );
+      }
       setAvailableStoresForBox([]); // No fallback - only show stores from TO
       setSelectedStoreForBox("");
     }

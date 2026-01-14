@@ -14,17 +14,28 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { generateUUID } from "../utils/uuid";
 import { syncCycleCountSessions } from "../services/cycle-count-sync.service";
+import { apiService } from "../services/api.service";
+import { isDeviceOnline } from "../utils/network-check";
 
 export default function CycleCountScanBinScreen() {
   const navigation = useNavigation();
   const route = useRoute();
-  const { countType } = (route.params as any) || { countType: "Adhoc" };
+  const routeParams = (route.params as any) || {};
+  const { countType, preCreatedTaskTitle, preCreatedBinCode, preCreatedSessionId } = routeParams;
   
-  const [binCode, setBinCode] = useState("");
+  const [binCode, setBinCode] = useState(preCreatedBinCode || "");
   const [loading, setLoading] = useState(false);
   const [binInfo, setBinInfo] = useState<any>(null);
   const [isBlindCount, setIsBlindCount] = useState(false);
   const binCodeInputRef = useRef<TextInput>(null);
+
+  // If task was pre-created with a bin code, auto-validate it
+  useEffect(() => {
+    if (preCreatedBinCode && preCreatedBinCode.trim()) {
+      console.log(`🔄 Auto-validating pre-created bin code: ${preCreatedBinCode}`);
+      validateBin(preCreatedBinCode.trim());
+    }
+  }, [preCreatedBinCode]);
 
   const handleScanButton = () => {
     // Clear the input and focus it for scanning
@@ -138,39 +149,74 @@ export default function CycleCountScanBinScreen() {
       const db = await getDatabase();
       const now = new Date().toISOString();
 
-      // Check if there's an existing draft session for this bin
-      const existingSession = await db.getFirstAsync<{
-        session_id: string;
-        status: string;
-      }>(
-        `SELECT session_id, status FROM cycle_count_sessions 
-         WHERE bin_code = ? AND status = 'Draft' 
-         ORDER BY updated_at DESC LIMIT 1`,
-        [binInfo.bin_code]
-      );
-
+      // Check if there's a pre-created session ID (from task creation)
       let sessionId: string;
-
-      if (existingSession) {
-        // Use existing draft session
-        sessionId = existingSession.session_id;
-        console.log(`📂 Found existing draft session: ${sessionId} for bin ${binInfo.bin_code}`);
-        
-        // Update session timestamp
-        await db.runAsync(
-          "UPDATE cycle_count_sessions SET updated_at = ? WHERE session_id = ?",
-          [now, sessionId]
+      
+      if (preCreatedSessionId) {
+        // Use the pre-created session from task creation
+        const preCreatedSession = await db.getFirstAsync<{
+          session_id: string;
+          status: string;
+        }>(
+          "SELECT session_id, status FROM cycle_count_sessions WHERE session_id = ?",
+          [preCreatedSessionId]
         );
-      } else {
+        
+        if (preCreatedSession) {
+          sessionId = preCreatedSessionId;
+          console.log(`📂 Using pre-created session: ${sessionId} for task ${preCreatedTaskTitle}`);
+          
+          // Update session timestamp and ensure bin_code matches
+          await db.runAsync(
+            "UPDATE cycle_count_sessions SET bin_code = ?, bin_id = ?, updated_at = ? WHERE session_id = ?",
+            [binInfo.bin_code, binInfo.bin_id || binInfo.bin_code, now, sessionId]
+          );
+        } else {
+          console.warn(`⚠️ Pre-created session ${preCreatedSessionId} not found, creating new session`);
+          // Fall through to create new session
+        }
+      }
+      
+      // If no pre-created session, check for existing draft session for this bin
+      if (!sessionId) {
+        const existingSession = await db.getFirstAsync<{
+          session_id: string;
+          status: string;
+        }>(
+          `SELECT session_id, status FROM cycle_count_sessions 
+           WHERE bin_code = ? AND status = 'Draft' 
+           ORDER BY updated_at DESC LIMIT 1`,
+          [binInfo.bin_code]
+        );
+
+        if (existingSession) {
+          // Use existing draft session
+          sessionId = existingSession.session_id;
+          console.log(`📂 Found existing draft session: ${sessionId} for bin ${binInfo.bin_code}`);
+          
+          // Update session timestamp
+          await db.runAsync(
+            "UPDATE cycle_count_sessions SET updated_at = ? WHERE session_id = ?",
+            [now, sessionId]
+          );
+        }
+      }
+      
+      if (!sessionId) {
+        // Create new cycle count session
         // Create new cycle count session
         sessionId = generateUUID();
         console.log(`🆕 Creating new session: ${sessionId} for bin ${binInfo.bin_code}`);
         
+        // If task was pre-created, save the server_session_id (task title) for sync
+        const serverSessionId = preCreatedTaskTitle || null;
+        
         await db.runAsync(
           `INSERT INTO cycle_count_sessions (
             session_id, count_type, warehouse_id, bin_id, bin_code,
-            started_by, started_at, status, is_blind_count, device_id, synced, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            started_by, started_at, status, is_blind_count, device_id, synced, 
+            server_session_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             sessionId,
             countType,
@@ -183,19 +229,120 @@ export default function CycleCountScanBinScreen() {
             isBlindCount ? 1 : 0,
             settings.device_id || "",
             0,
+            serverSessionId, // Save pre-created task title for immediate sync
             now,
             now,
           ]
         );
+        
+        if (serverSessionId) {
+          console.log(`✅ Saved pre-created task title ${serverSessionId} to session ${sessionId}`);
+        }
       }
 
-      // Navigate to counting screen with the session ID (existing or new)
-      (navigation as any).navigate("CycleCountBinCounting", {
+      // ✅ NEW: Call POST /api/cycle-count/{title}/start when starting a count session
+      // Try to find task title from session or backend
+      let taskTitle: string | null = null;
+      
+      // First, check if we have a task title in the session
+      const sessionData = await db.getFirstAsync<{ server_session_id: string | null }>(
+        "SELECT server_session_id FROM cycle_count_sessions WHERE session_id = ?",
+        [sessionId]
+      );
+      
+      if (sessionData?.server_session_id) {
+        taskTitle = sessionData.server_session_id;
+        console.log(`📋 Found task title in session: ${taskTitle}`);
+      } else {
+        // Try to find task from backend for this bin
+        try {
+          const online = await isDeviceOnline();
+          if (online) {
+            console.log(`🔍 Looking for backend task for bin ${binInfo.bin_code}...`);
+            const tasks = await apiService.getCycleCounts({ status: "Draft,In Progress,Review" });
+            const taskArray = Array.isArray(tasks) ? tasks : (tasks?.data || []);
+            
+            // Normalize bin codes for comparison
+            const normalizeBinCode = (code: string | null | undefined): string => {
+              if (!code) return "";
+              return String(code).trim().toUpperCase().replace(/\s+/g, "").replace(/--+/g, "-");
+            };
+            
+            const binCodeNormalized = normalizeBinCode(binInfo.bin_code);
+            
+            const existingTask = taskArray.find((t: any) => {
+              const taskBinCode = normalizeBinCode(t.bin_code);
+              const taskBinId = normalizeBinCode(t.bin_id);
+              const taskBinLocation = normalizeBinCode(t.bin_location);
+              const taskZone = normalizeBinCode(t.zone);
+              
+              return (
+                (taskBinCode && taskBinCode === binCodeNormalized) || 
+                (taskBinId && taskBinId === binCodeNormalized) ||
+                (taskBinLocation && taskBinLocation === binCodeNormalized) ||
+                (taskZone && taskZone === binCodeNormalized)
+              );
+            });
+            
+            if (existingTask?.title) {
+              taskTitle = existingTask.title;
+              console.log(`✅ Found backend task: ${taskTitle} for bin ${binInfo.bin_code}`);
+              
+              // Save task title to session for future use
+              await db.runAsync(
+                "UPDATE cycle_count_sessions SET server_session_id = ?, updated_at = ? WHERE session_id = ?",
+                [taskTitle, now, sessionId]
+              );
+            } else {
+              console.log(`ℹ️ No backend task found for bin ${binInfo.bin_code}`);
+            }
+          }
+        } catch (error: any) {
+          console.warn(`⚠️ Error finding backend task:`, error.message);
+        }
+      }
+      
+      // Call start API if we have a task title
+      if (taskTitle) {
+        try {
+          const online = await isDeviceOnline();
+          if (online) {
+            console.log(`📤 Starting cycle count task ${taskTitle} via API: POST /api/cycle-count/${taskTitle}/start`);
+            await apiService.startCycleCount(taskTitle, {
+              started_by: settings.user_id || settings.user_code || "USER-AUTO",
+            });
+            console.log(`✅ Successfully started task ${taskTitle} via API`);
+          } else {
+            console.log(`ℹ️ Device is offline - task ${taskTitle} will be started when synced`);
+          }
+        } catch (startError: any) {
+          // Log error but don't block navigation - sync will retry later
+          console.warn(`⚠️ Failed to start task via API:`, startError.message);
+          console.warn(`⚠️ Task will be started when synced`);
+        }
+      } else {
+        console.log(`ℹ️ No task title found - skipping start API call`);
+        console.log(`ℹ️ Task will be started when backend task is found and synced`);
+      }
+
+      // Prepare navigation params (NO cartonId - it will be scanned in counting screen)
+      const navParams = {
         sessionId,
         binCode: binInfo.bin_code,
         binInfo,
         isBlindCount,
+        // ✅ REMOVED: cartonId - will be scanned in counting screen instead
+      };
+      
+      // ✅ DEBUG: Log navigation params before navigating
+      console.log(`📦 Navigating to CycleCountBinCounting with params:`, {
+        sessionId,
+        binCode: binInfo.bin_code,
+        isBlindCount,
       });
+      
+      // Navigate to counting screen with the session ID (existing or new)
+      (navigation as any).navigate("CycleCountBinCounting", navParams);
     } catch (error: any) {
       console.error("Error starting count:", error);
       Alert.alert("Error", `Failed to start count: ${error.message}`);
@@ -256,31 +403,34 @@ export default function CycleCountScanBinScreen() {
       )}
 
       {binInfo && !loading && (
-        <View style={styles.binInfoCard}>
-          <Text style={styles.binInfoTitle}>Bin Information</Text>
-          <View style={styles.binInfoRow}>
-            <Text style={styles.binInfoLabel}>Bin Code:</Text>
-            <Text style={styles.binInfoValue}>{binInfo.bin_code}</Text>
+        <>
+          <View style={styles.binInfoCard}>
+            <Text style={styles.binInfoTitle}>Bin Information</Text>
+            <View style={styles.binInfoRow}>
+              <Text style={styles.binInfoLabel}>Bin Code:</Text>
+              <Text style={styles.binInfoValue}>{binInfo.bin_code}</Text>
+            </View>
+            {binInfo.warehouse_id && (
+              <View style={styles.binInfoRow}>
+                <Text style={styles.binInfoLabel}>Warehouse:</Text>
+                <Text style={styles.binInfoValue}>{binInfo.warehouse_id}</Text>
+              </View>
+            )}
+            {binInfo.zone && (
+              <View style={styles.binInfoRow}>
+                <Text style={styles.binInfoLabel}>Zone:</Text>
+                <Text style={styles.binInfoValue}>{binInfo.zone}</Text>
+              </View>
+            )}
+            {binInfo.aisle && (
+              <View style={styles.binInfoRow}>
+                <Text style={styles.binInfoLabel}>Aisle:</Text>
+                <Text style={styles.binInfoValue}>{binInfo.aisle}</Text>
+              </View>
+            )}
           </View>
-          {binInfo.warehouse_id && (
-            <View style={styles.binInfoRow}>
-              <Text style={styles.binInfoLabel}>Warehouse:</Text>
-              <Text style={styles.binInfoValue}>{binInfo.warehouse_id}</Text>
-            </View>
-          )}
-          {binInfo.zone && (
-            <View style={styles.binInfoRow}>
-              <Text style={styles.binInfoLabel}>Zone:</Text>
-              <Text style={styles.binInfoValue}>{binInfo.zone}</Text>
-            </View>
-          )}
-          {binInfo.aisle && (
-            <View style={styles.binInfoRow}>
-              <Text style={styles.binInfoLabel}>Aisle:</Text>
-              <Text style={styles.binInfoValue}>{binInfo.aisle}</Text>
-            </View>
-          )}
-        </View>
+
+        </>
       )}
 
       {/* Blind Count Toggle */}
@@ -300,13 +450,14 @@ export default function CycleCountScanBinScreen() {
       </View>
 
       {/* Start Count Button */}
-      <TouchableOpacity
-        style={[styles.startButton, !binInfo && styles.startButtonDisabled]}
-        onPress={handleStartCount}
-        disabled={!binInfo || loading}
-      >
-        <Text style={styles.startButtonText}>Start Count</Text>
-      </TouchableOpacity>
+      {binInfo && !loading && (
+        <TouchableOpacity
+          style={styles.startButton}
+          onPress={handleStartCount}
+        >
+          <Text style={styles.startButtonText}>Start Count</Text>
+        </TouchableOpacity>
+      )}
     </ScrollView>
   );
 }

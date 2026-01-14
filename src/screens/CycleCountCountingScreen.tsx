@@ -22,7 +22,7 @@ import { CycleCount } from "../types";
 export default function CycleCountCountingScreen() {
   const navigation = useNavigation();
   const route = useRoute();
-  const { cycleCountTitle } = (route.params as any) || {};
+  const { cycleCountTitle, cartonId } = (route.params as any) || {};
 
   const [cycleCount, setCycleCount] = useState<CycleCount | null>(null);
   const [currentItemIndex, setCurrentItemIndex] = useState(0);
@@ -51,7 +51,25 @@ export default function CycleCountCountingScreen() {
 
     setLoading(true);
     try {
-      const response = await apiService.getCycleCount(cycleCountTitle);
+      // ✅ NEW: Filter by carton_id and/or counted_by to show only relevant items
+      // This ensures each mobile session sees only items for the current carton/user
+      const settings = await getSettings();
+      const currentUser = settings.user_id || settings.user_code || null;
+      
+      // Build filter object - only include filters that are available
+      const filters: { carton_id?: string; counted_by?: string } = {};
+      if (cartonId) {
+        filters.carton_id = cartonId;
+      }
+      if (currentUser) {
+        filters.counted_by = currentUser;
+      }
+      
+      console.log(`🔍 Loading cycle count ${cycleCountTitle} with filters:`, filters);
+      const response = await apiService.getCycleCount(
+        cycleCountTitle,
+        Object.keys(filters).length > 0 ? filters : undefined
+      );
 
       // Handle different response formats
       let cc: any = null;

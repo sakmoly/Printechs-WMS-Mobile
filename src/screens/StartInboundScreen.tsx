@@ -599,7 +599,23 @@ export default function StartInboundScreen() {
         }
       }
     } catch (error: any) {
-      console.error("Failed to load transfer orders:", error);
+      // Handle 404 errors gracefully - ASN can be received without Transfer Order
+      const errorMessage = error?.message || error?.toString() || "";
+      const is404Error = 
+        errorMessage.includes("404") ||
+        errorMessage.includes("No transfer order found") ||
+        errorMessage.includes("not found") ||
+        errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+      
+      if (is404Error) {
+        // 404 is expected - ASN can be received without Transfer Order
+        console.log(
+          `ℹ️ StartInboundScreen: No transfer order found for ASN (this is OK - ASN can be received without Transfer Order)`
+        );
+      } else {
+        // Other errors (network, 500, etc.) - log as warning
+        console.warn("⚠️ StartInboundScreen: Failed to load transfer orders:", errorMessage);
+      }
       // Don't fall back to demo data - allow proceeding without transfer order
       setTransferOrder("");
       setTransferOrders([]);

@@ -291,6 +291,9 @@ export default function CycleCountDetailScreen() {
     
     setLoading(true);
     try {
+      // ✅ Note: Detail screen shows all items (no filters) for desktop-like view
+      // If you need to filter by carton_id or user, pass filters as second parameter:
+      // await apiService.getCycleCount(cycleCountTitle, { carton_id: "...", counted_by: "..." });
       const response = await apiService.getCycleCount(cycleCountTitle);
       
       // Handle different response formats
@@ -356,6 +359,48 @@ export default function CycleCountDetailScreen() {
     (navigation as any).navigate("CycleCountCounting", {
       cycleCountTitle: cycleCount.title,
     });
+  };
+
+  const handleCompleteTask = async () => {
+    if (!cycleCount) return;
+    
+    if (cycleCount.status !== "Submitted") {
+      Alert.alert(
+        "Cannot Complete Task",
+        `Cycle Count ${cycleCount.title} is ${cycleCount.status}. Only 'Submitted' tasks can be completed.`
+      );
+      return;
+    }
+
+    Alert.alert(
+      "Complete Task",
+      `This will complete the Cycle Count task "${cycleCount.title}" and update stock in the system. Continue?`,
+      [
+        {
+          text: "Cancel",
+          style: "cancel",
+        },
+        {
+          text: "Complete",
+          onPress: async () => {
+            setLoading(true);
+            try {
+              console.log(`📤 Completing cycle count task ${cycleCount.title} via API...`);
+              await apiService.completeCycleCount(cycleCount.title);
+              console.log(`✅ Successfully completed task ${cycleCount.title} via API`);
+              Alert.alert("Success", "Task completed successfully!");
+              // Reload to get updated status
+              await loadCycleCount();
+            } catch (error: any) {
+              console.error(`❌ Failed to complete task:`, error.message);
+              Alert.alert("Error", `Failed to complete task:\n${error.message}`);
+            } finally {
+              setLoading(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const getStatusColor = (status: string) => {
@@ -667,6 +712,17 @@ export default function CycleCountDetailScreen() {
           </TouchableOpacity>
         </View>
       )}
+
+      {cycleCount.status === "Submitted" && (
+        <View style={styles.actionSection}>
+          <TouchableOpacity
+            style={styles.completeButton}
+            onPress={handleCompleteTask}
+          >
+            <Text style={styles.completeButtonText}>Complete Task</Text>
+          </TouchableOpacity>
+        </View>
+      )}
     </ScrollView>
   );
 }
@@ -857,6 +913,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   startButtonText: {
+    color: "#FFF",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
+  completeButton: {
+    backgroundColor: "#4CAF50",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  completeButtonText: {
     color: "#FFF",
     fontSize: 16,
     fontWeight: "bold",

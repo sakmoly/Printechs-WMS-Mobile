@@ -864,7 +864,22 @@ export default function PackingScreen() {
         // Continue with null TO - backend should handle this
       }
 
+      // ✅ Generate tc_id before calling API (backend requires it)
+      // Format: TC-{ASN}-{timestamp}
+      // Example: TC-ASN-0001-1767516827262
+      const tc_id = `TC-${activeASN.replace(/^ASN-?/i, "")}-${Date.now()}`;
+
+      console.log("📦 Creating Transfer Carton with:", {
+        tc_id,
+        asn_no: activeASN,
+        to_no: toNo,
+        store: selectedStore,
+        user_id: settings.user_id,
+        created_by: settings.user_id,
+      });
+
       const response = await apiService.createTransferCarton({
+        tc_id, // ✅ NEW: Backend requires tc_id
         asn_no: activeASN,
         to_no: toNo || undefined, // Optional - convert null to undefined
         store: selectedStore,
@@ -877,10 +892,11 @@ export default function PackingScreen() {
         JSON.stringify(response).substring(0, 500)
       );
 
-      // Extract tc_id from various possible response formats
+      // ✅ Extract tc_id from various possible response formats
       // Backend might return: { tc_id: "..." }, { data: { tc_id: "..." } }, { result: { tc_id: "..." } }, etc.
-      // The API service generates a tc_id and sends it to backend, so we can use that as fallback
-      let tc_id =
+      // If backend returns a tc_id, use that (it may have modified our generated one)
+      // Otherwise, use the tc_id we generated and sent
+      const returnedTcId =
         response.tc_id ||
         response.data?.tc_id ||
         response.result?.tc_id ||
@@ -888,27 +904,29 @@ export default function PackingScreen() {
         response.transfer_carton?.tc_id ||
         (response as any)?.id; // Some backends might return just "id"
 
-      // If backend doesn't return tc_id, generate one (backend might accept the one we sent)
-      // The API service already generates and sends tc_id, so we can extract it from the request
-      // But since we don't have access to it here, we'll generate a new one as fallback
-      if (!tc_id) {
-        console.warn("⚠️ Backend did not return tc_id, generating one locally");
-        tc_id = `TC-${Date.now()}`;
+      // Use the backend's tc_id if available, otherwise use the one we generated
+      // Use the backend's tc_id if available, otherwise use the one we generated
+      const finalTcId = returnedTcId || tc_id;
+      
+      if (returnedTcId && returnedTcId !== tc_id) {
+        console.log(`✅ Backend returned different tc_id: ${returnedTcId} (we sent: ${tc_id})`);
+      } else if (!returnedTcId) {
+        console.log(`ℹ️ Backend did not return tc_id, using generated one: ${tc_id}`);
       }
 
-      console.log(`✅ Transfer Carton created with tc_id: ${tc_id}`);
+      console.log(`✅ Transfer Carton created with tc_id: ${finalTcId}`);
 
       // ✅ PREVENT DUPLICATE: Check if TC with this ID already exists before saving
       const existingTCWithId = await dataService.getTransferCartons(activeASN);
-      const duplicateTC = existingTCWithId.find((tc) => tc.tc_id === tc_id);
+      const duplicateTC = existingTCWithId.find((tc) => tc.tc_id === finalTcId);
 
       if (duplicateTC) {
         console.warn(
-          `⚠️ TC ${tc_id} already exists in local DB - skipping save to prevent duplicate`
+          `⚠️ TC ${finalTcId} already exists in local DB - skipping save to prevent duplicate`
         );
         Alert.alert(
           "Transfer Carton Already Exists",
-          `Transfer Carton ${tc_id} already exists in the database.\n\nPlease use the existing Transfer Carton.`,
+          `Transfer Carton ${finalTcId} already exists in the database.\n\nPlease use the existing Transfer Carton.`,
           [{ text: "OK" }]
         );
         setLoading(false);
@@ -917,7 +935,7 @@ export default function PackingScreen() {
       }
 
       const newTC: any = {
-        tc_id: tc_id,
+        tc_id: finalTcId, // ✅ Use finalTcId (backend's tc_id if returned, otherwise our generated one)
         asn_no: activeASN,
         to_no: toNo || null, // Use the TO number we found (or null if none)
         store: selectedStore,
@@ -931,9 +949,9 @@ export default function PackingScreen() {
       // Refresh the Transfer Carton list after creation
       await checkExistingTC();
 
-      setTransferCarton(tc_id);
+      setTransferCarton(finalTcId); // ✅ Use finalTcId
       setPackedBoxes([]);
-      Alert.alert("Success", `Transfer Carton ${tc_id} created`);
+      Alert.alert("Success", `Transfer Carton ${finalTcId} created`);
     } catch (error: any) {
       console.error("❌ ERROR: Failed to create Transfer Carton:", error);
       Alert.alert("Error", error.message || "Failed to create Transfer Carton");
@@ -1220,22 +1238,38 @@ export default function PackingScreen() {
         // ✅ Handle duplicate Putaway box error gracefully
         // If backend tries to create a Putaway box that already exists, treat it as success
         const errorMessage = error.message || "";
+        const errorString = JSON.stringify(error).toLowerCase(); // Convert full error to string for searching
         const errorDetails = error.details || {};
+        const errorDetailsMessage = errorDetails.message || "";
+        const errorCode = error.code || errorDetails.code || "";
+        
+        // Check for duplicate entry errors in multiple places
         const isDuplicatePutawayError =
           errorMessage.includes("Duplicate entry") ||
           errorMessage.includes("ER_DUP_ENTRY") ||
           errorMessage.includes("PAW-") ||
-          errorDetails.message?.includes("Duplicate entry") ||
-          errorDetails.message?.includes("PAW-");
+          errorMessage.includes("Failed to process transfer carton for putaway") ||
+          errorString.includes("duplicate entry") ||
+          errorString.includes("er_dup_entry") ||
+          errorString.includes("paw-") ||
+          errorDetailsMessage.includes("Duplicate entry") ||
+          errorDetailsMessage.includes("ER_DUP_ENTRY") ||
+          errorDetailsMessage.includes("PAW-") ||
+          errorCode === "ER_DUP_ENTRY" ||
+          errorCode === "DATABASE_ERROR"; // DATABASE_ERROR with duplicate entry details
 
         if (isDuplicatePutawayError && isPutawayTC) {
-          console.warn(
-            `⚠️ Duplicate Putaway box detected during seal - Putaway box already exists, treating as success:`,
-            errorMessage
+          console.log(
+            `ℹ️ Duplicate Putaway box detected during seal - Putaway box already exists in backend, treating as success`
+          );
+          console.log(
+            `ℹ️ This is expected if the putaway box was already created - continuing with seal process`
           );
           // Continue with the sealing process - the Putaway box already exists, which is fine
+          // The backend has already created the putaway box, so we can proceed
         } else {
           // Re-throw other errors
+          console.error(`❌ Error sealing Transfer Carton (not a duplicate putaway error):`, error);
           throw error;
         }
       }
@@ -1548,23 +1582,56 @@ export default function PackingScreen() {
           }
         }
       } catch (error: any) {
-        console.warn("⚠️ Could not fetch transfer order:", error);
+        // Handle 404 errors gracefully - ASN can be received without Transfer Order
+        const errorMessage = error?.message || error?.toString() || "";
+        const is404Error = 
+          errorMessage.includes("404") ||
+          errorMessage.includes("No transfer order found") ||
+          errorMessage.includes("not found") ||
+          errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+        
+        if (is404Error) {
+          // 404 is expected - ASN can be received without Transfer Order
+          console.log(
+            `ℹ️ PackingScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+          );
+        } else {
+          // Other errors (network, 500, etc.) - log as warning
+          console.warn("⚠️ PackingScreen: Could not fetch transfer order:", errorMessage);
+        }
       }
 
-      // No TO found or no allocations - show only warehouses
+      // No TO found or no allocations - Packing screen requires Transfer Order
+      // Warehouse boxes should go to Putaway screen, not Packing screen
       console.log(
-        `ℹ️ No Transfer Order found or no allocations, showing warehouses only`
+        `ℹ️ No Transfer Order found or no allocations - Packing screen requires Transfer Order with store allocations`
       );
-      setAvailableStores(["WH-MAIN"]);
-      if (!selectedStore) {
-        setSelectedStore("WH-MAIN");
+      console.log(
+        `ℹ️ Warehouse boxes should be handled in Putaway screen, not Packing screen`
+      );
+      setAvailableStores([]);
+      setSelectedStore("");
+    } catch (error: any) {
+      // Handle 404 errors gracefully - ASN can be received without Transfer Order
+      const errorMessage = error?.message || error?.toString() || "";
+      const is404Error = 
+        errorMessage.includes("404") ||
+        errorMessage.includes("No transfer order found") ||
+        errorMessage.includes("not found") ||
+        errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+      
+      if (is404Error) {
+        // 404 is expected - ASN can be received without Transfer Order
+        console.log(
+          `ℹ️ PackingScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+        );
+      } else {
+        // Other errors (network, 500, etc.) - log as warning
+        console.warn("⚠️ PackingScreen: Error loading transfer order stores:", errorMessage);
       }
-    } catch (error) {
-      console.error("❌ Error loading transfer order stores:", error);
-      setAvailableStores(["WH-MAIN"]);
-      if (!selectedStore) {
-        setSelectedStore("WH-MAIN");
-      }
+      // Warehouse boxes should go to Putaway screen, not Packing screen
+      setAvailableStores([]);
+      setSelectedStore("");
     }
   };
 

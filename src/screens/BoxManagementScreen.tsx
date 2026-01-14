@@ -579,8 +579,23 @@ export default function BoxManagementScreen() {
             setDistributionStores([]);
           }
         } catch (error: any) {
-          console.warn("⚠️ Could not fetch transfer order:", error);
-          console.warn("⚠️ Error details:", error.message);
+          // Handle 404 errors gracefully - ASN can be received without Transfer Order
+          const errorMessage = error?.message || error?.toString() || "";
+          const is404Error = 
+            errorMessage.includes("404") ||
+            errorMessage.includes("No transfer order found") ||
+            errorMessage.includes("not found") ||
+            errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+          
+          if (is404Error) {
+            // 404 is expected - ASN can be received without Transfer Order
+            console.log(
+              `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+            );
+          } else {
+            // Other errors (network, 500, etc.) - log as warning
+            console.warn("⚠️ BoxManagementScreen: Could not fetch transfer order:", errorMessage);
+          }
           // No Transfer Order - show empty list (no warehouses)
           // Stores should ONLY come from tabtransferorderitem (TO allocations)
           setTransferOrder(null);
@@ -598,8 +613,24 @@ export default function BoxManagementScreen() {
         console.warn(`⚠️ User will see "No stores found in Transfer Order" message`);
         console.warn(`⚠️ Note: Warehouses (WAREHOUSE, WH-MAIN, etc.) ARE now included in stores`);
       }
-    } catch (error) {
-      console.error("❌ Error loading transfer order and stores:", error);
+    } catch (error: any) {
+      // Handle 404 errors gracefully - ASN can be received without Transfer Order
+      const errorMessage = error?.message || error?.toString() || "";
+      const is404Error = 
+        errorMessage.includes("404") ||
+        errorMessage.includes("No transfer order found") ||
+        errorMessage.includes("not found") ||
+        errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
+      
+      if (is404Error) {
+        // 404 is expected - ASN can be received without Transfer Order
+        console.log(
+          `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
+        );
+      } else {
+        // Other errors (network, 500, etc.) - log as warning
+        console.warn("⚠️ BoxManagementScreen: Error loading transfer order and stores:", errorMessage);
+      }
       setTransferOrder(null);
       // Don't set default stores - only show stores that actually exist in TO allocations
       // If there's an error, show empty list or only what's in the database

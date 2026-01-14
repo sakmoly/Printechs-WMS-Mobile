@@ -30,6 +30,17 @@ export const clearAllCacheData = async () => {
       "material_request_cache",
       "scanned_items",
       "inbound_sessions",
+      "transfer_in_cache", // ✅ FIX: Clear transfer in cache
+      "stock_ledger_cache", // ✅ FIX: Clear stock ledger cache (sources expected quantities)
+      "stock_transaction_cache", // ✅ FIX: Clear stock transaction cache
+      "cycle_count_sessions", // ✅ FIX: Clear cycle count sessions
+      "cycle_count_lines", // ✅ FIX: Clear cycle count lines (contains expected_qty)
+      "cycle_count_cache", // ✅ FIX: Clear cycle count cache
+      "bin_master_cache", // ✅ FIX: Clear bin master cache
+      "item_barcode_map", // ✅ FIX: Clear item barcode map
+      "workflow_state_cache", // ✅ FIX: Clear workflow state cache
+      "putaway_items_cache", // ✅ FIX: Clear putaway items cache
+      "warehouse_rack_cache", // ✅ FIX: Clear warehouse rack cache
     ];
 
     for (const table of tablesToClear) {

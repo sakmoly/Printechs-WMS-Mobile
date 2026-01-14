@@ -337,16 +337,33 @@ export const syncEvents = async (): Promise<{
           continue;
         }
 
-        // Log PACK_BOX_TO_TC events in this batch for debugging
-        const packEvents = chunk.filter(e => e.event_type === "PACK_BOX_TO_TC");
+        // Log PACK_ITEM_TO_TC (and PACK_BOX_TO_TC for backward compatibility) events in this batch for debugging
+        const packEvents = chunk.filter(e => e.event_type === "PACK_ITEM_TO_TC" || e.event_type === "PACK_BOX_TO_TC");
         if (packEvents.length > 0) {
-          console.warn(`📦 PACK_BOX_TO_TC events in this batch:`, packEvents.map(e => ({
-            uuid: e.offline_uuid.substring(0, 8) + '...',
-            tc_id: e.tc_id,
-            box_id: e.box_id,
-            store: e.store,
-            asn_no: e.asn_no
-          })));
+          console.warn(`📦 PACK_ITEM_TO_TC/PACK_BOX_TO_TC events in this batch (${packEvents.length}):`);
+          packEvents.forEach((e, idx) => {
+            console.warn(`   Event ${idx + 1}:`, {
+              uuid: e.offline_uuid.substring(0, 12) + '...',
+              event_type: e.event_type,
+              item_code: e.item_code,
+              qty: e.qty,
+              carton_id: e.carton_id,
+              carton_id_length: e.carton_id?.length || 0,
+              box_id: e.box_id,
+              source_bin: e.source_bin,
+              source_bin_length: e.source_bin?.length || 0,
+              bin: e.bin,
+              location_id: e.location_id,
+              rack: e.rack,
+              tc_id: e.tc_id,
+              material_request: e.material_request,
+              to_no: e.to_no,
+              store: e.store,
+              asn_no: e.asn_no,
+              device_id: e.device_id,
+              user_id: e.user_id
+            });
+          });
         }
 
         // Log first event structure for debugging
@@ -359,7 +376,51 @@ export const syncEvents = async (): Promise<{
           });
         }
 
-        const response = await apiService.batchEvents(chunk);
+        // ✅ Check if items are already scanned (for Material Request events)
+        // If events with same item_code and tc_id already exist, use update_mode
+        // Backend uses item_code + tc_id to identify existing scans for update
+        let useUpdateMode = false;
+        
+        if (packEvents.length > 0) {
+          try {
+            const db = await getDatabase();
+            // Check if any of these items are already scanned (exist in synced events)
+            // Backend identifies existing scans by item_code + tc_id (not carton_id)
+            for (const event of packEvents) {
+              if (event.item_code && event.tc_id) {
+                // Check for existing synced events with same item_code and tc_id
+                const existingEvent = await db.getFirstAsync<{ count: number }>(
+                  `SELECT COUNT(*) as count FROM event_queue 
+                   WHERE item_code = ? AND tc_id = ? AND synced = 1
+                   AND event_type IN ('PACK_ITEM_TO_TC', 'PACK_BOX_TO_TC')`,
+                  [event.item_code, event.tc_id]
+                );
+                
+                if (existingEvent && existingEvent.count > 0) {
+                  useUpdateMode = true;
+                  console.warn(`🔄 Item ${event.item_code} already scanned in TC ${event.tc_id} (${existingEvent.count} existing events) - using update_mode: true`);
+                  break; // If any item is already scanned, use update mode for the whole batch
+                }
+              }
+            }
+          } catch (checkError: any) {
+            console.warn(`⚠️ Failed to check for existing events, using normal mode:`, checkError.message);
+            // Continue with normal mode if check fails
+          }
+        }
+        
+        // Log update mode decision
+        if (useUpdateMode) {
+          console.warn(`🔄 UPDATE MODE: Will send events with update_mode: true`);
+        } else {
+          console.warn(`➕ NORMAL MODE: Will send events without update_mode (new items)`);
+        }
+
+        const response = await apiService.batchEvents(chunk, useUpdateMode);
+        
+        if (useUpdateMode) {
+          console.warn(`✅ Sent batch with update_mode: true (items already scanned)`);
+        }
 
         // Log raw response for debugging (use warn so it shows up)
         console.warn(`📡 Backend batch response (raw):`, JSON.stringify(response, null, 2));
@@ -390,11 +451,27 @@ export const syncEvents = async (): Promise<{
           console.warn(`✅ Backend returned acked_uuids array with ${ackedUuids.length} UUIDs - events ARE saved to backend`);
         } else if (response.ok === true && (response.inserted_count !== undefined || response.total_count !== undefined)) {
           // Format 5: Backend saved events and returned count
-          const insertedCount = response.inserted_count || response.total_count || chunk.length;
-          console.warn(`✅ Backend returned ok: true with inserted_count: ${insertedCount} - events ARE saved to backend`);
-          // If backend says it inserted events, mark all events in chunk as synced
-          ackedUuids = chunk.map(e => e.offline_uuid);
-          usingFallbackAck = false; // Not a fallback - backend confirmed insertion
+          const insertedCount = response.inserted_count || 0;
+          const totalCount = response.total_count || chunk.length;
+          
+          // ✅ IMPORTANT: Only mark events as synced if they were actually inserted
+          // If inserted_count is 0, events failed validation and were NOT saved
+          if (insertedCount > 0) {
+            console.warn(`✅ Backend returned ok: true with inserted_count: ${insertedCount} - events ARE saved to backend`);
+            // If backend says it inserted events, mark all events in chunk as synced
+            // BUT: Exclude events that have errors (they will be handled below)
+            const errorUuids = new Set(
+              (response.errors || []).map((e: any) => e.offline_uuid || e.uuid).filter(Boolean)
+            );
+            ackedUuids = chunk
+              .filter(e => !errorUuids.has(e.offline_uuid))
+              .map(e => e.offline_uuid);
+            usingFallbackAck = false; // Not a fallback - backend confirmed insertion
+          } else {
+            console.warn(`⚠️ Backend returned ok: true but inserted_count: 0 - events were NOT saved (validation errors)`);
+            // Don't mark any events as synced - they all failed
+            ackedUuids = [];
+          }
         } else if (response.ok === true && response.processed) {
           // Simple acknowledgment - mark all events as synced
           console.warn(`ℹ️ Backend returned simple acknowledgment (ok: true, processed: ${response.processed})`);
@@ -414,10 +491,19 @@ export const syncEvents = async (): Promise<{
           console.warn(`   Response keys:`, Object.keys(response || {}));
         }
 
+        // Check for failed events in multiple formats
         if (response.failed && Array.isArray(response.failed)) {
           failedItems = response.failed;
         } else if (response.failed_details && Array.isArray(response.failed_details)) {
           failedItems = response.failed_details;
+        } else if (response.errors && Array.isArray(response.errors)) {
+          // ✅ Backend returns errors array with { offline_uuid, error } format
+          failedItems = response.errors.map((err: any) => ({
+            offline_uuid: err.offline_uuid || err.uuid,
+            uuid: err.offline_uuid || err.uuid,
+            message: err.error || err.message || "Validation error"
+          }));
+          console.warn(`⚠️ Backend returned ${failedItems.length} error(s) - events failed validation`);
         }
 
         // Determine if events were actually saved to backend
@@ -443,25 +529,50 @@ export const syncEvents = async (): Promise<{
           }))
         });
 
+        // ✅ IMPORTANT: Exclude failed events from acked list
+        // If an event has an error, it should NOT be marked as synced
+        const failedUuids = new Set(
+          failedItems.map((f: any) => f.offline_uuid || f.uuid).filter(Boolean)
+        );
+        const validAckedUuids = ackedUuids.filter(uuid => !failedUuids.has(uuid));
+        
+        // ✅ CRITICAL: Only mark events as synced if they were actually inserted
+        // If inserted_count is 0, even if response.ok is true, events were NOT saved
+        const actuallyInserted = response.inserted_count !== undefined && response.inserted_count > 0;
+        const hasErrors = failedItems.length > 0;
+        
         // Mark acked events as synced (this also clears error_msg)
-        if (ackedUuids.length > 0) {
-          for (const uuid of ackedUuids) {
+        if (validAckedUuids.length > 0 && actuallyInserted) {
+          for (const uuid of validAckedUuids) {
             await markEventSynced(uuid);
             totalSyncedCount++;
           }
-          console.warn(`✅ Marked ${ackedUuids.length} events as synced`);
-        } else if (response.ok === true || response.success === true) {
+          console.warn(`✅ Marked ${validAckedUuids.length} events as synced (${ackedUuids.length - validAckedUuids.length} excluded due to errors)`);
+        } else if (response.ok === true && !hasErrors && (response.inserted_count === undefined || response.inserted_count > 0)) {
           // Backend returned success but no acked_uuids - assume all events were processed
+          // BUT: Only if there are no errors and events were actually inserted
           // This handles cases where backend uses simple acknowledgment format
-          console.warn(`ℹ️ Backend returned success but no acked_uuids - marking all ${chunk.length} events as synced`);
+          console.warn(`ℹ️ Backend returned success but no acked_uuids - marking all ${chunk.length} events as synced (fallback)`);
           for (const event of chunk) {
-            await markEventSynced(event.offline_uuid);
-            totalSyncedCount++;
+            // Don't mark failed events as synced
+            if (!failedUuids.has(event.offline_uuid)) {
+              await markEventSynced(event.offline_uuid);
+              totalSyncedCount++;
+            }
           }
-          console.warn(`✅ Marked all ${chunk.length} events in chunk as synced (fallback)`);
+          console.warn(`✅ Marked ${chunk.length - failedUuids.size} events in chunk as synced (fallback, ${failedUuids.size} excluded)`);
         } else {
-          console.warn(`⚠️ No events were acked by backend (acked_uuids is empty or missing, and response.ok/success is not true)`);
+          // ✅ CRITICAL: If inserted_count is 0, events were NOT saved, even if response.ok is true
+          if (response.ok === true && response.inserted_count === 0) {
+            console.warn(`⚠️ Backend returned ok:true but inserted_count:0 - events were NOT saved to backend`);
+            console.warn(`   This means all events failed validation or were rejected`);
+          } else {
+            console.warn(`⚠️ No events were acked by backend (acked_uuids is empty or missing, and response.ok/success is not true, or all events have errors)`);
+          }
           console.warn(`   Response keys:`, Object.keys(response || {}));
+          if (response.errors && response.errors.length > 0) {
+            console.warn(`   Errors:`, response.errors.map((e: any) => e.error || e.message).join(", "));
+          }
         }
 
         // Mark failed events
@@ -485,7 +596,7 @@ export const syncEvents = async (): Promise<{
           const failedPackEvents = packEvents.filter(e => 
             failedItems.some((f: any) => (f.uuid || f.offline_uuid) === e.offline_uuid)
           );
-          console.warn(`📦 PACK_BOX_TO_TC sync result: ${ackedPackEvents.length} acked, ${failedPackEvents.length} failed, ${packEvents.length - ackedPackEvents.length - failedPackEvents.length} not acknowledged`);
+          console.warn(`📦 PACK_ITEM_TO_TC/PACK_BOX_TO_TC sync result: ${ackedPackEvents.length} acked, ${failedPackEvents.length} failed, ${packEvents.length - ackedPackEvents.length - failedPackEvents.length} not acknowledged`);
         }
 
         // Calculate actual synced/failed counts for this chunk
@@ -632,14 +743,14 @@ export const getEventsForTransferCarton = async (tc_id: string): Promise<ScanEve
   
   // First try exact match
   let events = await db.getAllAsync<ScanEvent>(
-    "SELECT * FROM event_queue WHERE tc_id = ? AND event_type = 'PACK_BOX_TO_TC' ORDER BY event_time ASC",
+    "SELECT * FROM event_queue WHERE tc_id = ? AND event_type IN ('PACK_BOX_TO_TC', 'PACK_ITEM_TO_TC') ORDER BY event_time ASC",
     [tc_id]
   );
   
   // If no exact match, try case-insensitive match
   if (events.length === 0) {
     events = await db.getAllAsync<ScanEvent>(
-      "SELECT * FROM event_queue WHERE UPPER(tc_id) = UPPER(?) AND event_type = 'PACK_BOX_TO_TC' ORDER BY event_time ASC",
+      "SELECT * FROM event_queue WHERE UPPER(tc_id) = UPPER(?) AND event_type IN ('PACK_BOX_TO_TC', 'PACK_ITEM_TO_TC') ORDER BY event_time ASC",
       [tc_id]
     );
   }
@@ -647,7 +758,7 @@ export const getEventsForTransferCarton = async (tc_id: string): Promise<ScanEve
   // If still no match, try to find events with similar tc_id (contains the tc_id)
   if (events.length === 0) {
     events = await db.getAllAsync<ScanEvent>(
-      "SELECT * FROM event_queue WHERE tc_id LIKE ? AND event_type = 'PACK_BOX_TO_TC' ORDER BY event_time ASC",
+      "SELECT * FROM event_queue WHERE tc_id LIKE ? AND event_type IN ('PACK_BOX_TO_TC', 'PACK_ITEM_TO_TC') ORDER BY event_time ASC",
       [`%${tc_id}%`]
     );
   }
@@ -666,7 +777,7 @@ export const searchRelatedEvents = async (tc_id: string): Promise<ScanEvent[]> =
   // This helps find events where tc_id might have been stored with a different format
   const events = await db.getAllAsync<ScanEvent>(
     `SELECT * FROM event_queue 
-     WHERE event_type = 'PACK_BOX_TO_TC' 
+     WHERE event_type IN ('PACK_BOX_TO_TC', 'PACK_ITEM_TO_TC') 
      AND (
        tc_id = ? 
        OR UPPER(tc_id) = UPPER(?)

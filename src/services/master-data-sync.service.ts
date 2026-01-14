@@ -100,17 +100,37 @@ export const syncMasterDataFromDesktop =
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           try {
-            await db.runAsync(
-              `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) 
-               VALUES (?, ?, ?, ?)`,
-              [
-                item.item_code,
-                item.barcode,
-                item.item_name || null,
-                item.updated_on || new Date().toISOString(),
-              ]
-            );
-            result.items.synced++;
+            // ✅ Add retry logic for database statement finalization errors
+            let retries = 3;
+            let success = false;
+            while (retries > 0 && !success) {
+              try {
+                await db.runAsync(
+                  `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) 
+                   VALUES (?, ?, ?, ?)`,
+                  [
+                    item.item_code,
+                    item.barcode,
+                    item.item_name || null,
+                    item.updated_on || new Date().toISOString(),
+                  ]
+                );
+                result.items.synced++;
+                success = true;
+              } catch (dbError: any) {
+                const errorMsg = dbError.message || dbError.toString() || "";
+                // Check if it's a finalizeAsync error - retry after a short delay
+                if (errorMsg.includes("finalizeAsync") || errorMsg.includes("NativeStatement")) {
+                  retries--;
+                  if (retries > 0) {
+                    // Wait a bit longer on each retry to allow statement to be finalized
+                    await new Promise((resolve) => setTimeout(resolve, 50 * (4 - retries)));
+                    continue;
+                  }
+                }
+                throw dbError; // Re-throw if not a finalizeAsync error or retries exhausted
+              }
+            }
 
             // Yield to UI thread every 50 items
             if ((i + 1) % 50 === 0) {
@@ -926,20 +946,26 @@ export const syncMasterDataFromDesktop =
       // Small delay between sync steps to allow UI updates
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // 7. Sync Warehouses
+      // 7. Sync Warehouses from tabwarehouse table
+      // Backend endpoint: GET /api/master/warehouses
+      // Expected to return data from tabwarehouse table
       try {
+        console.log("🔄 Syncing warehouses from tabwarehouse (endpoint: /api/master/warehouses)...");
         const response = await apiService.pullWarehouses();
-        const warehouses = extractArrayFromResponse(response, "🏭 Warehouses");
+        const warehouses = extractArrayFromResponse(response, "🏭 Warehouses from tabwarehouse");
 
+        console.log(`📦 Processing ${warehouses.length} warehouses from tabwarehouse...`);
         for (let whIndex = 0; whIndex < warehouses.length; whIndex++) {
           const warehouse = warehouses[whIndex];
           try {
+            // Map tabwarehouse fields to mobile app cache
+            // Expected fields from tabwarehouse: warehouse_id, warehouse_name, location, is_active, updated_on
             await db.runAsync(
               `INSERT OR REPLACE INTO warehouse_cache 
                (warehouse_id, warehouse_name, location, is_active, updated_on) 
                VALUES (?, ?, ?, ?, ?)`,
               [
-                warehouse.warehouse_id,
+                warehouse.warehouse_id || warehouse.name || warehouse.code,
                 warehouse.warehouse_name || warehouse.name || null,
                 warehouse.location || null,
                 warehouse.is_active !== undefined
@@ -958,6 +984,11 @@ export const syncMasterDataFromDesktop =
               ]
             );
             result.warehouses.synced++;
+            
+            // Log first few warehouses for debugging
+            if (whIndex < 3) {
+              console.log(`  ✅ Synced warehouse: ${warehouse.warehouse_id || warehouse.name} (${warehouse.warehouse_name || warehouse.name})`);
+            }
 
             // Yield to UI thread every 20 warehouses
             if ((whIndex + 1) % 20 === 0) {
@@ -971,15 +1002,17 @@ export const syncMasterDataFromDesktop =
             result.warehouses.failed++;
           }
         }
+        console.log(`✅ Successfully synced ${result.warehouses.synced} warehouses from tabwarehouse to warehouse_cache table`);
       } catch (error: any) {
         const errorMsg = error.message || error.toString() || "Unknown error";
         // 404 means endpoint not implemented - this is optional, just log a warning
         if (errorMsg.includes("404") || errorMsg.includes("not found")) {
           console.warn(
-            "⚠️ Warehouses endpoint not implemented (404) - skipping"
+            "⚠️ Warehouses endpoint (/api/master/warehouses) not implemented (404) - skipping tabwarehouse sync"
           );
+          console.warn("⚠️ Backend should implement GET /api/master/warehouses to return data from tabwarehouse table");
         } else {
-          console.error("Failed to pull warehouses:", errorMsg);
+          console.error("❌ Failed to pull warehouses from tabwarehouse:", errorMsg);
           result.warehouses.failed++;
         }
       }

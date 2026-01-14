@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
+import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { saveSettings, getSettings } from "../services/settings.service";
 import { apiService } from "../services/api.service";
 import { syncUsers } from "../services/user-sync.service";
@@ -317,7 +318,8 @@ export default function SettingsScreen() {
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <View style={{ flex: 1 }}>
+      <ScrollView style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Device Settings</Text>
       </View>
@@ -506,6 +508,8 @@ export default function SettingsScreen() {
         </View>
       </View>
     </ScrollView>
+    <ScreenFooterFrame />
+    </View>
   );
 }
 

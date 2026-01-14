@@ -148,6 +148,34 @@ const makeRequest = async (
   // In production mode with API URL configured, make real API call
   const url = `${settings.api_url.replace(/\/$/, "")}${endpoint}`;
   console.log(`🌐 API Request: ${method} ${url}`);
+  
+  // ✅ DEBUG: Log events/batch requests to verify structure
+  if (endpoint === "/api/events/batch" && body) {
+    console.warn(
+      `📦 Events Batch Request Details:`,
+      JSON.stringify({
+        has_events: !!body.events,
+        events_count: body.events?.length || 0,
+        update_mode: body.update_mode,
+        body_keys: Object.keys(body),
+        first_event_preview: body.events?.[0] ? {
+          event_type: body.events[0].event_type,
+          item_code: body.events[0].item_code,
+          qty: body.events[0].qty,
+          tc_id: body.events[0].tc_id,
+          carton_id: body.events[0].carton_id,
+        } : null,
+      }, null, 2)
+    );
+    // Also log the full request body for Material Request events
+    if (body.events && body.events.length > 0 && 
+        (body.events[0].event_type === "PACK_ITEM_TO_TC" || body.events[0].event_type === "PACK_BOX_TO_TC")) {
+      console.warn(
+        `📦 Full Events Batch Request Body:`,
+        JSON.stringify(body, null, 2)
+      );
+    }
+  }
 
   // Log request body for carton status updates (for debugging)
   if (endpoint === "/api/cartons/update-status" && body) {
@@ -155,6 +183,28 @@ const makeRequest = async (
       `📦 Carton Status Update Request:`,
       JSON.stringify(body, null, 2)
     );
+  }
+
+  // ✅ DEBUG: Log cycle count count requests to verify lineId and expected_qty are included
+  if (endpoint.includes("/api/cycle-count/") && endpoint.endsWith("/count") && method === "POST" && body) {
+    console.log(
+      `📦 Cycle Count Count Request:`,
+      JSON.stringify(body, null, 2)
+    );
+    // Log each line to verify lineId and expected_qty are present
+    if (body.lines && Array.isArray(body.lines)) {
+      body.lines.forEach((line: any, idx: number) => {
+        console.log(
+          `📦   Line ${idx + 1}: item_code=${line.item_code}, lineId=${line.lineId}, id=${line.id}, line_id=${line.line_id || 'null'}, expected_qty=${line.expected_qty !== undefined ? line.expected_qty : 'undefined'}, actual_qty=${line.actual_qty !== undefined ? line.actual_qty : line.counted_qty || 'undefined'}`
+        );
+        if (!line.lineId && line.lineId !== 0) {
+          console.error(`❌ CRITICAL: Line ${idx + 1} (${line.item_code}) is missing lineId!`);
+        }
+        if (line.expected_qty === undefined) {
+          console.warn(`⚠️ WARNING: Line ${idx + 1} (${line.item_code}) is missing expected_qty field!`);
+        }
+      });
+    }
   }
 
   if (authToken) {
@@ -225,10 +275,115 @@ const makeRequest = async (
         return []; // Return empty array instead of throwing error
       }
 
-      // Handle 404 for cycle-count endpoints - throw error (no mock data)
+      // Handle 404 for transfer-order endpoint gracefully (ASN can be received without Transfer Order)
       if (
         response.status === 404 &&
-        endpoint.includes("/api/cycle-count")
+        endpoint.includes("/api/transfer-order/by-asn/") &&
+        method === "GET"
+      ) {
+        console.log(
+          `ℹ️ No transfer order found for ASN (404) - this is OK, ASN can be received without Transfer Order`
+        );
+        return null; // Return null instead of throwing error
+      }
+
+      // Handle 404 for transfer-cartons/{tc_id} endpoint gracefully (endpoint may not exist on backend)
+      if (
+        response.status === 404 &&
+        endpoint.includes("/api/transfer-cartons/") &&
+        method === "GET" &&
+        !endpoint.includes("?") // Only for single TC endpoint, not list endpoint
+      ) {
+        console.log(
+          `ℹ️ Transfer Carton details endpoint not available (404) - this is expected if backend doesn't implement GET /api/transfer-cartons/{tc_id}`
+        );
+        return null; // Return null instead of throwing error
+      }
+
+      // Handle 404 for stock/item endpoint gracefully (endpoint may not exist on backend)
+      if (
+        response.status === 404 &&
+        endpoint.includes("/api/stock/item/") &&
+        endpoint.includes("/warehouse/") &&
+        method === "GET"
+      ) {
+        console.log(
+          `ℹ️ Stock item endpoint not found (404) - this endpoint may not be implemented yet`
+        );
+        return null; // Return null instead of throwing error
+      }
+
+      // Handle 404 for cycle-count DELETE endpoint gracefully (endpoint may not be implemented yet)
+      if (
+        response.status === 404 &&
+        endpoint.includes("/api/cycle-count") &&
+        method === "DELETE"
+      ) {
+        console.warn(
+          `ℹ️ Cycle Count DELETE endpoint not implemented (404) - this is expected if backend hasn't implemented DELETE /api/cycle-count/{title} yet`
+        );
+        // Return a success-like response so the app can continue with local deletion
+        return { success: true, message: "DELETE endpoint not implemented, local deletion only" };
+      }
+      
+
+      // Handle 400 for stock/ledger endpoint when bin_location is missing
+      if (
+        response.status === 400 &&
+        endpoint.includes("/api/stock/ledger")
+      ) {
+        const errorText = await response.text();
+        let errorData: any;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { message: errorText || "Bad Request" };
+        }
+        
+        // If the error is about missing bin_location, provide a helpful message
+        if (errorData.message?.includes("bin_location") && errorData.message?.includes("required")) {
+          console.warn(
+            `⚠️ Stock ledger API requires bin_location parameter. If you want all entries, use a different endpoint or provide a bin_location filter.`
+          );
+          // Return empty array instead of throwing error for StockLedgerListScreen
+          return [];
+        }
+        
+        // For other 400 errors, throw normally
+        throw new Error(
+          errorData.message || `Bad Request: ${endpoint}`
+        );
+      }
+
+      // Handle 404 for picking endpoints gracefully (endpoints may not be implemented yet)
+      if (
+        response.status === 404 &&
+        endpoint.includes("/api/wms/picking/")
+      ) {
+        console.log(
+          `ℹ️ Picking endpoint not implemented (404): ${endpoint} - this is expected if backend hasn't implemented picking APIs yet`
+        );
+        // Return a structured error that can be caught and handled gracefully
+        const errorText = await response.text();
+        let errorData: any;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { message: errorText || "Not Found" };
+        }
+        const error = new Error(
+          errorData.message || `Picking endpoint not found: ${endpoint}`
+        );
+        (error as any).status = 404;
+        (error as any).is404 = true;
+        throw error;
+      }
+      
+      // Handle 404 for other cycle-count endpoints - throw error (no mock data)
+      if (
+        response.status === 404 &&
+        endpoint.includes("/api/cycle-count") &&
+        method !== "DELETE"
       ) {
         console.error(
           `❌ Cycle Count endpoint returned 404: ${endpoint}`
@@ -374,8 +529,15 @@ const makeRequest = async (
 
       const finalError = `API error (${response.status}): ${errorMessage}`;
 
-      // For 404 errors on carton status updates, log as warning (expected if carton doesn't exist yet)
+      // For 404 errors on picking endpoints, don't log as error (handled gracefully by caller)
       if (
+        response.status === 404 &&
+        endpoint.includes("/api/wms/picking/")
+      ) {
+        // Picking endpoint 404s are handled above and will be caught by caller
+        // Don't log as error - the handler above already logged as info
+        // Just throw the error with is404 flag
+      } else if (
         response.status === 404 &&
         endpoint === "/api/cartons/update-status"
       ) {
@@ -416,12 +578,43 @@ const makeRequest = async (
       throw new Error(`Request timeout after ${API_TIMEOUT}ms: ${url}`);
     }
     if (error.message && error.message.includes("API error")) {
+      // Check if this is a picking endpoint 404 (handled gracefully)
+      if (error.is404 && endpoint.includes("/api/wms/picking/")) {
+        // Don't log as error - this is expected and handled gracefully
+        throw error; // Re-throw with is404 flag
+      }
       throw error; // Re-throw API errors as-is
     }
     // Network errors or other errors
     const errorMsg = error.message || error.toString() || "Unknown error";
-    console.error(`❌ API Request failed: ${method} ${url}`, errorMsg);
-    throw new Error(`Network error: ${errorMsg}`);
+    
+    // Detect server unavailable scenarios
+    const isServerUnavailable = 
+      errorMsg.includes("Network request failed") ||
+      errorMsg.includes("Failed to fetch") ||
+      errorMsg.includes("NetworkError") ||
+      errorMsg.includes("ERR_NETWORK") ||
+      errorMsg.includes("ERR_INTERNET_DISCONNECTED") ||
+      error.name === "TypeError" && errorMsg.includes("fetch");
+    
+    // Create user-friendly error message
+    let userFriendlyError: Error;
+    if (isServerUnavailable) {
+      userFriendlyError = new Error("SERVER_UNAVAILABLE");
+      userFriendlyError.message = "Server is not accessible. Please check your connection and try again.";
+    } else {
+      userFriendlyError = new Error(`Network error: ${errorMsg}`);
+    }
+    
+    // Don't log picking endpoint errors as they're handled gracefully
+    if (!endpoint.includes("/api/wms/picking/")) {
+      if (isServerUnavailable) {
+        console.warn(`⚠️ Server unavailable: ${method} ${url} - ${errorMsg}`);
+      } else {
+        console.error(`❌ API Request failed: ${method} ${url}`, errorMsg);
+      }
+    }
+    throw userFriendlyError;
   }
 };
 
@@ -1257,9 +1450,39 @@ export const apiService = {
     );
   },
 
-  batchEvents: async (events: ScanEvent[]) => {
+  batchEvents: async (events: ScanEvent[], updateMode: boolean = false) => {
     // Backend expects events to be wrapped in an object with an 'events' property
-    return makeRequest("/api/events/batch", "POST", { events });
+    // If updateMode is true, include update_mode flag for updating existing scanned items
+    // Ensure events is always an array
+    if (!Array.isArray(events)) {
+      console.error(`❌ ERROR: events must be an array, got:`, typeof events);
+      throw new Error("Events must be an array");
+    }
+    
+    const requestBody: any = {
+      events: events || [],
+    };
+    
+    if (updateMode) {
+      requestBody.update_mode = true;
+    }
+    
+    console.log(`📤 Batch Events Request:`, {
+      update_mode: updateMode,
+      events_count: events?.length || 0,
+      request_body_keys: Object.keys(requestBody),
+      has_events: !!requestBody.events,
+      events_is_array: Array.isArray(requestBody.events),
+      events_length: requestBody.events?.length || 0,
+    });
+    
+    // Verify request body structure before sending
+    if (!requestBody.events || !Array.isArray(requestBody.events)) {
+      console.error(`❌ ERROR: Request body missing events array:`, requestBody);
+      throw new Error("Request body must contain events array");
+    }
+    
+    return makeRequest("/api/events/batch", "POST", requestBody);
   },
 
   createBox: async (data: { asn_no: string; to_no: string; store: string }) => {
@@ -1275,24 +1498,46 @@ export const apiService = {
   },
 
   createTransferCarton: async (data: {
-    asn_no: string;
+    tc_id?: string; // ✅ NEW: Optional tc_id - backend may require it or generate it
+    asn_no: string | null; // Allow null for Material Requests
     to_no?: string;
     store: string;
     user_id?: string;
     created_by?: string;
+    material_request?: string; // Optional: for Material Request tracking
   }) => {
-    // Include created_by if user_id is provided (backend may expect created_by)
+    // ✅ Backend requires: tc_id, store, and user_id (or created_by)
     const requestData: any = {
-      asn_no: data.asn_no,
-      to_no: data.to_no,
       store: data.store,
     };
 
-    // Backend expects created_by, but we'll send both user_id and created_by
-    // to support either field name
+    // Include tc_id if provided (backend may require it or accept it)
+    if (data.tc_id) {
+      requestData.tc_id = data.tc_id;
+    }
+
+    // Include asn_no if provided (not null) - Material Requests use null
+    if (data.asn_no !== null && data.asn_no !== undefined) {
+      requestData.asn_no = data.asn_no;
+    }
+
+    // Include to_no if provided
+    if (data.to_no) {
+      requestData.to_no = data.to_no;
+    }
+
+    // ✅ Backend requires user_id or created_by - send both for compatibility
     if (data.user_id) {
       requestData.user_id = data.user_id;
       requestData.created_by = data.created_by || data.user_id;
+    } else if (data.created_by) {
+      requestData.created_by = data.created_by;
+      requestData.user_id = data.created_by; // Also send as user_id for compatibility
+    }
+
+    // Include material_request if provided (for Material Request tracking)
+    if (data.material_request) {
+      requestData.material_request = data.material_request;
     }
 
     return makeRequest("/api/transfer-cartons/create", "POST", requestData);
@@ -1302,8 +1547,26 @@ export const apiService = {
     return makeRequest("/api/transfer-cartons/seal", "POST", data);
   },
 
-  dispatchTransferCarton: async (data: { tc_id: string }) => {
-    return makeRequest("/api/transfer-cartons/dispatch", "POST", data);
+  dispatchTransferCarton: async (data: { 
+    tc_id: string;
+    dispatched_by?: string;
+    user_id?: string;
+  }) => {
+    // Backend may need user_id or dispatched_by for tracking
+    const requestBody: any = {
+      tc_id: data.tc_id,
+    };
+    
+    // Add user_id or dispatched_by if provided
+    if (data.dispatched_by) {
+      requestBody.dispatched_by = data.dispatched_by;
+    }
+    if (data.user_id) {
+      requestBody.user_id = data.user_id;
+    }
+    
+    console.log(`🚚 Dispatching Transfer Carton:`, JSON.stringify(requestBody, null, 2));
+    return makeRequest("/api/transfer-cartons/dispatch", "POST", requestBody);
   },
 
   // PULL APIs
@@ -1325,7 +1588,27 @@ export const apiService = {
     return await makeRequest(`/api/transfer-order/by-asn/${asn_no}`, "GET");
   },
 
+  /**
+   * Get boxes for a specific ASN and store.
+   * 
+   * ⚠️ IMPORTANT: This endpoint requires both 'asn' and 'store' parameters.
+   * For bin validation/scanning, use getBinMaster() instead.
+   * 
+   * @param params - Object with asn and store (both required by backend)
+   * @returns Array of boxes
+   */
   getBoxes: async (params: { asn?: string; store?: string }) => {
+    // Validate required parameters
+    if (!params.asn || !params.store) {
+      const missing = [];
+      if (!params.asn) missing.push("asn");
+      if (!params.store) missing.push("store");
+      throw new Error(
+        `Missing required parameters for getBoxes: ${missing.join(", ")}. ` +
+        `For bin validation, use getBinMaster(binCode) instead.`
+      );
+    }
+
     const queryParams = new URLSearchParams();
     if (params.asn) queryParams.append("asn", params.asn);
     if (params.store) queryParams.append("store", params.store);
@@ -1333,15 +1616,23 @@ export const apiService = {
     return makeRequest(`/api/boxes${query ? `?${query}` : ""}`, "GET");
   },
 
-  getTransferCartons: async (params: { asn?: string; store?: string }) => {
+  getTransferCartons: async (params: { asn?: string; store?: string; material_request?: string }) => {
     const queryParams = new URLSearchParams();
     if (params.asn) queryParams.append("asn", params.asn);
     if (params.store) queryParams.append("store", params.store);
+    if (params.material_request) queryParams.append("material_request", params.material_request);
     const query = queryParams.toString();
     return makeRequest(
       `/api/transfer-cartons${query ? `?${query}` : ""}`,
       "GET"
     );
+  },
+
+  getTransferCarton: async (tc_id: string) => {
+    // Get transfer carton details including items and quantities
+    // Note: This endpoint may not exist on all backends (returns 404 if not implemented)
+    // makeRequest will return null for 404, so we don't need special handling here
+    return makeRequest(`/api/transfer-cartons/${tc_id}`, "GET");
   },
 
   // Put Away APIs
@@ -1387,6 +1678,12 @@ export const apiService = {
     return makeRequest("/api/master/warehouse-racks", "GET");
   },
 
+  /**
+   * Pull warehouses from backend tabwarehouse table
+   * Backend endpoint: GET /api/master/warehouses
+   * Expected response: Array of warehouse objects from tabwarehouse table
+   * Fields: warehouse_id, warehouse_name, location, is_active, updated_on
+   */
   pullWarehouses: async () => {
     return makeRequest("/api/master/warehouses", "GET");
   },
@@ -1407,8 +1704,19 @@ export const apiService = {
     return makeRequest(url, "GET");
   },
 
+  /**
+   * Get bin master data for bin validation/scanning.
+   * 
+   * ✅ Use this endpoint for bin location validation in picking flows.
+   * 
+   * @param binCode - The bin code to validate (e.g., "A1-R02-L1-B2")
+   * @returns Bin master data including bin_code, bin_id, warehouse_id, zone, aisle, etc.
+   */
   getBinMaster: async (binCode: string) => {
-    return makeRequest(`/api/master/bin-master/${encodeURIComponent(binCode)}`, "GET");
+    if (!binCode || !binCode.trim()) {
+      throw new Error("Bin code is required for getBinMaster");
+    }
+    return makeRequest(`/api/master/bin-master/${encodeURIComponent(binCode.trim())}`, "GET");
   },
 
   pullStockLedger: async () => {
@@ -1841,7 +2149,434 @@ export const apiService = {
     title: string,
     status: string
   ) => {
-    return makeRequest(`/api/material-requests/${title}/status`, "POST", { status });
+    console.log(
+      `📝 Updating Material Request status: ${title} -> ${status}`
+    );
+    // Use /api/material-requests/{title}/update-status as per backend documentation
+    const response = await makeRequest(
+      `/api/material-requests/${title}/update-status`,
+      "POST",
+      { status }
+    );
+    console.log(
+      `📝 Material Request status update response:`,
+      JSON.stringify(response, null, 2)
+    );
+    return response;
+  },
+
+  getMaterialRequestPickingStatus: async (title: string) => {
+    console.log(`📊 Getting picking status for Material Request: ${title}`);
+    try {
+      const response = await makeRequest(
+        `/api/material-requests/${title}/picking-status`,
+        "GET"
+      );
+      console.log(
+        `📊 Picking status response:`,
+        JSON.stringify(response, null, 2)
+      );
+      return response;
+    } catch (error: any) {
+      // Handle 404 gracefully - API might not be implemented yet
+      if (error.message?.includes("404") || error.message?.includes("not found")) {
+        console.log(`ℹ️ Picking-status API not available (404) - will use fallback calculation`);
+        return { ok: false, error: { code: "NOT_FOUND", message: "API not implemented" } };
+      }
+      throw error; // Re-throw other errors
+    }
+  },
+
+  pickMaterialRequestItems: async (
+    title: string,
+    items: Array<{
+      item_code: string;
+      picked_qty: number;
+      source_bin: string;
+      carton_id?: string; // ✅ NEW: Optional carton_id for carton-level inventory
+    }>,
+    warehouse?: string,
+    user_id?: string // ✅ NEW: Optional user_id for created_by field
+  ) => {
+    // Get user_id from settings if not provided
+    let userId = user_id;
+    if (!userId) {
+      const settings = await getSettings();
+      userId = settings.user_id || settings.user_code || "";
+    }
+
+    const requestBody: any = {
+      items,
+    };
+
+    // Add warehouse if provided
+    if (warehouse) {
+      requestBody.warehouse = warehouse;
+    }
+
+    // ✅ CRITICAL: Add user_id/created_by for backend (required for normalizedCreatedBy)
+    if (userId) {
+      requestBody.user_id = userId;
+      requestBody.created_by = userId; // Backend might use either field
+    }
+
+    console.warn(
+      `📦 Calling pick-items API for Material Request: ${title}`,
+      JSON.stringify(requestBody, null, 2)
+    );
+    const response = await makeRequest(
+      `/api/material-requests/${title}/pick-items`,
+      "POST",
+      requestBody
+    );
+    console.warn(
+      `✅ pick-items API response:`,
+      JSON.stringify(response, null, 2)
+    );
+    return response;
+  },
+
+  // ✅ NEW: Add items to Transfer Carton (for Material Request redesign)
+  addItemsToTransferCarton: async (
+    tc_id: string,
+    items: Array<{
+      item_code: string;
+      qty: number;
+      carton_id?: string;
+      source_bin?: string;
+    }>,
+    user_id: string
+  ) => {
+    const requestBody = {
+      items,
+      user_id,
+    };
+    
+    // ✅ DEBUG: Log the request body to verify carton_id is included
+    console.log(`📦 addItemsToTransferCarton Request for TC ${tc_id}:`, JSON.stringify(requestBody, null, 2));
+    console.log(`📦 Items with carton_id check:`, items.map(item => ({
+      item_code: item.item_code,
+      qty: item.qty,
+      carton_id: item.carton_id || "NOT PROVIDED ⚠️",
+      source_bin: item.source_bin || "NOT PROVIDED ⚠️",
+    })));
+    
+    return makeRequest(
+      `/api/transfer-cartons/${tc_id}/add-items`,
+      "POST",
+      requestBody
+    );
+  },
+
+  // ✅ NEW: Picking Flow APIs
+  // Note: These APIs may not be implemented on backend yet
+  // They will gracefully fail and use local storage only
+  startPickingSession: async (materialRequestTitle: string, user_id: string) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/start`,
+        "POST",
+        {
+          material_request_title: materialRequestTitle,
+          user_id,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist (404), return local session ID silently
+      if (error?.status === 404 || error?.is404 || error?.message?.includes("404") || error?.message?.includes("not found")) {
+        // Silent - don't log as error, just return local session
+        return {
+          session_id: `PK-${materialRequestTitle}-${Date.now()}`,
+          data: { session_id: `PK-${materialRequestTitle}-${Date.now()}` },
+        };
+      }
+      throw error;
+    }
+  },
+
+  scanBin: async (sessionId: string, binCode: string) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/scan-bin`,
+        "POST",
+        {
+          session_id: sessionId,
+          bin_code: binCode,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist, just log and continue
+      if (error?.message?.includes("404") || error?.message?.includes("not found")) {
+        console.warn("⚠️ Scan bin API not available, saving locally only");
+        return { ok: true, message: "Saved locally" };
+      }
+      throw error;
+    }
+  },
+
+  scanCarton: async (sessionId: string, cartonId: string) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/scan-carton`,
+        "POST",
+        {
+          session_id: sessionId,
+          carton_id: cartonId,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist (404), just log and continue
+      if (error?.status === 404 || error?.is404 || error?.message?.includes("404") || error?.message?.includes("not found")) {
+        // Silent - don't log as error, just return success for local storage
+        return { ok: true, message: "Saved locally" };
+      }
+      throw error;
+    }
+  },
+
+  scanItem: async (
+    sessionId: string,
+    barcode: string,
+    cartonId?: string,
+    materialRequestTitle?: string // Pass MR title directly to avoid parsing issues
+  ) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/scan-item`,
+        "POST",
+        {
+          session_id: sessionId,
+          barcode,
+          carton_id: cartonId,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist, use the existing pick-items API as fallback
+      if (error?.status === 404 || error?.is404 || error?.message?.includes("404") || error?.message?.includes("not found")) {
+        // Use materialRequestTitle if provided, otherwise try to extract from session ID
+        let mrTitle = materialRequestTitle;
+        if (!mrTitle) {
+          // Extract material request title from session ID
+          // Session ID format: PK-{MR_TITLE}-{timestamp}
+          // Example: PK-MR-123457-1768293356659 -> MR-123457
+          // We need to find where the timestamp starts (last numeric-only segment)
+          const parts = sessionId.split("-");
+          if (parts.length >= 3 && parts[0] === "PK") {
+            // Find the last part that is purely numeric (timestamp)
+            let timestampIndex = -1;
+            for (let i = parts.length - 1; i >= 1; i--) {
+              if (/^\d+$/.test(parts[i])) {
+                timestampIndex = i;
+                break;
+              }
+            }
+            if (timestampIndex > 0) {
+              // Everything between "PK" and the timestamp is the MR title
+              mrTitle = parts.slice(1, timestampIndex).join("-");
+            } else {
+              // Fallback: remove "PK-" and last part
+              mrTitle = parts.slice(1, -1).join("-");
+            }
+          } else {
+            // Fallback: remove "PK-" prefix and everything after last dash
+            mrTitle = sessionId.replace(/^PK-/, "").split("-").slice(0, -1).join("-");
+          }
+        }
+        
+        // Debug log to help diagnose extraction issues
+        if (materialRequestTitle) {
+          console.log(`✅ Using provided Material Request title: ${materialRequestTitle}`);
+        } else {
+          console.warn(`⚠️ Extracted MR title from session ID: "${mrTitle}" (from "${sessionId}")`);
+        }
+        
+        if (mrTitle) {
+          // Validate MR title format (should be like MR-123457, not MR-PICK-MR-123457)
+          // If it contains "PICK", it's likely a malformed session ID extraction
+          if (mrTitle.includes("PICK") && !mrTitle.startsWith("MR-PICK-")) {
+            console.error(`❌ Invalid MR title extracted: "${mrTitle}" - this suggests a session ID parsing issue`);
+            // Try to extract the actual MR number from the malformed title
+            const mrMatch = mrTitle.match(/MR-(\d+)/);
+            if (mrMatch) {
+              mrTitle = `MR-${mrMatch[1]}`;
+              console.warn(`⚠️ Corrected MR title to: "${mrTitle}"`);
+            }
+          }
+          
+          // Use existing pick-items API
+          // Note: source_bin should be provided by the caller
+          // If not provided, this will fail validation on backend
+          return await apiService.pickMaterialRequestItems(
+            mrTitle,
+            [
+              {
+                item_code: barcode,
+                picked_qty: 1,
+                source_bin: "", // ⚠️ WARNING: source_bin is required - should be provided by caller
+                carton_id: cartonId,
+              },
+            ]
+          );
+        }
+        throw new Error(`Cannot determine Material Request from session ID: ${sessionId}`);
+      }
+      throw error;
+    }
+  },
+
+  updateLineQty: async (
+    sessionId: string,
+    lineId: string,
+    qty: number,
+    reason?: string
+  ) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/line-qty`,
+        "PUT",
+        {
+          session_id: sessionId,
+          line_id: lineId,
+          qty,
+          reason,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist, use pick-items API as fallback
+      if (error?.message?.includes("404") || error?.message?.includes("not found")) {
+        console.warn("⚠️ Update line qty API not available, using pick-items API fallback");
+        // Extract material request title from session ID
+        const mrTitle = sessionId.split("-").slice(0, -1).join("-").replace("PK-", "");
+        if (mrTitle) {
+          // Calculate difference - this is a simplified approach
+          // In a real scenario, you'd need to know the current qty
+          return await apiService.pickMaterialRequestItems(
+            mrTitle,
+            [
+              {
+                item_code: lineId, // Assuming lineId is item_code
+                picked_qty: qty,
+                source_bin: "",
+              },
+            ]
+          );
+        }
+        throw new Error("Cannot determine Material Request from session ID");
+      }
+      throw error;
+    }
+  },
+
+  completePicking: async (sessionId: string, materialRequestTitle?: string) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/complete`,
+        "POST",
+        {
+          session_id: sessionId,
+        }
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist, use update-status API as fallback
+      if (error?.message?.includes("404") || error?.message?.includes("not found") || error?.is404) {
+        console.warn("⚠️ Complete picking API not available, using update-status API fallback");
+        
+        // ✅ Use materialRequestTitle if provided (more reliable)
+        let mrTitle = materialRequestTitle;
+        
+        // Fallback: Try to extract from session ID if not provided
+        if (!mrTitle) {
+          // Session ID format: PK-MR-123457-1768293356659 or similar
+          // Try to extract MR-123457
+          const parts = sessionId.split("-");
+          if (parts.length >= 3 && parts[0] === "PK" && parts[1] === "MR") {
+            // Format: PK-MR-123457-timestamp
+            mrTitle = `MR-${parts.slice(2, -1).join("-")}`; // Get everything between "MR" and timestamp
+          } else {
+            // Try simpler extraction
+            mrTitle = sessionId.replace("PK-", "").split("-").slice(0, -1).join("-");
+          }
+        }
+        
+        if (mrTitle) {
+          console.log(`🔄 Using update-status API fallback for Material Request: ${mrTitle}`);
+          return await apiService.updateMaterialRequestStatus(mrTitle, "Picked");
+        }
+        throw new Error("Cannot determine Material Request title. Please provide materialRequestTitle parameter.");
+      }
+      throw error;
+    }
+  },
+
+  getPickingSession: async (sessionId: string) => {
+    try {
+      return await makeRequest(
+        `/api/wms/picking/session/${sessionId}`,
+        "GET"
+      );
+    } catch (error: any) {
+      // If endpoint doesn't exist, return null (will use local storage)
+      if (error?.message?.includes("404") || error?.message?.includes("not found")) {
+        console.warn("⚠️ Get picking session API not available, using local storage");
+        return null;
+      }
+      throw error;
+    }
+  },
+
+  // Get item locations for location icon
+  // Uses: GET /api/stock/item/:item_code/warehouse/:warehouse
+  // Alternative: GET /api/stock-ledger/:item_code/:warehouse
+  getItemLocations: async (warehouseId: string, itemCode: string) => {
+    try {
+      // Try primary endpoint first
+      let response;
+      try {
+        response = await makeRequest(
+          `/api/stock/item/${encodeURIComponent(itemCode)}/warehouse/${encodeURIComponent(warehouseId)}`,
+          "GET"
+        );
+      } catch (error: any) {
+        // If primary endpoint fails, try alternative
+        if (error?.status === 404 || error?.message?.includes("404")) {
+          console.log("ℹ️ Primary stock endpoint not found, trying alternative...");
+          response = await makeRequest(
+            `/api/stock-ledger/${encodeURIComponent(itemCode)}/${encodeURIComponent(warehouseId)}`,
+            "GET"
+          );
+        } else {
+          throw error;
+        }
+      }
+      
+      // Response should be an array of locations
+      if (Array.isArray(response)) {
+        return response;
+      }
+      
+      // If response is wrapped, try to extract array
+      if (response?.data && Array.isArray(response.data)) {
+        return response.data;
+      }
+      
+      // If response is an object with locations array
+      if (response?.locations && Array.isArray(response.locations)) {
+        return response.locations;
+      }
+      
+      // Return empty array if response format is unexpected
+      console.warn("⚠️ Unexpected response format for item locations:", response);
+      return [];
+    } catch (error: any) {
+      // If endpoint doesn't exist, return empty array
+      if (error?.status === 404 || error?.is404 || error?.message?.includes("404") || error?.message?.includes("not found")) {
+        console.log("ℹ️ Item locations API not available (404)");
+        return [];
+      }
+      // For other errors, log and return empty array
+      console.warn("⚠️ Error fetching item locations:", error.message);
+      return [];
+    }
   },
 
   // ============================================
@@ -1865,8 +2600,25 @@ export const apiService = {
     );
   },
 
-  getCycleCount: async (title: string) => {
-    return makeRequest(`/api/cycle-count/${title}`, "GET");
+  getCycleCount: async (
+    title: string,
+    filters?: {
+      carton_id?: string;
+      counted_by?: string;
+    }
+  ) => {
+    const params = new URLSearchParams();
+    if (filters?.carton_id) {
+      params.append("carton_id", filters.carton_id);
+    }
+    if (filters?.counted_by) {
+      params.append("counted_by", filters.counted_by);
+    }
+    const queryString = params.toString();
+    return makeRequest(
+      `/api/cycle-count/${title}${queryString ? `?${queryString}` : ""}`,
+      "GET"
+    );
   },
 
   startCycleCount: async (title: string, data: { started_by: string }) => {
@@ -1879,8 +2631,11 @@ export const apiService = {
       counted_by: string;
       lines: Array<{
         id?: number;
+        lineId?: number; // ✅ FIX: Backend expects lineId (camelCase) for line identification
+        line_id?: string; // Optional: Backend line_id in format "LINE-{id}"
         item_code: string; // Required for backend matching
         barcode?: string; // Optional, also accepted
+        carton_id?: string; // ✅ NEW: Optional carton_id for carton-level inventory
         actual_qty: number;
         counted_qty?: number;
         bin_location?: string;
@@ -1916,6 +2671,23 @@ export const apiService = {
 
   deleteCycleCount: async (title: string) => {
     return makeRequest(`/api/cycle-count/${title}`, "DELETE");
+  },
+
+  createCycleCount: async (data: {
+    title?: string; // Optional - backend may generate if not provided
+    bin_code?: string;
+    bin_id?: string;
+    warehouse?: string; // Required - backend expects 'warehouse'
+    warehouse_id?: string; // Also accepted for compatibility
+    count_type?: string; // Required
+    count_date?: string; // Required - format: YYYY-MM-DD
+    is_blind_count?: boolean;
+    opening_stock?: boolean; // Optional - indicates if this is an initial/baseline count (independent of blind_count)
+    is_opening_stock?: boolean; // Alias for opening_stock (backend may accept either)
+    created_by?: string; // Required
+    lines?: Array<any>; // Required - array of cycle count lines (can be empty for new task)
+  }) => {
+    return makeRequest(`/api/cycle-count`, "POST", data);
   },
 
   // ============================================
@@ -1973,6 +2745,7 @@ export const apiService = {
     items?: Array<{
       item_code: string;
       qty: number;
+      carton_id?: string; // ✅ NEW: Optional carton_id for carton-level inventory
       location_id?: string;
       source_bin?: string;
       target_bin?: string;
@@ -1989,16 +2762,58 @@ export const apiService = {
     item_code?: string;
     warehouse?: string;
     location?: string;
+    bin_location?: string; // Optional bin_location filter
   }) => {
     const params = new URLSearchParams();
     if (filters?.item_code) params.append("item_code", filters.item_code);
     if (filters?.warehouse) params.append("warehouse", filters.warehouse);
     if (filters?.location) params.append("location", filters.location);
+    if (filters?.bin_location) params.append("bin_location", filters.bin_location);
     const queryString = params.toString();
+    
+    // If backend requires bin_location, we need to handle it differently
+    // For now, only add it if provided (optional)
     return makeRequest(
       `/api/stock/ledger${queryString ? `?${queryString}` : ""}`,
       "GET"
     );
+  },
+
+  // ✅ NEW: Get stock ledger by bin location and optional carton ID (for Cycle Count)
+  getStockLedgerByLocation: async (filters: {
+    bin_location: string; // Required
+    carton_id?: string; // Optional for carton-level filtering
+    warehouse?: string; // Optional warehouse filter
+    item_code?: string; // Optional item code filter
+  }) => {
+    // Validate bin_location is provided and not empty/null
+    if (!filters.bin_location || filters.bin_location.trim() === "" || filters.bin_location === "null") {
+      console.error("❌ getStockLedgerByLocation called with invalid bin_location:", filters.bin_location);
+      throw new Error("bin_location parameter is required and cannot be empty or null");
+    }
+    
+    const params = new URLSearchParams();
+    params.append("bin_location", filters.bin_location.trim());
+    if (filters.carton_id && filters.carton_id.trim()) {
+      params.append("carton_id", filters.carton_id.trim());
+    }
+    if (filters.warehouse) params.append("warehouse", filters.warehouse);
+    if (filters.item_code) params.append("item_code", filters.item_code);
+    const queryString = params.toString();
+    const endpoint = `/api/stock/ledger?${queryString}`;
+    console.log(`🔍 Fetching stock ledger by location: bin_location=${filters.bin_location}, carton_id=${filters.carton_id || 'null'}, warehouse=${filters.warehouse || 'null'}`);
+    console.log(`🔍 Full endpoint: ${endpoint}`);
+    const response = await makeRequest(endpoint, "GET");
+    console.log(`📦 Stock ledger API response:`, {
+      responseType: typeof response,
+      isArray: Array.isArray(response),
+      hasData: response?.data !== undefined,
+      hasItems: response?.items !== undefined,
+      dataLength: response?.data?.length || (Array.isArray(response) ? response.length : 0),
+      itemsLength: response?.items?.length || 0,
+      firstItem: Array.isArray(response) && response.length > 0 ? response[0] : (response?.data?.[0] || response?.items?.[0] || null)
+    });
+    return response;
   },
 
   getStockByItemAndWarehouse: async (

@@ -276,6 +276,24 @@ export const CREATE_MATERIAL_REQUEST_CACHE_TABLE = `
   );
 `;
 
+// Material Request Picking Sessions Table (for draft/resume functionality)
+export const CREATE_MATERIAL_REQUEST_PICKING_SESSIONS_TABLE = `
+  CREATE TABLE IF NOT EXISTS material_request_picking_sessions (
+    session_id TEXT PRIMARY KEY,
+    material_request_title TEXT,
+    tc_id TEXT,
+    bin_location TEXT,
+    carton_id TEXT,
+    store TEXT,
+    status TEXT DEFAULT 'Draft',
+    started_by TEXT,
+    started_at TEXT,
+    updated_at TEXT,
+    synced INTEGER DEFAULT 0,
+    FOREIGN KEY (material_request_title) REFERENCES material_request_cache(title)
+  );
+`;
+
 // Cycle Count Cache Table
 export const CREATE_CYCLE_COUNT_CACHE_TABLE = `
   CREATE TABLE IF NOT EXISTS cycle_count_cache (
@@ -319,6 +337,7 @@ export const CREATE_CYCLE_COUNT_LINES_TABLE = `
     session_id TEXT,
     item_code TEXT,
     barcode TEXT,
+    carton_id TEXT,
     uom TEXT,
     expected_qty REAL,
     counted_qty REAL,
@@ -427,4 +446,5 @@ export const ALL_MIGRATIONS = [
   CREATE_ITEM_BARCODE_MAP_TABLE,
   CREATE_STOCK_LEDGER_CACHE_TABLE,
   CREATE_STOCK_TRANSACTION_CACHE_TABLE,
+  CREATE_MATERIAL_REQUEST_PICKING_SESSIONS_TABLE,
 ];

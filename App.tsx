@@ -4,6 +4,7 @@ import { NavigationContainer, useNavigation } from "@react-navigation/native";
 import * as NavigationBar from "expo-navigation-bar";
 import { createStackNavigator } from "@react-navigation/stack";
 import {
+  View,
   TouchableOpacity,
   Text,
   StyleSheet,
@@ -40,7 +41,11 @@ import StockDetailScreen from "./src/screens/StockDetailScreen";
 import StockTransactionHistoryScreen from "./src/screens/StockTransactionHistoryScreen";
 import MaterialRequestListScreen from "./src/screens/MaterialRequestListScreen";
 import MaterialRequestDetailScreen from "./src/screens/MaterialRequestDetailScreen";
+import MaterialRequestScanLocationScreen from "./src/screens/MaterialRequestScanLocationScreen";
 import MaterialRequestPackingScreen from "./src/screens/MaterialRequestPackingScreen";
+import PickingScanBinScreen from "./src/screens/PickingScanBinScreen";
+import PickingScanCartonScreen from "./src/screens/PickingScanCartonScreen";
+import PickingScanItemsScreen from "./src/screens/PickingScanItemsScreen";
 import CycleCountListScreen from "./src/screens/CycleCountListScreen";
 import CycleCountDetailScreen from "./src/screens/CycleCountDetailScreen";
 import CycleCountCountingScreen from "./src/screens/CycleCountCountingScreen";
@@ -54,8 +59,30 @@ const Stack = createStackNavigator();
 
 // Header Sync Button Component (must be inside AppProvider to access context)
 const SyncHeaderButton = () => {
-  const { refreshPendingEvents } = useApp();
+  const { refreshPendingEvents, pendingEventsCount } = useApp();
   const [syncing, setSyncing] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean | null>(null); // null = checking
+
+  // Check network status periodically
+  useEffect(() => {
+    const checkNetworkStatus = async () => {
+      try {
+        const { isDeviceOnline } = await import("./src/utils/network-check");
+        const online = await isDeviceOnline();
+        setIsOnline(online);
+      } catch (error) {
+        setIsOnline(false);
+      }
+    };
+
+    // Check immediately
+    checkNetworkStatus();
+
+    // Check every 30 seconds
+    const interval = setInterval(checkNetworkStatus, 30000);
+
+    return () => clearInterval(interval);
+  }, []);
 
   const handleSync = async () => {
     if (syncing) {
@@ -64,6 +91,15 @@ const SyncHeaderButton = () => {
 
     setSyncing(true);
     try {
+      // Update online status before sync
+      try {
+        const { isDeviceOnline } = await import("./src/utils/network-check");
+        const online = await isDeviceOnline();
+        setIsOnline(online);
+      } catch (error) {
+        setIsOnline(false);
+      }
+
       // First sync master data from desktop (includes all master data: items, ASNs, bins, stock ledger, etc.)
       try {
         const masterResult = await syncMasterDataFromDesktop();
@@ -116,6 +152,21 @@ const SyncHeaderButton = () => {
     }
   };
 
+  // Determine status indicator color
+  const getStatusColor = () => {
+    if (syncing) return "#FFA500"; // Orange/Yellow when syncing
+    if (isOnline === null) return "#757575"; // Gray when checking
+    if (isOnline) return pendingEventsCount > 0 ? "#FFA500" : "#4CAF50"; // Green if online and no pending, Orange if pending
+    return "#F44336"; // Red if offline
+  };
+
+  const getStatusLabel = () => {
+    if (syncing) return "Syncing";
+    if (isOnline === null) return "Checking";
+    if (isOnline) return "Online";
+    return "Offline";
+  };
+
   return (
     <TouchableOpacity
       style={[
@@ -127,19 +178,39 @@ const SyncHeaderButton = () => {
       disabled={syncing}
     >
       {syncing ? (
-        <>
+        <View style={syncButtonStyles.syncContent}>
           <ActivityIndicator
             size="small"
             color="#fff"
             style={{ marginRight: 6 }}
           />
           <Text style={syncButtonStyles.text}>Syncing...</Text>
-        </>
+        </View>
       ) : (
-        <>
-          <Text style={syncButtonStyles.icon}>🔄</Text>
-          <Text style={syncButtonStyles.text}>Sync</Text>
-        </>
+        <View style={syncButtonStyles.syncContent}>
+          {/* Status Indicator with Label */}
+          <View style={syncButtonStyles.statusRow}>
+            <View
+              style={[
+                syncButtonStyles.statusDot,
+                { backgroundColor: getStatusColor() },
+              ]}
+            />
+            <Text style={syncButtonStyles.statusLabel}>{getStatusLabel()}</Text>
+            {pendingEventsCount > 0 && (
+              <View style={syncButtonStyles.badge}>
+                <Text style={syncButtonStyles.badgeText}>
+                  {pendingEventsCount > 99 ? "99+" : pendingEventsCount}
+                </Text>
+              </View>
+            )}
+          </View>
+          {/* Sync Icon and Text */}
+          <View style={syncButtonStyles.syncRow}>
+            <Text style={syncButtonStyles.icon}>🔄</Text>
+            <Text style={syncButtonStyles.text}>Sync</Text>
+          </View>
+        </View>
       )}
     </TouchableOpacity>
   );
@@ -149,23 +220,77 @@ const syncButtonStyles = StyleSheet.create({
   button: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    backgroundColor: "rgba(0, 0, 0, 0.25)",
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
+    paddingVertical: 8,
+    borderRadius: 8,
     marginRight: 10,
-    minWidth: 80,
+    minWidth: 90,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.2)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+    elevation: 2,
   },
   buttonDisabled: {
     opacity: 0.6,
   },
+  syncContent: {
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 4,
+    position: "relative",
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 4,
+  },
+  statusLabel: {
+    color: "#fff",
+    fontSize: 10,
+    fontWeight: "500",
+  },
+  badge: {
+    position: "absolute",
+    top: -6,
+    right: -12,
+    backgroundColor: "#F44336",
+    borderRadius: 8,
+    minWidth: 16,
+    height: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 3,
+    borderWidth: 1.5,
+    borderColor: "#fff",
+  },
+  badgeText: {
+    color: "#fff",
+    fontSize: 9,
+    fontWeight: "bold",
+  },
+  syncRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+  },
   icon: {
-    fontSize: 16,
+    fontSize: 14,
     marginRight: 4,
   },
   text: {
     color: "#fff",
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: "600",
   },
 });
@@ -299,8 +424,24 @@ export default function App() {
             component={MaterialRequestDetailScreen}
           />
           <Stack.Screen
+            name="MaterialRequestScanLocation"
+            component={MaterialRequestScanLocationScreen}
+          />
+          <Stack.Screen
             name="MaterialRequestPacking"
             component={MaterialRequestPackingScreen}
+          />
+          <Stack.Screen
+            name="PickingScanBin"
+            component={PickingScanBinScreen}
+          />
+          <Stack.Screen
+            name="PickingScanCarton"
+            component={PickingScanCartonScreen}
+          />
+          <Stack.Screen
+            name="PickingScanItems"
+            component={PickingScanItemsScreen}
           />
           <Stack.Screen
             name="CycleCountList"

@@ -50,11 +50,11 @@ export default function CycleCountDraftsScreen() {
         ORDER BY started_at DESC`
       );
 
-      // Get item count for each session
+      // Get item count for each session (only count scanned items with counted_qty > 0)
       const sessionsWithCounts = await Promise.all(
         sessions.map(async (session) => {
           const countResult = await db.getFirstAsync<{ count: number }>(
-            "SELECT COUNT(*) as count FROM cycle_count_lines WHERE session_id = ?",
+            "SELECT COUNT(*) as count FROM cycle_count_lines WHERE session_id = ? AND counted_qty > 0",
             [session.session_id]
           );
           return {

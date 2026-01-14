@@ -6,8 +6,9 @@ import { getDatabase } from "../database/database";
 /**
  * Resolve item_code from barcode or item code
  * Accepts both barcode (e.g., 100000000001) and item code (e.g., ITEM-0001)
- * Always checks backend server first (if available), then caches in local database
- * Falls back to local database if backend is unavailable
+ * Priority 1: Checks local database first (item_master, item_barcode_map)
+ * Priority 2: If not found locally, checks backend server and caches result
+ * Falls back gracefully if backend is unavailable
  */
 export const resolveItemFromBarcode = async (
   barcode: string
@@ -16,8 +17,72 @@ export const resolveItemFromBarcode = async (
   const input = barcode.trim().toUpperCase();
   const originalInput = barcode.trim(); // Keep original case for backend lookup
 
-  // Priority 1: Always check backend server first (if available) to get latest data
-  // ✅ REMOVED: Demo mode check - always use backend if API URL is configured
+  // Priority 1: Check local database first (faster, works offline)
+  try {
+    const db = await getDatabase();
+
+    // First, try item_barcode_map table (most specific)
+    let barcodeMap = await db.getFirstAsync<{
+      item_code: string;
+      barcode: string;
+      uom: string;
+      pack_size: number;
+    }>(
+      "SELECT item_code, barcode, uom, pack_size FROM item_barcode_map WHERE barcode = ? OR UPPER(barcode) = ?",
+      [originalInput, input]
+    );
+
+    if (barcodeMap) {
+      console.log(
+        `✅ Item found in local item_barcode_map: item_code="${barcodeMap.item_code}", barcode="${barcodeMap.barcode}"`
+      );
+      // Get item details from item_master if available
+      const itemMaster = await db.getFirstAsync<ItemMaster>(
+        "SELECT item_code, barcode, item_name FROM item_master WHERE item_code = ?",
+        [barcodeMap.item_code]
+      );
+      if (itemMaster) {
+        return itemMaster;
+      }
+      // Return basic info from barcode_map
+      return {
+        item_code: barcodeMap.item_code,
+        barcode: barcodeMap.barcode,
+        item_name: null,
+      };
+    }
+
+    // Try to find by barcode in item_master (case-insensitive)
+    let item = await db.getFirstAsync<ItemMaster>(
+      "SELECT item_code, barcode, item_name FROM item_master WHERE UPPER(barcode) = ? OR barcode = ?",
+      [input, originalInput]
+    );
+
+    if (item) {
+      console.log(
+        `✅ Item found in local database by barcode: item_code="${item.item_code}"`
+      );
+      return item;
+    }
+
+    // If not found by barcode, try to find by item code (case-insensitive)
+    item = await db.getFirstAsync<ItemMaster>(
+      "SELECT item_code, barcode, item_name FROM item_master WHERE UPPER(item_code) = ? OR item_code = ?",
+      [input, originalInput]
+    );
+
+    if (item) {
+      console.log(
+        `✅ Item found in local database by item_code: item_code="${item.item_code}"`
+      );
+      return item;
+    }
+  } catch (error: any) {
+    // If database lookup fails, log error and continue to backend lookup
+    console.warn("⚠️ Database lookup failed:", error.message);
+  }
+
+  // Priority 2: If not found locally, check backend server (if available)
   if (settings.api_url) {
     try {
       console.log(`🔍 Fetching from server for: ${originalInput}`);
@@ -47,12 +112,13 @@ export const resolveItemFromBarcode = async (
         throw error;
       });
 
-      // If response is null, it means network error occurred - fallback to local
+      // If response is null, it means network error occurred - item not found
       if (response === null) {
         console.log(
-          `ℹ️ Backend unavailable, falling back to local database for: ${originalInput}`
+          `ℹ️ Backend unavailable, item not found: ${originalInput}`
         );
-        // Continue to local database lookup below
+        // Return null - item not found
+        return null;
       } else {
         // Handle different response formats
         let items: any[] = [];
@@ -171,6 +237,8 @@ export const resolveItemFromBarcode = async (
           };
         } else {
           console.log(`❌ Item not found in backend: ${originalInput}`);
+          // Item not found in backend - return null
+          return null;
         }
       }
     } catch (error: any) {
@@ -183,9 +251,9 @@ export const resolveItemFromBarcode = async (
         error?.message?.includes("request failed");
 
       if (isNetworkError) {
-        // Network errors are expected - log as info, not warning/error
+        // Network errors are expected - log as info
         console.log(
-          `ℹ️ Network unavailable for ${originalInput} (using local database): ${
+          `ℹ️ Network unavailable for ${originalInput}: ${
             error.message || error.name || "Network request failed"
           }`
         );
@@ -196,45 +264,12 @@ export const resolveItemFromBarcode = async (
           error.message
         );
       }
-      // Continue to local database fallback
+      // Backend unavailable or error - item not found
+      return null;
     }
   }
 
-  // Priority 2: Fallback to local database if backend unavailable or item not found in backend
-  try {
-    const db = await getDatabase();
-
-    // Try to find by barcode (case-insensitive)
-    let item = await db.getFirstAsync<ItemMaster>(
-      "SELECT item_code, barcode, item_name FROM item_master WHERE UPPER(barcode) = ? OR barcode = ?",
-      [input, originalInput]
-    );
-
-    if (item) {
-      console.log(
-        `✅ Item found in local database by barcode: ${item.item_code}`
-      );
-      return item;
-    }
-
-    // If not found by barcode, try to find by item code (case-insensitive)
-    item = await db.getFirstAsync<ItemMaster>(
-      "SELECT item_code, barcode, item_name FROM item_master WHERE UPPER(item_code) = ? OR item_code = ?",
-      [input, originalInput]
-    );
-
-    if (item) {
-      console.log(
-        `✅ Item found in local database by item_code: ${item.item_code}`
-      );
-      return item;
-    }
-  } catch (error: any) {
-    // If database lookup fails, log error
-    console.warn("⚠️ Database lookup failed:", error.message);
-  }
-
-  // Item not found in backend or local database
+  // Item not found in local database or backend
   console.log(`❌ Item not found: ${originalInput}`);
   return null;
 };

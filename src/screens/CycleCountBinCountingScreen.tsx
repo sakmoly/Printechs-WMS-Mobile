@@ -12,9 +12,14 @@ import {
   KeyboardAvoidingView,
   Platform,
   Vibration,
+  Modal,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useNavigation, useRoute, useFocusEffect } from "@react-navigation/native";
+import {
+  useNavigation,
+  useRoute,
+  useFocusEffect,
+} from "@react-navigation/native";
 import { BarcodeScanner } from "../components/BarcodeScanner";
 import { apiService } from "../services/api.service";
 import { getSettings } from "../services/settings.service";
@@ -22,12 +27,14 @@ import { getDatabase } from "../database/database";
 import { generateUUID } from "../utils/uuid";
 import { syncCycleCountSession } from "../services/cycle-count-sync.service";
 import { isDeviceOnline } from "../utils/network-check";
+import { resolveItemFromBarcode } from "../services/item-master.service";
 
 interface CountLine {
   line_id: string;
   item_code: string;
   item_name?: string;
   barcode: string;
+  carton_id?: string | null; // ✅ NEW: Optional carton_id for carton-level inventory
   uom: string;
   expected_qty: number | null;
   counted_qty: number;
@@ -35,13 +42,33 @@ interface CountLine {
   is_unexpected_item: boolean;
   reason_code?: string;
   notes?: string;
+  created_at?: string; // Timestamp when line was created
+  updated_at?: string; // Timestamp when line was last updated
 }
 
 export default function CycleCountBinCountingScreen() {
   const navigation = useNavigation();
   const route = useRoute();
-  const { sessionId, binCode, binInfo, isBlindCount } = (route.params as any) || {};
-  
+  const routeParams = (route.params as any) || {};
+  const {
+    sessionId,
+    binCode,
+    binInfo,
+    isBlindCount,
+    cartonId: initialCartonId,
+  } = routeParams;
+
+  // ✅ DEBUG: Log route params to verify carton ID is passed
+  useEffect(() => {
+    console.log(`📦 CycleCountBinCountingScreen: Route params received:`, {
+      sessionId,
+      binCode,
+      cartonId: initialCartonId,
+      isBlindCount,
+      allParams: routeParams,
+    });
+  }, [route.params]);
+
   const [showScanner, setShowScanner] = useState(false);
   const [countLines, setCountLines] = useState<CountLine[]>([]);
   const [loading, setLoading] = useState(false);
@@ -50,44 +77,185 @@ export default function CycleCountBinCountingScreen() {
   const [editQty, setEditQty] = useState("");
   const [manualBarcode, setManualBarcode] = useState("");
   const [taskTitle, setTaskTitle] = useState<string | null>(null);
+  const [cartonId, setCartonId] = useState<string | null>(null); // ✅ NEW: Carton ID will be scanned in this screen
+  const [cartonIdInput, setCartonIdInput] = useState(""); // ✅ NEW: Input field for carton ID
+  const [showCartonScanner, setShowCartonScanner] = useState(false); // ✅ NEW: Scanner modal for carton ID
+  const cartonIdInputRef = useRef<TextInput>(null); // ✅ NEW: Ref for carton ID input
+  const skipCartonRestoreRef = useRef<boolean>(false); // ✅ NEW: Flag to skip carton ID restoration when user explicitly clears it
+
+  // ✅ IMPORTANT: Update cartonId when route params change (e.g., when screen is focused)
+  useEffect(() => {
+    const currentCartonId = routeParams?.cartonId;
+    console.log(`📦 useEffect: Checking cartonId from route params:`, {
+      routeParamsCartonId: currentCartonId,
+      currentStateCartonId: cartonId,
+      routeParamsFull: routeParams,
+    });
+    if (currentCartonId !== undefined && currentCartonId !== cartonId) {
+      console.log(
+        `📦 Updating cartonId from route params: ${currentCartonId} (was: ${cartonId})`
+      );
+      setCartonId(currentCartonId || null);
+    } else if (currentCartonId === undefined || currentCartonId === null) {
+      console.log(
+        `📦 Carton ID is null/undefined in route params - keeping current state: ${cartonId}`
+      );
+    }
+  }, [route.params]);
+
+  // ✅ DEBUG: Log carton ID state changes and reload items when cartonId changes
+  useEffect(() => {
+    console.log(
+      `📦 CycleCountBinCountingScreen: Carton ID state changed to:`,
+      cartonId
+    );
+    // Reload items when cartonId changes (e.g., when user changes carton)
+    if (sessionId) {
+      console.log(`🔄 Reloading items for cartonId: ${cartonId || "null"}`);
+      loadSessionWithCartonId(cartonId);
+    }
+  }, [cartonId, sessionId]);
+
   const lastScanTime = useRef<number>(0);
   const barcodeInputRef = useRef<TextInput>(null);
   const SCAN_DEBOUNCE_MS = 300;
 
   useFocusEffect(
     useCallback(() => {
-      console.log(`🔄 useFocusEffect: Screen focused, sessionId: ${sessionId}`);
-      // Load session first to get current state
-      loadSession().then(() => {
-        // Then load expected items (which will check database and skip if needed)
-        loadExpectedItems();
-      });
-      // Auto-focus barcode input when screen gains focus
+      console.log(
+        `🔄 useFocusEffect: Screen focused, sessionId: ${sessionId}, current cartonId: ${
+          cartonId || "null"
+        }`
+      );
+
+      // ✅ FIX: Async function inside callback (useFocusEffect doesn't support async callbacks)
+      const loadData = async () => {
+        // ✅ FIX: Restore cartonId from database if not set in route params
+        // This ensures cartonId is restored when returning to the screen after saving draft
+        // BUT skip restoration if user explicitly cleared it (clicked "Change Carton")
+        let restoredCartonId = cartonId;
+        if (!cartonId && sessionId && !skipCartonRestoreRef.current) {
+          try {
+            const db = await getDatabase();
+            const mostRecentLine = await db.getFirstAsync<{
+              carton_id: string | null;
+            }>(
+              "SELECT carton_id FROM cycle_count_lines WHERE session_id = ? AND carton_id IS NOT NULL AND carton_id != '' ORDER BY updated_at DESC LIMIT 1",
+              [sessionId]
+            );
+            if (mostRecentLine?.carton_id) {
+              console.log(
+                `📦 Restored cartonId from database: ${mostRecentLine.carton_id}`
+              );
+              restoredCartonId = mostRecentLine.carton_id;
+              setCartonId(mostRecentLine.carton_id);
+              // Wait a bit for state to update
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+          } catch (error: any) {
+            console.warn(
+              `⚠️ Could not restore cartonId from database:`,
+              error.message
+            );
+          }
+        } else if (skipCartonRestoreRef.current) {
+          console.log(
+            `📦 Skipping carton ID restoration - user explicitly cleared it`
+          );
+          // Reset the flag after skipping restoration
+          skipCartonRestoreRef.current = false;
+        }
+
+        // ✅ NEW: Load taskTitle (server_session_id) from session FIRST
+        // This is needed for loadExpectedItems to check backend task lines
+        let loadedTaskTitle: string | null = null;
+        if (sessionId) {
+          try {
+            const db = await getDatabase();
+            const session = await db.getFirstAsync<{
+              server_session_id: string | null;
+            }>(
+              "SELECT server_session_id FROM cycle_count_sessions WHERE session_id = ?",
+              [sessionId]
+            );
+            if (session?.server_session_id) {
+              console.log(
+                `📋 Loaded taskTitle from session: ${session.server_session_id}`
+              );
+              loadedTaskTitle = session.server_session_id;
+              setTaskTitle(session.server_session_id);
+            } else {
+              console.log(
+                `ℹ️ No taskTitle (server_session_id) found in session ${sessionId}`
+              );
+              setTaskTitle(null);
+            }
+          } catch (error: any) {
+            console.warn(
+              `⚠️ Could not load taskTitle from session:`,
+              error.message
+            );
+            setTaskTitle(null);
+          }
+        }
+
+        // Load session with the correct cartonId (will filter by carton_id if set)
+        // Use restoredCartonId if cartonId state hasn't updated yet
+        const cartonIdToUse = cartonId || restoredCartonId;
+        await loadSessionWithCartonId(cartonIdToUse);
+
+        // ✅ NEW: Start the task if carton ID is already set (restored from previous session)
+        // This ensures the task is started before scanning items, even if user returns to this screen
+        // Only starts if task is in "Draft" status - if already "In Progress", skips starting
+        if (cartonIdToUse && loadedTaskTitle) {
+          // Use the helper function to ensure task is started (only if in Draft status)
+          await ensureTaskStarted(loadedTaskTitle);
+        }
+
+        // Then load expected items (which will use taskTitle to check backend task lines)
+        // Pass taskTitle directly to loadExpectedItems to ensure it has the value
+        await loadExpectedItems(loadedTaskTitle);
+      };
+
+      // Call the async function
+      loadData();
+      // ✅ NEW: Auto-focus carton ID input if not set, otherwise focus item barcode input
       setTimeout(() => {
-        barcodeInputRef.current?.focus();
+        if (!cartonId) {
+          cartonIdInputRef.current?.focus();
+        } else {
+          barcodeInputRef.current?.focus();
+        }
       }, 100);
 
       // Sync when screen loses focus (user navigates away)
       return () => {
         if (sessionId) {
-          console.log(`🔄 Screen losing focus, syncing session ${sessionId}...`);
+          console.log(
+            `🔄 Screen losing focus, syncing session ${sessionId}...`
+          );
           // Use a timeout to ensure sync happens after navigation starts
           setTimeout(async () => {
             try {
               const success = await syncCycleCountSession(sessionId);
               if (success) {
-                console.log(`✅ Successfully synced session ${sessionId} on navigation`);
+                console.log(
+                  `✅ Successfully synced session ${sessionId} on navigation`
+                );
               } else {
                 console.warn(`⚠️ Sync returned false for session ${sessionId}`);
               }
             } catch (error: any) {
-              console.error(`❌ Failed to sync session ${sessionId} on navigation:`, error);
+              console.error(
+                `❌ Failed to sync session ${sessionId} on navigation:`,
+                error
+              );
               console.error(`❌ Error details:`, error.message, error.stack);
             }
           }, 100); // Small delay to ensure navigation doesn't block sync
         }
       };
-    }, [sessionId])
+    }, [sessionId, cartonId]) // ✅ FIX: Include cartonId in dependencies so it reloads when carton changes
   );
 
   // Auto-focus on mount
@@ -98,101 +266,661 @@ export default function CycleCountBinCountingScreen() {
     return () => clearTimeout(timer);
   }, []);
 
-  const loadSession = async () => {
-    if (!sessionId) {
-      console.log("⚠️ loadSession: sessionId is missing");
+  // ✅ NEW: Load session with specific cartonId (can be passed as parameter)
+  // ✅ Helper function to start task only if it's in "Draft" status
+  const ensureTaskStarted = async (taskTitleToStart: string) => {
+    if (!taskTitleToStart) {
+      console.log(
+        `ℹ️ No task title provided - task will be started when backend task is created`
+      );
       return;
     }
-    
+
     try {
-      console.log(`🔄 loadSession: Loading count lines for session ${sessionId}`);
-      const db = await getDatabase();
-      const lines = await db.getAllAsync<CountLine>(
-        "SELECT * FROM cycle_count_lines WHERE session_id = ? ORDER BY updated_at DESC, created_at DESC",
-        [sessionId]
-      );
-      console.log(`✅ loadSession: Loaded ${lines.length} count lines`);
-      console.log(`📊 loadSession: Lines summary:`, lines.map(l => ({
-        item_code: l.item_code,
-        counted_qty: l.counted_qty,
-        expected_qty: l.expected_qty
-      })));
-      setCountLines(lines);
-    } catch (error: any) {
-      console.error("❌ loadSession: Error loading session:", error);
-    }
-  };
-
-  const loadExpectedItems = async () => {
-    if (!binCode || isBlindCount || !sessionId) {
-      console.log(`⏭️ loadExpectedItems: Skipping (binCode: ${binCode}, isBlindCount: ${isBlindCount}, sessionId: ${sessionId})`);
-      return;
-    }
-    
-    console.log(`🔄 loadExpectedItems: Starting for bin ${binCode}, session ${sessionId}`);
-    setLoading(true);
-    try {
-      const db = await getDatabase();
-      
-      // CRITICAL: Check database directly, not state (state might be stale)
-      const existingLinesInDb = await db.getAllAsync<{ item_code: string; counted_qty: number }>(
-        "SELECT item_code, counted_qty FROM cycle_count_lines WHERE session_id = ?",
-        [sessionId]
-      );
-      
-      console.log(`📋 loadExpectedItems: Found ${existingLinesInDb.length} existing lines in database`);
-      console.log(`📋 loadExpectedItems: Existing lines:`, existingLinesInDb.map(l => ({
-        item_code: l.item_code,
-        counted_qty: l.counted_qty
-      })));
-      
-      // If session already has lines (especially with counted_qty > 0), don't load expected items
-      // This prevents overwriting scanned data
-      if (existingLinesInDb.length > 0) {
-        const hasScannedItems = existingLinesInDb.some(l => l.counted_qty > 0);
-        if (hasScannedItems) {
-          console.log(`✅ loadExpectedItems: Session has scanned items, skipping expected items load to preserve data`);
-          return;
-        }
-        console.log(`⚠️ loadExpectedItems: Session has lines but no scanned items, will only add missing expected items`);
-      }
-      
-      // Load expected items from stock ledger for this bin
-      let expectedItems = await db.getAllAsync<{
-        item_code: string;
-        qty: number;
-      }>(
-        "SELECT item_code, qty FROM stock_ledger_cache WHERE bin_location = ?",
-        [binCode]
-      );
-
-      console.log(`📦 loadExpectedItems: Found ${expectedItems.length} expected items in stock ledger`);
-
-      // If no items found, log warning (data should come from backend sync)
-      if (expectedItems.length === 0) {
-        console.warn(
-          `⚠️ loadExpectedItems: No expected items found for bin ${binCode}. Please sync stock ledger data from backend.`
+      const online = await isDeviceOnline();
+      if (!online) {
+        console.log(
+          `ℹ️ Device is offline - task ${taskTitleToStart} will be started when synced`
         );
         return;
       }
 
+      // ✅ Check task status first before attempting to start
+      try {
+        const taskResponse = await apiService.getCycleCount(taskTitleToStart);
+        const taskStatus =
+          taskResponse?.status ||
+          taskResponse?.data?.status ||
+          taskResponse?.task?.status ||
+          null;
+
+        console.log(
+          `📋 Task ${taskTitleToStart} current status: ${
+            taskStatus || "unknown"
+          }`
+        );
+
+        // ✅ Only start if task is in "Draft" status
+        // If already "In Progress", "Started", "Submitted", etc., skip starting
+        if (
+          taskStatus &&
+          (taskStatus.toLowerCase() === "draft" ||
+            taskStatus.toLowerCase() === "pending")
+        ) {
+          console.log(
+            `📤 Starting cycle count task ${taskTitleToStart} (status: ${taskStatus})...`
+          );
+          const settings = await getSettings();
+          await apiService.startCycleCount(taskTitleToStart, {
+            started_by: settings.user_id || settings.user_code || "USER-AUTO",
+          });
+          console.log(
+            `✅ Successfully started task ${taskTitleToStart} - status changed to Started/In Progress`
+          );
+        } else if (taskStatus) {
+          // Task is already started or in progress - no action needed
+          console.log(
+            `ℹ️ Task ${taskTitleToStart} is already in "${taskStatus}" status - no need to start again`
+          );
+        } else {
+          // Status not found in response - try to start anyway (might be a new task)
+          console.log(
+            `⚠️ Could not determine task status - attempting to start anyway...`
+          );
+          const settings = await getSettings();
+          await apiService.startCycleCount(taskTitleToStart, {
+            started_by: settings.user_id || settings.user_code || "USER-AUTO",
+          });
+          console.log(`✅ Successfully started task ${taskTitleToStart}`);
+        }
+      } catch (getStatusError: any) {
+        // If getCycleCount fails, the task might not exist yet - try to start anyway
+        // This will fail gracefully if task doesn't exist
+        console.warn(
+          `⚠️ Could not check task status: ${getStatusError.message} - attempting to start anyway...`
+        );
+        try {
+          const settings = await getSettings();
+          await apiService.startCycleCount(taskTitleToStart, {
+            started_by: settings.user_id || settings.user_code || "USER-AUTO",
+          });
+          console.log(`✅ Successfully started task ${taskTitleToStart}`);
+        } catch (startError: any) {
+          // Handle "already started" error gracefully
+          const errorMessage =
+            startError.message || startError.toString() || "";
+          if (
+            errorMessage.includes("INVALID_STATUS") ||
+            errorMessage.includes("Cannot start") ||
+            errorMessage.includes("status: In Progress") ||
+            errorMessage.includes("status: Started")
+          ) {
+            console.log(
+              `ℹ️ Task ${taskTitleToStart} is already started/in progress - no action needed`
+            );
+          } else {
+            throw startError; // Re-throw other errors
+          }
+        }
+      }
+    } catch (error: any) {
+      const errorMessage = error.message || error.toString() || "";
+      if (
+        errorMessage.includes("INVALID_STATUS") ||
+        errorMessage.includes("Cannot start") ||
+        errorMessage.includes("status: In Progress") ||
+        errorMessage.includes("status: Started")
+      ) {
+        console.log(
+          `ℹ️ Task ${taskTitleToStart} is already started/in progress - no action needed`
+        );
+      } else {
+        console.warn(
+          `⚠️ Failed to start task ${taskTitleToStart}:`,
+          error.message
+        );
+        console.warn(`⚠️ Task will be started during sync or when submitting`);
+      }
+    }
+  };
+
+  const loadSessionWithCartonId = async (cartonIdToFilter?: string | null) => {
+    if (!sessionId) {
+      console.log("⚠️ loadSessionWithCartonId: sessionId is missing");
+      return;
+    }
+
+    const effectiveCartonId =
+      cartonIdToFilter !== undefined ? cartonIdToFilter : cartonId;
+
+    try {
+      console.log(
+        `🔄 loadSessionWithCartonId: Loading count lines for session ${sessionId}, carton_id: ${
+          effectiveCartonId || "null"
+        }`
+      );
+      const db = await getDatabase();
+
+      // ✅ FIX: Filter by carton_id if set, to show only items for current carton
+      let lines: CountLine[];
+      if (effectiveCartonId) {
+        // Carton-level counting: only show items for this carton
+        lines = await db.getAllAsync<CountLine>(
+          "SELECT * FROM cycle_count_lines WHERE session_id = ? AND carton_id = ? ORDER BY updated_at DESC, created_at DESC",
+          [sessionId, effectiveCartonId]
+        );
+        console.log(
+          `📦 loadSessionWithCartonId: Filtered by carton_id ${effectiveCartonId}, found ${lines.length} lines`
+        );
+      } else {
+        // Bin-level counting: show all items without carton_id
+        lines = await db.getAllAsync<CountLine>(
+          "SELECT * FROM cycle_count_lines WHERE session_id = ? AND (carton_id IS NULL OR carton_id = '') ORDER BY updated_at DESC, created_at DESC",
+          [sessionId]
+        );
+        console.log(
+          `📦 loadSessionWithCartonId: Bin-level counting, found ${lines.length} lines`
+        );
+      }
+
+      console.log(`✅ loadSession: Loaded ${lines.length} count lines`);
+
+      // ✅ FIX: Show ALL items (both scanned and expected) in the UI
+      // Expected items with counted_qty = 0 should be displayed with their expected_qty
+      // Note: expected_qty is preserved even when carton_id is set (backend stock ledger is bin-level)
+      const allLines = lines
+        // Sort: Most recently scanned/updated items first (by updated_at DESC)
+        .sort((a, b) => {
+          // Sort by updated_at descending (most recent first)
+          const aUpdated = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+          const bUpdated = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+          if (bUpdated !== aUpdated) {
+            return bUpdated - aUpdated; // Most recent first
+          }
+          // If updated_at is the same, sort by created_at descending
+          const aCreated = a.created_at ? new Date(a.created_at).getTime() : 0;
+          const bCreated = b.created_at ? new Date(b.created_at).getTime() : 0;
+          return bCreated - aCreated; // Most recent first
+        });
+
+      const scannedCount = allLines.filter((l) => l.counted_qty > 0).length;
+      const expectedCount = allLines.filter(
+        (l) => l.expected_qty !== null && l.counted_qty === 0
+      ).length;
+
+      console.log(
+        `📊 loadSession: Lines summary - Total: ${allLines.length}, Scanned (counted_qty > 0): ${scannedCount}, Expected (not scanned yet): ${expectedCount}`
+      );
+      console.log(
+        `📊 loadSession: All lines:`,
+        allLines.map((l) => ({
+          item_code: l.item_code,
+          counted_qty: l.counted_qty,
+          expected_qty: l.expected_qty,
+          carton_id: l.carton_id || "null",
+        }))
+      );
+
+      setCountLines(allLines); // Show all items (scanned and expected) in UI
+    } catch (error: any) {
+      console.error(
+        "❌ loadSessionWithCartonId: Error loading session:",
+        error
+      );
+    }
+  };
+
+  // Wrapper function that uses current cartonId state
+  const loadSession = async () => {
+    await loadSessionWithCartonId();
+  };
+
+  const loadExpectedItems = async (taskTitleParam?: string | null) => {
+    // Use provided taskTitle or fall back to state
+    const effectiveTaskTitle =
+      taskTitleParam !== undefined ? taskTitleParam : taskTitle;
+
+    // ✅ NEW: Only load expected items AFTER carton ID is scanned
+    // Items should be filtered by carton_id
+    if (!binCode || isBlindCount || !sessionId || !cartonId) {
+      if (!cartonId) {
+        console.log(
+          `⏭️ loadExpectedItems: Skipping - carton ID not scanned yet. Items will be loaded after carton ID is scanned.`
+        );
+      } else {
+        console.log(
+          `⏭️ loadExpectedItems: Skipping (binCode: ${binCode}, isBlindCount: ${isBlindCount}, sessionId: ${sessionId})`
+        );
+      }
+      return;
+    }
+
+    console.log(
+      `🔄 loadExpectedItems: Loading items for carton ${cartonId} in bin ${binCode}, session ${sessionId}`
+    );
+    setLoading(true);
+    try {
+      const db = await getDatabase();
+
+      // CRITICAL: Check database directly, not state (state might be stale)
+      const existingLinesInDb = await db.getAllAsync<{
+        item_code: string;
+        counted_qty: number;
+      }>(
+        "SELECT item_code, counted_qty FROM cycle_count_lines WHERE session_id = ?",
+        [sessionId]
+      );
+
+      console.log(
+        `📋 loadExpectedItems: Found ${existingLinesInDb.length} existing lines in database`
+      );
+      console.log(
+        `📋 loadExpectedItems: Existing lines:`,
+        existingLinesInDb.map((l) => ({
+          item_code: l.item_code,
+          counted_qty: l.counted_qty,
+        }))
+      );
+
+      // If session already has lines (especially with counted_qty > 0), don't load expected items
+      // This prevents overwriting scanned data
+      if (existingLinesInDb.length > 0) {
+        const hasScannedItems = existingLinesInDb.some(
+          (l) => l.counted_qty > 0
+        );
+        if (hasScannedItems) {
+          console.log(
+            `✅ loadExpectedItems: Session has scanned items, skipping expected items load to preserve data`
+          );
+          return;
+        }
+        console.log(
+          `⚠️ loadExpectedItems: Session has lines but no scanned items, will only add missing expected items`
+        );
+      }
+
+      // ✅ NEW: Priority 1: Try to load expected items from backend task lines first
+      // This allows scanning the same bin/carton again and getting expected items from previous task
+      let expectedItems: Array<{ item_code: string; qty: number }> = [];
+      let loadedFromBackend = false;
+
+      // First, try to load from current task title if available
+      if (effectiveTaskTitle) {
+        try {
+          console.log(
+            `🔍 loadExpectedItems: Fetching task lines from backend for task ${effectiveTaskTitle}...`
+          );
+          const taskResponse = await apiService.getCycleCount(
+            effectiveTaskTitle
+          );
+          const taskData = taskResponse?.data || taskResponse;
+          const taskLines = taskData?.lines || taskData?.items || [];
+
+          if (taskLines && taskLines.length > 0) {
+            console.log(
+              `✅ loadExpectedItems: Found ${taskLines.length} task lines from backend task ${effectiveTaskTitle}`
+            );
+            // ✅ NEW: Filter task lines by carton_id to only show items in this carton
+            const cartonFilteredLines = taskLines.filter((line: any) => {
+              const lineCartonId = (line.carton_id || "").trim();
+              const currentCartonId = (cartonId || "").trim();
+              return (
+                !lineCartonId ||
+                lineCartonId === currentCartonId ||
+                lineCartonId === ""
+              );
+            });
+
+            expectedItems = cartonFilteredLines
+              .filter(
+                (line: any) =>
+                  line.item_code &&
+                  (line.expected_qty || line.expected_qty === 0)
+              )
+              .map((line: any) => ({
+                item_code: line.item_code,
+                qty: line.expected_qty || 0,
+              }));
+            loadedFromBackend = true;
+            console.log(
+              `✅ loadExpectedItems: Loaded ${expectedItems.length} expected items from backend task lines (filtered by carton ${cartonId})`
+            );
+          } else {
+            console.log(
+              `ℹ️ loadExpectedItems: Backend task ${effectiveTaskTitle} has no task lines, will try to find other tasks for this bin`
+            );
+          }
+        } catch (backendError: any) {
+          console.warn(
+            `⚠️ loadExpectedItems: Failed to fetch task lines from backend task ${effectiveTaskTitle}:`,
+            backendError.message
+          );
+          console.log(
+            `ℹ️ loadExpectedItems: Will try to find other tasks for this bin`
+          );
+        }
+      } else {
+        console.log(
+          `ℹ️ loadExpectedItems: No taskTitle available, will search for backend tasks for bin ${binCode}`
+        );
+      }
+
+      // ✅ NEW: If current task has no lines, check for other backend tasks for this bin
+      // This allows loading expected items from a previous task for the same bin
+      if (!loadedFromBackend && binCode) {
+        try {
+          const online = await isDeviceOnline();
+          if (online) {
+            console.log(
+              `🔍 loadExpectedItems: Searching for backend tasks for bin ${binCode}...`
+            );
+            const tasksResponse = await apiService.getCycleCounts({
+              status: "Draft,In Progress,Review,Completed,Submitted",
+            });
+            const tasksArray = Array.isArray(tasksResponse)
+              ? tasksResponse
+              : tasksResponse?.data || tasksResponse?.cycle_counts || [];
+
+            // Normalize bin codes for comparison
+            const normalizeBinCode = (
+              code: string | null | undefined
+            ): string => {
+              if (!code) return "";
+              return String(code)
+                .trim()
+                .toUpperCase()
+                .replace(/\s+/g, "")
+                .replace(/--+/g, "-");
+            };
+
+            const binCodeNormalized = normalizeBinCode(binCode);
+
+            // Find tasks for this bin (can be multiple - use the most recent or active one)
+            const matchingTasks = tasksArray.filter((t: any) => {
+              const taskBinCode = normalizeBinCode(
+                t.bin_code || t.bin_location || t.bin_id
+              );
+              return taskBinCode && taskBinCode === binCodeNormalized;
+            });
+
+            if (matchingTasks.length > 0) {
+              // Sort by updated_on or created_on (most recent first)
+              matchingTasks.sort((a: any, b: any) => {
+                const dateA = new Date(
+                  a.updated_on || a.created_on || 0
+                ).getTime();
+                const dateB = new Date(
+                  b.updated_on || b.created_on || 0
+                ).getTime();
+                return dateB - dateA;
+              });
+
+              // Try each task until we find one with task lines
+              for (const task of matchingTasks) {
+                if (!task.title) continue;
+
+                try {
+                  console.log(
+                    `🔍 loadExpectedItems: Fetching task lines from backend task ${task.title} for bin ${binCode}...`
+                  );
+                  const taskResponse = await apiService.getCycleCount(
+                    task.title
+                  );
+                  const taskData = taskResponse?.data || taskResponse;
+                  const taskLines = taskData?.lines || taskData?.items || [];
+
+                  if (taskLines && taskLines.length > 0) {
+                    console.log(
+                      `✅ loadExpectedItems: Found ${taskLines.length} task lines from previous backend task ${task.title}`
+                    );
+                    expectedItems = taskLines
+                      .filter(
+                        (line: any) =>
+                          line.item_code &&
+                          (line.expected_qty || line.expected_qty === 0)
+                      )
+                      .map((line: any) => ({
+                        item_code: line.item_code,
+                        qty: line.expected_qty || 0,
+                      }));
+                    loadedFromBackend = true;
+
+                    // Save this task title to session for future use
+                    await db.runAsync(
+                      "UPDATE cycle_count_sessions SET server_session_id = ?, updated_at = ? WHERE session_id = ?",
+                      [task.title, new Date().toISOString(), sessionId]
+                    );
+                    setTaskTitle(task.title);
+
+                    console.log(
+                      `✅ loadExpectedItems: Loaded ${expectedItems.length} expected items from previous backend task ${task.title}`
+                    );
+                    break; // Found task lines, stop searching
+                  }
+                } catch (taskError: any) {
+                  console.warn(
+                    `⚠️ loadExpectedItems: Failed to fetch task lines from task ${task.title}:`,
+                    taskError.message
+                  );
+                  continue; // Try next task
+                }
+              }
+
+              if (!loadedFromBackend) {
+                console.log(
+                  `ℹ️ loadExpectedItems: Found ${matchingTasks.length} backend task(s) for bin ${binCode} but none have task lines`
+                );
+              }
+            } else {
+              console.log(
+                `ℹ️ loadExpectedItems: No backend tasks found for bin ${binCode}`
+              );
+            }
+          } else {
+            console.log(
+              `ℹ️ loadExpectedItems: Device is offline, cannot search backend tasks`
+            );
+          }
+        } catch (searchError: any) {
+          console.warn(
+            `⚠️ loadExpectedItems: Failed to search backend tasks for bin ${binCode}:`,
+            searchError.message
+          );
+        }
+      }
+
+      // ✅ Priority 2: Fetch from backend stock ledger API
+      // Note: Skip stock ledger for carton-level counting because:
+      // - Stock ledger is bin-level (tracks items already in the bin)
+      // - New cartons don't have items in stock ledger yet
+      // - Showing bin-level expected items for a new carton is misleading
+      // Only load stock ledger for bin-level counting (no carton_id)
+      if (!loadedFromBackend || expectedItems.length === 0) {
+        if (cartonId) {
+          // Carton-level counting: Skip stock ledger (new carton doesn't have items in stock ledger yet)
+          console.log(
+            `⏭️ loadExpectedItems: Skipping stock ledger for carton ${cartonId} - new cartons don't have items in stock ledger yet`
+          );
+          console.log(
+            `ℹ️ loadExpectedItems: For new cartons, expected items will only come from already scanned items in this session`
+          );
+        } else {
+          // Bin-level counting: Load stock ledger (bin already has items)
+          try {
+            const online = await isDeviceOnline();
+            if (online) {
+              console.log(
+                `📦 loadExpectedItems: Fetching bin-level items from backend stock ledger for bin ${binCode}...`
+              );
+
+              try {
+                // Query bin-level items (backend stock ledger is bin-level)
+                const stockResponse = await apiService.getStockLedgerByLocation(
+                  {
+                    bin_location: binCode,
+                  }
+                );
+
+                const stockItems =
+                  stockResponse?.data ||
+                  stockResponse?.items ||
+                  stockResponse ||
+                  [];
+                console.log(
+                  `📦 loadExpectedItems: Backend Stock Ledger API Response:`,
+                  {
+                    responseType: Array.isArray(stockItems)
+                      ? "array"
+                      : typeof stockItems,
+                    isArray: Array.isArray(stockItems),
+                    itemCount: Array.isArray(stockItems)
+                      ? stockItems.length
+                      : 0,
+                    rawResponse: JSON.stringify(stockResponse).substring(
+                      0,
+                      500
+                    ), // First 500 chars for debugging
+                    firstItem:
+                      Array.isArray(stockItems) && stockItems.length > 0
+                        ? stockItems[0]
+                        : null,
+                  }
+                );
+
+                if (
+                  stockItems &&
+                  Array.isArray(stockItems) &&
+                  stockItems.length > 0
+                ) {
+                  console.log(
+                    `✅ loadExpectedItems: Found ${stockItems.length} items from backend stock ledger for bin ${binCode}`
+                  );
+                  expectedItems = stockItems.map((item: any) => ({
+                    item_code: item.item_code,
+                    qty: item.qty || item.expected_qty || 0,
+                  }));
+                  loadedFromBackend = true;
+                  console.log(
+                    `✅ loadExpectedItems: Processed ${expectedItems.length} expected items:`,
+                    expectedItems.map((i) => `${i.item_code}: ${i.qty}`)
+                  );
+                } else {
+                  console.warn(
+                    `⚠️ loadExpectedItems: Backend returned empty array or invalid format`
+                  );
+                  console.warn(
+                    `⚠️ loadExpectedItems: Raw response:`,
+                    JSON.stringify(stockResponse)
+                  );
+                }
+              } catch (stockError: any) {
+                console.error(
+                  `❌ loadExpectedItems: Failed to fetch from backend stock ledger:`,
+                  stockError.message
+                );
+                console.error(
+                  `❌ loadExpectedItems: Error details:`,
+                  stockError
+                );
+              }
+            } else {
+              console.log(
+                `ℹ️ loadExpectedItems: Device is offline, cannot fetch from backend stock ledger`
+              );
+            }
+          } catch (stockError: any) {
+            console.error(
+              `❌ loadExpectedItems: Error fetching from backend stock ledger:`,
+              stockError.message
+            );
+            console.error(`❌ loadExpectedItems: Error details:`, stockError);
+          }
+        }
+      }
+
+      // ✅ Priority 3: Fallback to stock ledger cache if backend API fails (bin-level only, no carton_id support)
+      // Note: stock_ledger_cache doesn't have carton_id column, so we can only use it for bin-level items
+      // For carton-level counting, we must use backend API which supports carton_id filtering
+      if (!loadedFromBackend || expectedItems.length === 0) {
+        if (cartonId) {
+          // Carton-level counting: stock_ledger_cache doesn't support carton_id, so skip it
+          console.log(
+            `⏭️ loadExpectedItems: Skipping stock_ledger_cache - carton-level counting requires backend API (carton_id: ${cartonId})`
+          );
+          console.log(
+            `ℹ️ loadExpectedItems: For carton-level items, backend stock ledger API must be available with carton_id filter`
+          );
+        } else {
+          // Bin-level counting: use stock_ledger_cache
+          console.log(
+            `📦 loadExpectedItems: Loading expected items from stock ledger cache for bin ${binCode}...`
+          );
+          const stockLedgerItems = await db.getAllAsync<{
+            item_code: string;
+            qty: number;
+          }>(
+            "SELECT item_code, qty FROM stock_ledger_cache WHERE bin_location = ?",
+            [binCode]
+          );
+
+          if (stockLedgerItems && stockLedgerItems.length > 0) {
+            expectedItems = stockLedgerItems.map((item) => ({
+              item_code: item.item_code,
+              qty: item.qty,
+            }));
+            console.log(
+              `✅ loadExpectedItems: Found ${expectedItems.length} expected items in stock ledger cache for bin ${binCode}`
+            );
+          } else {
+            console.warn(
+              `⚠️ loadExpectedItems: No expected items found in stock ledger cache for bin ${binCode}.`
+            );
+          }
+        }
+      }
+
+      // If no items found from both sources, log warning
+      if (expectedItems.length === 0) {
+        console.warn(
+          `⚠️ loadExpectedItems: No expected items found for bin ${binCode} from backend task or stock ledger cache.`
+        );
+        if (taskTitle) {
+          console.warn(
+            `⚠️ Backend task ${taskTitle} may not have task lines yet. Items will be created as you scan them.`
+          );
+        } else {
+          console.warn(
+            `⚠️ Please sync stock ledger data from backend or ensure backend task has task lines.`
+          );
+        }
+        return;
+      }
+
       // Get existing item codes from DATABASE (not state)
-      const existingItemCodes = new Set(existingLinesInDb.map(l => l.item_code));
-      console.log(`📋 loadExpectedItems: Existing item codes:`, Array.from(existingItemCodes));
-      
+      const existingItemCodes = new Set(
+        existingLinesInDb.map((l) => l.item_code)
+      );
+      console.log(
+        `📋 loadExpectedItems: Existing item codes:`,
+        Array.from(existingItemCodes)
+      );
+
       // Only create lines for items that don't exist in the database
       const newLines: CountLine[] = expectedItems
-        .filter(item => {
+        .filter((item) => {
           const exists = existingItemCodes.has(item.item_code);
           if (exists) {
-            console.log(`⏭️ loadExpectedItems: Skipping ${item.item_code} - already exists in database`);
+            console.log(
+              `⏭️ loadExpectedItems: Skipping ${item.item_code} - already exists in database`
+            );
           }
           return !exists;
         })
-        .map(item => ({
+        .map((item) => ({
           line_id: generateUUID(),
           item_code: item.item_code,
           barcode: "",
+          carton_id: cartonId || null, // ✅ NEW: Include carton_id when loading expected items
           uom: "EA",
           expected_qty: item.qty,
           counted_qty: 0,
@@ -200,21 +928,26 @@ export default function CycleCountBinCountingScreen() {
           is_unexpected_item: false,
         }));
 
-      console.log(`➕ loadExpectedItems: Will add ${newLines.length} new expected items`);
+      console.log(
+        `➕ loadExpectedItems: Will add ${newLines.length} new expected items`
+      );
 
       if (newLines.length > 0) {
         // Save new lines to database
         for (const line of newLines) {
-          console.log(`💾 loadExpectedItems: Inserting line for ${line.item_code}, expected: ${line.expected_qty}`);
+          console.log(
+            `💾 loadExpectedItems: Inserting line for ${line.item_code}, expected: ${line.expected_qty}`
+          );
           await db.runAsync(
             `INSERT INTO cycle_count_lines (
-              line_id, session_id, item_code, barcode, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              line_id, session_id, item_code, barcode, carton_id, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               line.line_id,
               sessionId,
               line.item_code,
               line.barcode,
+              line.carton_id || null, // ✅ NEW: Include carton_id (can be null for bin-level mode)
               line.uom,
               line.expected_qty,
               line.counted_qty,
@@ -224,19 +957,144 @@ export default function CycleCountBinCountingScreen() {
             ]
           );
         }
-        console.log(`✅ loadExpectedItems: Added ${newLines.length} expected items, reloading session`);
+        console.log(
+          `✅ loadExpectedItems: Added ${newLines.length} expected items, reloading session`
+        );
         await loadSession();
       } else {
         console.log(`✅ loadExpectedItems: No new items to add`);
       }
     } catch (error: any) {
-      console.error("❌ loadExpectedItems: Error loading expected items:", error);
+      console.error(
+        "❌ loadExpectedItems: Error loading expected items:",
+        error
+      );
     } finally {
       setLoading(false);
     }
   };
 
+  // ✅ NEW: Handle carton ID scan/input
+  const handleCartonIdScan = async (scannedCartonId: string) => {
+    const trimmedCartonId = scannedCartonId.trim().toUpperCase();
+    if (trimmedCartonId) {
+      console.log(`📦 Carton ID scanned: ${trimmedCartonId}`);
+      setCartonId(trimmedCartonId);
+      setCartonIdInput("");
+      setShowCartonScanner(false);
+
+      // ✅ NEW: Start the task immediately after carton ID validation (before scanning items)
+      // This ensures the task status is "Started/In Progress" before any items are counted
+      // Only starts if task is in "Draft" status - if already "In Progress", skips starting
+      if (taskTitle) {
+        await ensureTaskStarted(taskTitle);
+      } else {
+        console.log(
+          `ℹ️ No task title found - task will be started when backend task is created`
+        );
+      }
+
+      // ✅ NEW: Load expected items for this carton after carton ID is set
+      if (sessionId && binCode && !isBlindCount) {
+        console.log(
+          `🔄 Loading expected items for carton ${trimmedCartonId}...`
+        );
+        // Load session first to get items for this carton
+        await loadSessionWithCartonId(trimmedCartonId);
+        // Then load expected items from backend/stock ledger
+        await loadExpectedItems(taskTitle);
+      }
+
+      // Focus item barcode input after carton ID is set
+      setTimeout(() => {
+        barcodeInputRef.current?.focus();
+      }, 100);
+    }
+  };
+
+  const handleCartonIdInputChange = (text: string) => {
+    setCartonIdInput(text.toUpperCase());
+  };
+
+  const handleCartonIdSubmit = () => {
+    if (cartonIdInput.trim()) {
+      handleCartonIdScan(cartonIdInput);
+    }
+  };
+
+  const handleChangeCartonId = () => {
+    // ✅ Clear the current carton ID to show the carton ID input card
+    // This allows the user to type, scan, or generate a new carton ID
+    // Set flag to prevent useFocusEffect from restoring carton ID from database
+    skipCartonRestoreRef.current = true;
+    setCartonId(null);
+    setCartonIdInput("");
+    // The carton ID input card will automatically appear (rendered when !cartonId)
+    // After a short delay, focus the input field for better UX
+    setTimeout(() => {
+      cartonIdInputRef.current?.focus();
+    }, 200);
+  };
+
+  // ✅ NEW: Generate carton ID locally
+  const handleGenerateCartonId = () => {
+    if (!binCode) {
+      Alert.alert("Error", "Bin code is required to generate carton ID");
+      return;
+    }
+
+    // Generate carton ID format: CTN-{BIN_CODE}-{TIMESTAMP}
+    // Example: CTN-A1-R01-L1-B1-20250109-001
+    const now = new Date();
+    const dateStr = now.toISOString().split("T")[0].replace(/-/g, ""); // YYYYMMDD
+    const timeStr = now
+      .toTimeString()
+      .split(" ")[0]
+      .replace(/:/g, "")
+      .substring(0, 6); // HHMMSS (first 6 chars)
+    const randomSuffix = Math.floor(Math.random() * 1000)
+      .toString()
+      .padStart(3, "0");
+
+    // Clean bin code (remove special chars, keep alphanumeric and dashes)
+    const cleanBinCode = binCode.replace(/[^A-Z0-9-]/gi, "-").toUpperCase();
+
+    const generatedCartonId = `CTN-${cleanBinCode}-${dateStr}-${timeStr}-${randomSuffix}`;
+
+    console.log(
+      `🔧 Generated carton ID: ${generatedCartonId} for bin ${binCode}`
+    );
+
+    // Set the generated carton ID (same as scanning)
+    handleCartonIdScan(generatedCartonId);
+
+    Alert.alert(
+      "Carton ID Generated",
+      `Generated Carton ID:\n${generatedCartonId}\n\nThis will be sent to backend when items are synced.`,
+      [{ text: "OK" }]
+    );
+  };
+
   const handleItemScan = async (barcode: string) => {
+    // ✅ NEW: Require carton ID before scanning items
+    if (!cartonId || cartonId.trim() === "") {
+      Alert.alert(
+        "Carton ID Required",
+        "Please scan or enter a Carton ID before scanning items.\n\nOne bin can have multiple cartons.",
+        [
+          {
+            text: "OK",
+            onPress: () => {
+              setTimeout(() => {
+                cartonIdInputRef.current?.focus();
+              }, 100);
+            },
+          },
+        ]
+      );
+      return;
+    }
+
     const now = Date.now();
     if (now - lastScanTime.current < SCAN_DEBOUNCE_MS) {
       return; // Debounce rapid scans
@@ -244,61 +1102,76 @@ export default function CycleCountBinCountingScreen() {
     lastScanTime.current = now;
 
     setShowScanner(false);
-    
+
     try {
       const db = await getDatabase();
-      
-      // Resolve barcode to item
-      let barcodeMap = await db.getFirstAsync<{
+
+      // ✅ Priority 1: Search local database first (item_master, item_barcode_map)
+      // ✅ Priority 2: If not found locally, search from backend API
+      console.log(`🔍 Searching for item: barcode="${barcode}"`);
+      const item = await resolveItemFromBarcode(barcode);
+
+      if (!item) {
+        Alert.alert(
+          "Item Not Found",
+          `Barcode "${barcode}" not found in system`
+        );
+        // Refocus input even on error
+        setTimeout(() => {
+          barcodeInputRef.current?.focus();
+        }, 100);
+        return;
+      }
+
+      // Item found - get additional details from barcode_map if available
+      const barcodeMap = await db.getFirstAsync<{
         item_code: string;
         uom: string;
         pack_size: number;
         barcode_type: string;
       }>(
-        "SELECT item_code, uom, pack_size, barcode_type FROM item_barcode_map WHERE barcode = ?",
-        [barcode]
+        "SELECT item_code, uom, pack_size, barcode_type FROM item_barcode_map WHERE barcode = ? OR item_code = ?",
+        [barcode, item.item_code]
       );
 
-      // Barcode mapping should come from backend sync (item_barcode_map table)
-      // If not found, will try item master below
+      // Use barcode_map data if available (has pack_size and UOM), otherwise use defaults
+      const itemCode = item.item_code;
+      const uom = barcodeMap?.uom || "EA";
+      const increment = barcodeMap?.pack_size || 1;
 
+      // Create or update barcode map entry if it doesn't exist
       if (!barcodeMap) {
-        // Try to resolve from item master
-        const itemMaster = await db.getFirstAsync<{
-          item_code: string;
-          barcode: string;
-        }>(
-          "SELECT item_code, barcode FROM item_master WHERE barcode = ?",
-          [barcode]
-        );
-
-        if (!itemMaster) {
-          Alert.alert("Item Not Found", `Barcode "${barcode}" not found in system`);
-          // Refocus input even on error
-          setTimeout(() => {
-            barcodeInputRef.current?.focus();
-          }, 100);
-          return;
+        try {
+          await db.runAsync(
+            "INSERT OR REPLACE INTO item_barcode_map (barcode, item_code, uom, pack_size, barcode_type, updated_on) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+              barcode,
+              itemCode,
+              uom,
+              increment,
+              "Unit",
+              new Date().toISOString(),
+            ]
+          );
+          console.log(
+            `💾 Created barcode map entry: barcode="${barcode}", item_code="${itemCode}"`
+          );
+        } catch (cacheError: any) {
+          console.warn(
+            `⚠️ Failed to create barcode map entry:`,
+            cacheError.message
+          );
         }
-
-        // Create barcode map entry
-        await db.runAsync(
-          "INSERT OR REPLACE INTO item_barcode_map (barcode, item_code, uom, pack_size, barcode_type, updated_on) VALUES (?, ?, ?, ?, ?, ?)",
-          [barcode, itemMaster.item_code, "EA", 1, "Unit", new Date().toISOString()]
-        );
-
-        // Use item master data
-        const increment = 1;
-        await addOrIncrementItem(itemMaster.item_code, barcode, "EA", increment);
-      } else {
-        // Use barcode map data
-        const increment = barcodeMap.pack_size || 1;
-        await addOrIncrementItem(barcodeMap.item_code, barcode, barcodeMap.uom, increment);
       }
+
+      console.log(
+        `✅ Item resolved: item_code="${itemCode}", barcode="${barcode}", uom="${uom}", increment=${increment}`
+      );
+      await addOrIncrementItem(itemCode, barcode, uom, increment);
 
       // Vibrate on success
       Vibration.vibrate(50);
-      
+
       // Clear input and refocus for next scan
       setManualBarcode("");
       setTimeout(() => {
@@ -308,7 +1181,7 @@ export default function CycleCountBinCountingScreen() {
       console.error("Error processing scan:", error);
       Alert.alert("Error", `Failed to process scan: ${error.message}`);
       Vibration.vibrate([100, 50, 100]); // Error pattern
-      
+
       // Refocus even on error
       setTimeout(() => {
         barcodeInputRef.current?.focus();
@@ -325,57 +1198,92 @@ export default function CycleCountBinCountingScreen() {
     try {
       if (!sessionId) {
         console.error("❌ addOrIncrementItem: sessionId is missing!");
-        Alert.alert("Error", "Session ID is missing. Please restart the counting session.");
+        Alert.alert(
+          "Error",
+          "Session ID is missing. Please restart the counting session."
+        );
         return;
       }
 
-      console.log(`💾 Saving item: ${itemCode}, barcode: ${barcode}, increment: ${increment}, sessionId: ${sessionId}`);
+      console.log(
+        `💾 Saving item: ${itemCode}, barcode: ${barcode}, increment: ${increment}, sessionId: ${sessionId}`
+      );
       const db = await getDatabase();
-      
+
       // Verify session exists
       const session = await db.getFirstAsync<{ session_id: string }>(
         "SELECT session_id FROM cycle_count_sessions WHERE session_id = ?",
         [sessionId]
       );
-      
+
       if (!session) {
         console.error(`❌ Session ${sessionId} not found in database!`);
-        Alert.alert("Error", "Session not found. Please restart the counting session.");
+        Alert.alert(
+          "Error",
+          "Session not found. Please restart the counting session."
+        );
         return;
       }
 
-      // Check if item already exists in count lines
+      // Check if item already exists in count lines with the same carton_id
+      // If carton_id is provided, match by both item_code AND carton_id
+      // If carton_id is null, only match by item_code (for bin-level counting)
       const existingLine = await db.getFirstAsync<CountLine>(
-        "SELECT * FROM cycle_count_lines WHERE session_id = ? AND item_code = ?",
-        [sessionId, itemCode]
+        cartonId
+          ? "SELECT * FROM cycle_count_lines WHERE session_id = ? AND item_code = ? AND carton_id = ?"
+          : "SELECT * FROM cycle_count_lines WHERE session_id = ? AND item_code = ? AND (carton_id IS NULL OR carton_id = '')",
+        cartonId ? [sessionId, itemCode, cartonId] : [sessionId, itemCode]
       );
 
       const now = new Date().toISOString();
 
       if (existingLine) {
-        // Increment existing line
+        // Increment existing line (carton_id already matches due to query filter)
         const newQty = existingLine.counted_qty + increment;
-        console.log(`📝 Updating existing line ${existingLine.line_id}: ${existingLine.counted_qty} + ${increment} = ${newQty}`);
-        const result = await db.runAsync(
-          "UPDATE cycle_count_lines SET counted_qty = ?, updated_at = ? WHERE line_id = ?",
-          [newQty, now, existingLine.line_id]
+        console.log(
+          `📝 Updating existing line ${existingLine.line_id}: ${
+            existingLine.counted_qty
+          } + ${increment} = ${newQty}, carton_id: ${
+            cartonId || "null"
+          } (existing: ${existingLine.carton_id || "null"})`
         );
-        console.log(`✅ Updated line:`, result);
+
+        // Update existing line quantity and ensure carton_id is set (in case it was null before)
+        const updateQuery = cartonId
+          ? "UPDATE cycle_count_lines SET counted_qty = ?, carton_id = ?, updated_at = ? WHERE line_id = ?"
+          : "UPDATE cycle_count_lines SET counted_qty = ?, updated_at = ? WHERE line_id = ?";
+        const updateParams = cartonId
+          ? [newQty, cartonId, now, existingLine.line_id]
+          : [newQty, now, existingLine.line_id];
+
+        const result = await db.runAsync(updateQuery, updateParams);
+        console.log(
+          `✅ Updated line ${existingLine.line_id} with qty ${newQty}${
+            cartonId ? ` and carton_id ${cartonId}` : ""
+          }`
+        );
       } else {
         // Add new line
         const lineId = generateUUID();
-        const expectedQty = isBlindCount ? null : await getExpectedQty(itemCode);
-        
-        console.log(`➕ Inserting new line ${lineId} for item ${itemCode}, expected: ${expectedQty}, counted: ${increment}`);
+        const expectedQty = isBlindCount
+          ? null
+          : await getExpectedQty(itemCode);
+
+        console.log(
+          `➕ Inserting new line ${lineId} for item ${itemCode}, expected: ${expectedQty}, counted: ${increment}, carton_id: ${
+            cartonId || "null"
+          }`
+        );
         const result = await db.runAsync(
           `INSERT INTO cycle_count_lines (
-            line_id, session_id, item_code, barcode, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            line_id, session_id, item_code, barcode, carton_id, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             lineId,
             sessionId,
             itemCode,
             barcode,
+            cartonId || null, // ✅ NEW: Use carton_id from route params (scanned during bin scan)
             uom,
             expectedQty,
             increment,
@@ -400,38 +1308,84 @@ export default function CycleCountBinCountingScreen() {
       console.log(`✅ Item saved successfully: ${itemCode}`);
 
       // Real-time sync: If device is online, sync only the current item immediately (non-blocking)
-      isDeviceOnline().then(async (online) => {
-        if (online) {
-          console.log(`🔄 Device is online - syncing item ${itemCode} for session ${sessionId} immediately...`);
-          try {
-            const syncSuccess = await syncCycleCountSession(sessionId, itemCode);
-            if (syncSuccess) {
-              console.log(`✅ Real-time sync successful for item ${itemCode} in session ${sessionId}`);
-            } else {
-              console.warn(`⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`);
+      isDeviceOnline()
+        .then(async (online) => {
+          if (online) {
+            console.log(
+              `🔄 Device is online - syncing item ${itemCode} for session ${sessionId} immediately...`
+            );
+            try {
+              const syncSuccess = await syncCycleCountSession(
+                sessionId,
+                itemCode
+              );
+              if (syncSuccess) {
+                console.log(
+                  `✅ Real-time sync successful for item ${itemCode} in session ${sessionId}`
+                );
+              } else {
+                console.warn(
+                  `⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`
+                );
+              }
+            } catch (syncError: any) {
+              console.warn(
+                `⚠️ Real-time sync failed for item ${itemCode}:`,
+                syncError.message
+              );
+              // Don't show error to user - sync will retry later
             }
-          } catch (syncError: any) {
-            console.warn(`⚠️ Real-time sync failed for item ${itemCode}:`, syncError.message);
-            // Don't show error to user - sync will retry later
+          } else {
+            console.log(
+              `ℹ️ Device is offline - item ${itemCode} will sync when online`
+            );
           }
-        } else {
-          console.log(`ℹ️ Device is offline - item ${itemCode} will sync when online`);
-        }
-      }).catch((error) => {
-        console.warn(`⚠️ Error checking network status:`, error);
-        // Continue without sync - will retry later
-      });
+        })
+        .catch((error) => {
+          console.warn(`⚠️ Error checking network status:`, error);
+          // Continue without sync - will retry later
+        });
     } catch (error: any) {
       console.error("❌ Error in addOrIncrementItem:", error);
       console.error("❌ Error stack:", error.stack);
-      Alert.alert("Save Error", `Failed to save item: ${error.message || error.toString()}`);
+      Alert.alert(
+        "Save Error",
+        `Failed to save item: ${error.message || error.toString()}`
+      );
       // Don't re-throw - let the UI continue working
     }
   };
 
   const getExpectedQty = async (itemCode: string): Promise<number | null> => {
+    // ✅ FIX: Show expected qty even when carton_id is set
+    // Backend stock ledger is bin-level, so expected_qty applies regardless of carton_id
+    // carton_id is only for tracking which carton was counted, not for filtering expected quantities
+
     try {
       const db = await getDatabase();
+
+      // Priority 1: Check if we already have expected_qty in cycle_count_lines for this item
+      if (sessionId) {
+        const existingLine = await db.getFirstAsync<{
+          expected_qty: number | null;
+        }>(
+          "SELECT expected_qty FROM cycle_count_lines WHERE session_id = ? AND item_code = ? LIMIT 1",
+          [sessionId, itemCode]
+        );
+
+        if (
+          existingLine &&
+          existingLine.expected_qty !== null &&
+          existingLine.expected_qty !== undefined
+        ) {
+          console.log(
+            `✅ getExpectedQty: Found expected_qty from cycle_count_lines for ${itemCode}: ${existingLine.expected_qty}`
+          );
+          return existingLine.expected_qty;
+        }
+      }
+
+      // Priority 2: Fallback to stock_ledger_cache
       let stock = await db.getFirstAsync<{ qty: number }>(
         "SELECT qty FROM stock_ledger_cache WHERE item_code = ? AND bin_location = ?",
         [itemCode, binCode]
@@ -489,72 +1443,105 @@ export default function CycleCountBinCountingScreen() {
   const handleSaveQty = async (lineId: string) => {
     const qty = parseFloat(editQty);
     if (isNaN(qty) || qty < 0) {
-      Alert.alert("Invalid Quantity", "Please enter a valid quantity (0 or greater)");
+      Alert.alert(
+        "Invalid Quantity",
+        "Please enter a valid quantity (0 or greater)"
+      );
       return;
     }
 
     try {
       const db = await getDatabase();
-      
+
       // Get the item_code for this line before updating
       const line = await db.getFirstAsync<{ item_code: string }>(
         "SELECT item_code FROM cycle_count_lines WHERE line_id = ?",
         [lineId]
       );
-      
+
       if (!line) {
         Alert.alert("Error", "Line not found");
         return;
       }
-      
+
       const itemCode = line.item_code;
       const now = new Date().toISOString();
       await db.runAsync(
         "UPDATE cycle_count_lines SET counted_qty = ?, updated_at = ? WHERE line_id = ?",
         [qty, now, lineId]
       );
-      
+
       // Automatically update session status to 'Draft' when quantity is edited
       await db.runAsync(
         "UPDATE cycle_count_sessions SET status = 'Draft', updated_at = ? WHERE session_id = ?",
         [now, sessionId]
       );
-      
+
       setEditingLineId(null);
       setEditQty("");
       await loadSession();
 
       // Real-time sync: If device is online, sync only the edited item immediately (non-blocking)
-      isDeviceOnline().then(async (online) => {
-        if (online) {
-          console.log(`🔄 Device is online - syncing item ${itemCode} for session ${sessionId} after quantity edit...`);
-          try {
-            const syncSuccess = await syncCycleCountSession(sessionId, itemCode);
-            if (syncSuccess) {
-              console.log(`✅ Real-time sync successful for item ${itemCode} in session ${sessionId} after edit`);
-            } else {
-              console.warn(`⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`);
+      isDeviceOnline()
+        .then(async (online) => {
+          if (online) {
+            console.log(
+              `🔄 Device is online - syncing item ${itemCode} for session ${sessionId} after quantity edit...`
+            );
+            try {
+              const syncSuccess = await syncCycleCountSession(
+                sessionId,
+                itemCode
+              );
+              if (syncSuccess) {
+                console.log(
+                  `✅ Real-time sync successful for item ${itemCode} in session ${sessionId} after edit`
+                );
+              } else {
+                console.warn(
+                  `⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`
+                );
+              }
+            } catch (syncError: any) {
+              console.warn(
+                `⚠️ Real-time sync failed for item ${itemCode}:`,
+                syncError.message
+              );
+              // Don't show error to user - sync will retry later
             }
-          } catch (syncError: any) {
-            console.warn(`⚠️ Real-time sync failed for item ${itemCode}:`, syncError.message);
-            // Don't show error to user - sync will retry later
+          } else {
+            console.log(
+              `ℹ️ Device is offline - item ${itemCode} will sync when online`
+            );
           }
-        } else {
-          console.log(`ℹ️ Device is offline - item ${itemCode} will sync when online`);
-        }
-      }).catch((error) => {
-        console.warn(`⚠️ Error checking network status:`, error);
-        // Continue without sync - will retry later
-      });
+        })
+        .catch((error) => {
+          console.warn(`⚠️ Error checking network status:`, error);
+          // Continue without sync - will retry later
+        });
     } catch (error: any) {
       Alert.alert("Error", `Failed to update quantity: ${error.message}`);
     }
   };
 
   const handleMarkBinCompleted = async () => {
+    // ✅ Check if carton ID is required but not set
+    if (!cartonId && cartonIdInput.trim()) {
+      Alert.alert(
+        "Carton ID Required",
+        "Please complete the carton ID scan first before marking bin as completed.",
+        [{ text: "OK" }]
+      );
+      // Focus carton ID input
+      setTimeout(() => {
+        cartonIdInputRef.current?.focus();
+      }, 100);
+      return;
+    }
+
     Alert.alert(
       "Mark Bin Completed",
-      "This will mark all unscanned expected items as zero. Continue?",
+      "This will mark all unscanned expected items as zero and complete the bin count. Continue?",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -562,7 +1549,7 @@ export default function CycleCountBinCountingScreen() {
           onPress: async () => {
             try {
               const db = await getDatabase();
-              
+
               // Set all expected items with 0 counted_qty to 0 (if not blind count)
               if (!isBlindCount) {
                 await db.runAsync(
@@ -579,22 +1566,21 @@ export default function CycleCountBinCountingScreen() {
                 [new Date().toISOString(), new Date().toISOString(), sessionId]
               );
 
-              Alert.alert(
-                "Success", 
-                "Bin marked as completed",
-                [
-                  {
-                    text: "OK",
-                    onPress: () => {
-                      // Navigate back to dashboard
-                      navigation.goBack();
-                    }
-                  }
-                ]
-              );
+              Alert.alert("Success", "Bin marked as completed", [
+                {
+                  text: "OK",
+                  onPress: () => {
+                    // Navigate back to dashboard
+                    navigation.goBack();
+                  },
+                },
+              ]);
               await loadSession();
             } catch (error: any) {
-              Alert.alert("Error", `Failed to mark bin completed: ${error.message}`);
+              Alert.alert(
+                "Error",
+                `Failed to mark bin completed: ${error.message}`
+              );
             }
           },
         },
@@ -632,13 +1618,146 @@ export default function CycleCountBinCountingScreen() {
             setSaving(true);
             try {
               const db = await getDatabase();
+
+              // First, sync all counts to backend
+              console.log(
+                `🔄 Syncing counts before submission for session ${sessionId}...`
+              );
+              const syncSuccess = await syncCycleCountSession(sessionId);
+              if (!syncSuccess) {
+                console.warn(
+                  `⚠️ Sync returned false, but continuing with submission`
+                );
+              }
+
+              // Update local status to Submitted
               await db.runAsync(
                 "UPDATE cycle_count_sessions SET status = 'Submitted', updated_at = ? WHERE session_id = ?",
                 [new Date().toISOString(), sessionId]
               );
-              Alert.alert("Success", "Bin count submitted successfully");
-              navigation.goBack();
+
+              // ✅ Submit the task to backend (only if taskTitle exists)
+              if (taskTitle) {
+                try {
+                  console.log(
+                    `📤 Submitting cycle count task ${taskTitle} to backend...`
+                  );
+
+                  // ✅ Try to submit the task
+                  try {
+                    await apiService.submitCycleCount(taskTitle);
+                    console.log(
+                      `✅ Successfully submitted task ${taskTitle} to backend`
+                    );
+                  } catch (submitError: any) {
+                    // ✅ Handle case where task is in "Draft" status - need to start it first
+                    const errorMessage =
+                      submitError.message || submitError.toString() || "";
+                    const isInvalidStatus =
+                      errorMessage.includes("INVALID_STATUS") ||
+                      errorMessage.includes("Cannot submit") ||
+                      errorMessage.includes("status: Draft");
+
+                    if (isInvalidStatus) {
+                      console.log(
+                        `ℹ️ Task ${taskTitle} is in Draft status. Starting task first...`
+                      );
+                      try {
+                        // Get settings for started_by
+                        const settings = await getSettings();
+                        // Start the task first
+                        await apiService.startCycleCount(taskTitle, {
+                          started_by:
+                            settings.user_id ||
+                            settings.user_code ||
+                            "USER-AUTO",
+                        });
+                        console.log(
+                          `✅ Successfully started task ${taskTitle}`
+                        );
+
+                        // Wait a moment for backend to process status change
+                        await new Promise((resolve) =>
+                          setTimeout(resolve, 500)
+                        );
+
+                        // Retry submission after starting
+                        console.log(
+                          `📤 Retrying submission of task ${taskTitle}...`
+                        );
+                        await apiService.submitCycleCount(taskTitle);
+                        console.log(
+                          `✅ Successfully submitted task ${taskTitle} to backend (after starting)`
+                        );
+                      } catch (startError: any) {
+                        // If starting fails, log and rethrow
+                        console.error(
+                          `❌ Failed to start task ${taskTitle}:`,
+                          startError.message
+                        );
+                        throw startError; // Re-throw to be caught by outer catch
+                      }
+                    } else {
+                      // Other submission errors - rethrow
+                      throw submitError;
+                    }
+                  }
+
+                  // ✅ Complete the task after submission (automatic)
+                  try {
+                    console.log(
+                      `📤 Completing cycle count task ${taskTitle} via API...`
+                    );
+                    await apiService.completeCycleCount(taskTitle);
+                    console.log(
+                      `✅ Successfully completed task ${taskTitle} via API`
+                    );
+                  } catch (completeError: any) {
+                    // Log error but don't block - task is already submitted
+                    console.warn(
+                      `⚠️ Failed to complete task via API:`,
+                      completeError.message
+                    );
+                    console.warn(
+                      `⚠️ Task is submitted but not completed - may need manual completion in desktop app`
+                    );
+                  }
+                } catch (submitError: any) {
+                  // If submission fails even after starting, log but don't block - counts are already synced
+                  console.error(
+                    `❌ Failed to submit task to backend:`,
+                    submitError.message
+                  );
+                  // Still show success to user since counts are synced
+                  Alert.alert(
+                    "Warning",
+                    `Bin count has been synced, but task submission failed: ${submitError.message}. The task may need to be submitted manually in the desktop app.`
+                  );
+                }
+              } else {
+                console.warn(
+                  `⚠️ No task title found - skipping submit and complete API calls`
+                );
+                console.warn(
+                  `⚠️ Task will be submitted when backend task is found and synced`
+                );
+              }
+
+              Alert.alert(
+                "Success",
+                "Bin count submitted and completed successfully",
+                [
+                  {
+                    text: "OK",
+                    onPress: () => {
+                      // Navigate to Cycle Count Dashboard
+                      (navigation as any).navigate("CycleCountDashboard");
+                    },
+                  },
+                ]
+              );
             } catch (error: any) {
+              console.error("❌ Error submitting bin count:", error);
               Alert.alert("Error", `Failed to submit: ${error.message}`);
             } finally {
               setSaving(false);
@@ -664,9 +1783,10 @@ export default function CycleCountBinCountingScreen() {
 
   const renderCountLine = ({ item }: { item: CountLine }) => {
     const isEditing = editingLineId === item.line_id;
-    const variance = typeof item.expected_qty === 'number'
-      ? item.counted_qty - item.expected_qty 
-      : null;
+    const variance =
+      typeof item.expected_qty === "number"
+        ? item.counted_qty - item.expected_qty
+        : null;
 
     return (
       <View style={styles.countLineCard}>
@@ -678,19 +1798,25 @@ export default function CycleCountBinCountingScreen() {
               <Text style={styles.barcodeText}>Barcode: {item.barcode}</Text>
             )}
           </View>
-          {!isBlindCount && (
-            <View style={[
-              styles.expectedBadge,
-              variance === 0 && styles.expectedBadgeGreen
-            ]}>
-              <Text style={[
-                styles.expectedBadgeText,
-                variance === 0 && styles.expectedBadgeTextGreen
-              ]}>
-                Exp: {item.expected_qty ?? 0}
-              </Text>
-            </View>
-          )}
+          {!isBlindCount &&
+            item.expected_qty !== null &&
+            item.expected_qty !== undefined && (
+              <View
+                style={[
+                  styles.expectedBadge,
+                  variance === 0 && styles.expectedBadgeGreen,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.expectedBadgeText,
+                    variance === 0 && styles.expectedBadgeTextGreen,
+                  ]}
+                >
+                  Exp: {item.expected_qty}
+                </Text>
+              </View>
+            )}
         </View>
 
         <View style={styles.countLineBody}>
@@ -723,31 +1849,41 @@ export default function CycleCountBinCountingScreen() {
             <View style={styles.qtyRow}>
               <View style={styles.qtySection}>
                 <Text style={styles.qtyLabel}>Counted</Text>
-                <Text style={styles.qtyValue}>{item.counted_qty}</Text>
+                <Text
+                  style={[
+                    styles.qtyValue,
+                    item.counted_qty === 0 && styles.qtyValueZero,
+                  ]}
+                >
+                  {item.counted_qty}
+                </Text>
                 <Text style={styles.uomText}>{item.uom}</Text>
               </View>
-              
-              {!isBlindCount && variance !== null && (
-                <View style={styles.varianceSection}>
-                  <Text style={styles.varianceLabel}>Variance</Text>
-                  <Text
-                    style={[
-                      styles.varianceValue,
-                      {
-                        color:
-                          variance === 0
-                            ? "#4CAF50"
-                            : variance > 0
-                            ? "#FF9800"
-                            : "#F44336",
-                      },
-                    ]}
-                  >
-                    {variance > 0 ? "+" : ""}
-                    {variance}
-                  </Text>
-                </View>
-              )}
+
+              {!isBlindCount &&
+                variance !== null &&
+                item.expected_qty !== null &&
+                item.expected_qty !== undefined && (
+                  <View style={styles.varianceSection}>
+                    <Text style={styles.varianceLabel}>Variance</Text>
+                    <Text
+                      style={[
+                        styles.varianceValue,
+                        {
+                          color:
+                            variance === 0
+                              ? "#4CAF50"
+                              : variance > 0
+                              ? "#FF9800"
+                              : "#F44336",
+                        },
+                      ]}
+                    >
+                      {variance > 0 ? "+" : ""}
+                      {variance}
+                    </Text>
+                  </View>
+                )}
 
               <TouchableOpacity
                 style={styles.editButton}
@@ -777,10 +1913,20 @@ export default function CycleCountBinCountingScreen() {
         >
           {/* Action Buttons - Top */}
           <View style={styles.topActionContainer}>
+            {/* ✅ Hide/Disable Mark Bin button during carton scanning if carton ID is required but not set */}
             <TouchableOpacity
-              style={styles.topActionButton}
+              style={[
+                styles.topActionButton,
+                saving === true ||
+                (!cartonId && cartonIdInput.trim().length > 0)
+                  ? { opacity: 0.5 }
+                  : {},
+              ]}
               onPress={handleMarkBinCompleted}
-              disabled={saving}
+              disabled={
+                Boolean(saving) ||
+                (!cartonId && cartonIdInput.trim().length > 0)
+              }
             >
               <Text style={styles.topActionButtonText}>Mark Bin</Text>
             </TouchableOpacity>
@@ -797,6 +1943,25 @@ export default function CycleCountBinCountingScreen() {
           {/* Bin Header Card */}
           <View style={styles.binHeaderCard}>
             <Text style={styles.headerTitle}>Bin: {binCode}</Text>
+            {cartonId && (
+              <View style={styles.cartonIdContainer}>
+                <Text
+                  style={styles.cartonIdText}
+                  numberOfLines={2}
+                  ellipsizeMode="tail"
+                >
+                  Carton: {cartonId}
+                </Text>
+                <TouchableOpacity
+                  style={styles.changeCartonButton}
+                  onPress={handleChangeCartonId}
+                >
+                  <Text style={styles.changeCartonButtonText}>
+                    Change Carton
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
             {taskTitle && (
               <Text style={styles.taskTitleText}>Task: {taskTitle}</Text>
             )}
@@ -812,77 +1977,129 @@ export default function CycleCountBinCountingScreen() {
             </View>
           </View>
 
-          {/* Scan Card */}
-          <View style={styles.scanCard}>
-            <TouchableOpacity
-              style={styles.scanButton}
-              onPress={() => setShowScanner(true)}
-            >
-              <Text style={styles.scanButtonText}>Scan Item Barcode</Text>
-              <Text style={styles.scanButtonSubtext}>
-                Scan repeatedly to increment quantity
+          {/* ✅ NEW: Carton ID Scanning Section - Show if carton ID is not set */}
+          {!cartonId && (
+            <View style={styles.cartonIdCard}>
+              <Text style={styles.cartonIdCardTitle}>📦 Scan Carton ID</Text>
+              <Text style={styles.cartonIdCardSubtitle}>
+                One bin can have multiple cartons. Please scan the carton ID
+                first.
               </Text>
-            </TouchableOpacity>
-
-            {/* Manual Barcode Input */}
-            <View style={styles.manualInputSection}>
-              <Text style={styles.manualInputLabel}>Scan Item Barcode</Text>
-              <View style={styles.manualInputRow}>
-              <TextInput
-                ref={barcodeInputRef}
-                style={styles.manualInput}
-                value={manualBarcode}
-                onChangeText={setManualBarcode}
-                placeholder="Scan or enter barcode"
-                autoCapitalize="characters"
-                autoFocus={true}
-                blurOnSubmit={false}
-                showSoftInputOnFocus={false}
-                keyboardType="default"
-                onSubmitEditing={() => {
-                  if (manualBarcode.trim()) {
-                    handleItemScan(manualBarcode.trim());
-                    setManualBarcode("");
-                    // Refocus immediately after submit
-                    setTimeout(() => {
-                      barcodeInputRef.current?.focus();
-                    }, 50);
-                  }
-                }}
-                returnKeyType="done"
-                onBlur={() => {
-                  // Auto-refocus when input loses focus (unless editing quantity)
-                  if (!editingLineId) {
-                    setTimeout(() => {
-                      barcodeInputRef.current?.focus();
-                    }, 100);
-                  }
-                }}
-              />
+              <View style={styles.cartonIdInputRow}>
+                <TextInput
+                  ref={cartonIdInputRef}
+                  style={styles.cartonIdInput}
+                  value={cartonIdInput}
+                  onChangeText={handleCartonIdInputChange}
+                  placeholder="Scan or enter carton ID"
+                  autoCapitalize="characters"
+                  autoFocus={true}
+                  showSoftInputOnFocus={false}
+                  onSubmitEditing={handleCartonIdSubmit}
+                />
                 <TouchableOpacity
-                  style={styles.submitBarcodeButton}
-                  onPress={() => {
-                    if (manualBarcode.trim()) {
-                      handleItemScan(manualBarcode.trim());
-                      setManualBarcode("");
-                      // Refocus after submit
-                      setTimeout(() => {
-                        barcodeInputRef.current?.focus();
-                      }, 50);
-                    }
-                  }}
-                  disabled={!manualBarcode.trim()}
+                  style={styles.cartonIdScanButton}
+                  onPress={() => setShowCartonScanner(true)}
                 >
-                  <Text style={styles.submitBarcodeButtonText}>Submit</Text>
+                  <Text style={styles.cartonIdScanButtonText}>📷 Scan</Text>
                 </TouchableOpacity>
+                {cartonIdInput.trim() && (
+                  <TouchableOpacity
+                    style={styles.cartonIdSubmitButton}
+                    onPress={handleCartonIdSubmit}
+                  >
+                    <Text style={styles.cartonIdSubmitButtonText}>✓</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+              {/* ✅ NEW: Generate Carton ID Button */}
+              <TouchableOpacity
+                style={styles.generateCartonButton}
+                onPress={handleGenerateCartonId}
+              >
+                <Text style={styles.generateCartonButtonText}>
+                  🔧 Generate Carton ID
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* Scan Card - Only show if carton ID is set */}
+          {cartonId && (
+            <View style={styles.scanCard}>
+              <TouchableOpacity
+                style={styles.scanButton}
+                onPress={() => setShowScanner(true)}
+              >
+                <Text style={styles.scanButtonText}>Scan Item Barcode</Text>
+                <Text style={styles.scanButtonSubtext}>
+                  Scan repeatedly to increment quantity
+                </Text>
+              </TouchableOpacity>
+
+              {/* Manual Barcode Input */}
+              <View style={styles.manualInputSection}>
+                <Text style={styles.manualInputLabel}>Scan Item Barcode</Text>
+                <View style={styles.manualInputRow}>
+                  <TextInput
+                    ref={barcodeInputRef}
+                    style={styles.manualInput}
+                    value={manualBarcode}
+                    onChangeText={setManualBarcode}
+                    placeholder="Scan or enter barcode"
+                    autoCapitalize="characters"
+                    autoFocus={true}
+                    blurOnSubmit={false}
+                    showSoftInputOnFocus={false}
+                    keyboardType="default"
+                    onSubmitEditing={() => {
+                      if (manualBarcode.trim()) {
+                        handleItemScan(manualBarcode.trim());
+                        setManualBarcode("");
+                        // Refocus immediately after submit
+                        setTimeout(() => {
+                          barcodeInputRef.current?.focus();
+                        }, 50);
+                      }
+                    }}
+                    returnKeyType="done"
+                    onBlur={() => {
+                      // Auto-refocus when input loses focus (unless editing quantity)
+                      if (!editingLineId) {
+                        setTimeout(() => {
+                          barcodeInputRef.current?.focus();
+                        }, 100);
+                      }
+                    }}
+                  />
+                  <TouchableOpacity
+                    style={styles.submitBarcodeButton}
+                    onPress={() => {
+                      if (manualBarcode.trim()) {
+                        handleItemScan(manualBarcode.trim());
+                        setManualBarcode("");
+                        // Refocus after submit
+                        setTimeout(() => {
+                          barcodeInputRef.current?.focus();
+                        }, 50);
+                      }
+                    }}
+                    disabled={!manualBarcode.trim()}
+                  >
+                    <Text style={styles.submitBarcodeButtonText}>Submit</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
-          </View>
+          )}
 
-          {/* Scanned Items List */}
-          {countLines.length > 0 && (
+          {/* Expected/Scanned Items List - Only show after carton ID is scanned */}
+          {cartonId && countLines.length > 0 && (
             <View style={styles.listSection}>
-              <Text style={styles.listTitle}>Scanned Items</Text>
+              <Text style={styles.listTitle}>
+                {isBlindCount ? "Scanned Items" : "Expected Items"}
+              </Text>
+              <Text style={styles.listSubtitle}>Carton: {cartonId}</Text>
               <FlatList
                 data={countLines}
                 keyExtractor={(item) => item.line_id}
@@ -892,22 +2109,103 @@ export default function CycleCountBinCountingScreen() {
               />
             </View>
           )}
-
+          {cartonId && countLines.length === 0 && (
+            <View style={styles.listSection}>
+              <Text style={styles.listTitle}>Expected Items</Text>
+              <Text style={styles.listSubtitle}>Carton: {cartonId}</Text>
+              <View style={styles.emptyList}>
+                <Text style={styles.emptyListText}>
+                  No items found for this carton
+                </Text>
+              </View>
+            </View>
+          )}
         </ScrollView>
 
         {/* Scanner Modal */}
         {showScanner && (
-          <BarcodeScanner
-            onScan={handleItemScan}
-            onClose={() => {
+          <Modal
+            visible={showScanner}
+            transparent={true}
+            animationType="slide"
+            onRequestClose={() => {
               setShowScanner(false);
-              // Refocus input when scanner closes
               setTimeout(() => {
                 barcodeInputRef.current?.focus();
               }, 200);
             }}
-            title="Scan Item Barcode"
-          />
+          >
+            <View style={styles.modalOverlay}>
+              <View style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Scan Item Barcode</Text>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setShowScanner(false);
+                      setTimeout(() => {
+                        barcodeInputRef.current?.focus();
+                      }, 200);
+                    }}
+                    style={styles.modalCloseButton}
+                  >
+                    <Text style={styles.modalCloseButtonText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+                <BarcodeScanner
+                  onScan={(barcode) => {
+                    handleItemScan(barcode);
+                    setShowScanner(false);
+                    setTimeout(() => {
+                      barcodeInputRef.current?.focus();
+                    }, 200);
+                  }}
+                  title="Scan Item Barcode"
+                />
+              </View>
+            </View>
+          </Modal>
+        )}
+        {showCartonScanner && (
+          <Modal
+            visible={showCartonScanner}
+            transparent={true}
+            animationType="slide"
+            onRequestClose={() => {
+              setShowCartonScanner(false);
+              setTimeout(() => {
+                cartonIdInputRef.current?.focus();
+              }, 200);
+            }}
+          >
+            <View style={styles.modalOverlay}>
+              <View style={styles.modalContent}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Scan Carton ID</Text>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setShowCartonScanner(false);
+                      setTimeout(() => {
+                        cartonIdInputRef.current?.focus();
+                      }, 200);
+                    }}
+                    style={styles.modalCloseButton}
+                  >
+                    <Text style={styles.modalCloseButtonText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+                <BarcodeScanner
+                  onScan={(barcode) => {
+                    handleCartonIdScan(barcode);
+                    setShowCartonScanner(false);
+                    setTimeout(() => {
+                      cartonIdInputRef.current?.focus();
+                    }, 200);
+                  }}
+                  title="Scan Carton ID"
+                />
+              </View>
+            </View>
+          </Modal>
         )}
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -966,6 +2264,16 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255, 255, 255, 0.2)",
     paddingHorizontal: 8,
     paddingVertical: 3,
+    borderRadius: 4,
+    alignSelf: "flex-start",
+  },
+  cartonIdText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#FFF",
+    backgroundColor: "rgba(33, 150, 243, 0.3)", // Blue background
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     borderRadius: 4,
     alignSelf: "flex-start",
   },
@@ -1043,6 +2351,12 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
     paddingTop: 0,
+  },
+  listSubtitle: {
+    fontSize: 14,
+    color: "#666",
+    marginBottom: 12,
+    fontWeight: "500",
   },
   listTitle: {
     fontSize: 18,
@@ -1136,6 +2450,10 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: "bold",
     color: "#9C27B0",
+  },
+  qtyValueZero: {
+    color: "#999",
+    opacity: 0.6,
   },
   uomText: {
     fontSize: 12,
@@ -1277,6 +2595,142 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "bold",
   },
+  cartonIdContainer: {
+    flexDirection: "column",
+    marginTop: 6,
+    gap: 6,
+  },
+  changeCartonButton: {
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+    alignSelf: "flex-start",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.3)",
+  },
+  changeCartonButtonText: {
+    fontSize: 11,
+    color: "#FFF",
+    fontWeight: "600",
+  },
+  cartonIdCard: {
+    backgroundColor: "#FF9800",
+    marginHorizontal: 12,
+    marginTop: 8,
+    marginBottom: 8,
+    padding: 16,
+    borderRadius: 12,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  cartonIdCardTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#FFF",
+    marginBottom: 4,
+  },
+  cartonIdCardSubtitle: {
+    fontSize: 12,
+    color: "#FFF",
+    opacity: 0.9,
+    marginBottom: 12,
+  },
+  cartonIdInputRow: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+  },
+  cartonIdInput: {
+    flex: 1,
+    backgroundColor: "#FFF",
+    borderWidth: 2,
+    borderColor: "#FFF",
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  cartonIdScanButton: {
+    backgroundColor: "#2196F3",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 8,
+    justifyContent: "center",
+  },
+  cartonIdScanButtonText: {
+    color: "#FFF",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  cartonIdSubmitButton: {
+    backgroundColor: "#4CAF50",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 8,
+    justifyContent: "center",
+  },
+  cartonIdSubmitButtonText: {
+    color: "#FFF",
+    fontSize: 18,
+    fontWeight: "bold",
+  },
+  generateCartonButton: {
+    marginTop: 12,
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.3)",
+  },
+  generateCartonButtonText: {
+    color: "#FFF",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  // Modal styles for BarcodeScanner
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  modalContent: {
+    backgroundColor: "#FFF",
+    borderRadius: 12,
+    padding: 20,
+    width: "90%",
+    maxWidth: 500,
+    maxHeight: "80%",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#333",
+  },
+  modalCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#F5F5F5",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  modalCloseButtonText: {
+    fontSize: 20,
+    color: "#666",
+    fontWeight: "bold",
+  },
 });
-
-

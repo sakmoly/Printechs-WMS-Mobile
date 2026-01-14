@@ -14,6 +14,7 @@ import { apiService } from "../services/api.service";
 import { getDatabase } from "../database/database";
 import { MaterialRequest } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
+import ScreenFooterFrame from "../components/ScreenFooterFrame";
 
 // Helper function to get status sort order
 const getStatusSortOrder = (status: string | undefined): number => {
@@ -275,11 +276,25 @@ export default function MaterialRequestListScreen() {
           "⚠️ Backend database error detected. Falling back to local cache..."
         );
       } else {
-        // For other errors, log as error
-        console.error(
-          "❌ MaterialRequestListScreen: Error loading Material Requests:",
-          error
-        );
+        // Check if it's a server unavailable error
+        const isServerUnavailable = 
+          error.message?.includes("SERVER_UNAVAILABLE") ||
+          error.message?.includes("Server is not accessible") ||
+          error.message?.includes("Network request failed");
+        
+        if (isServerUnavailable) {
+          // Log as warning for server unavailable (expected scenario)
+          console.warn(
+            "⚠️ MaterialRequestListScreen: Server not accessible, using cached data",
+            error.message
+          );
+        } else {
+          // For other errors, log as error
+          console.error(
+            "❌ MaterialRequestListScreen: Error loading Material Requests:",
+            error
+          );
+        }
       }
 
       // Fallback to local cache
@@ -354,11 +369,25 @@ export default function MaterialRequestListScreen() {
           //   [{ text: "OK" }]
           // );
         } else {
-          Alert.alert(
-            "Connection Issue",
-            "Unable to load Material Requests. Please check your connection and try again.",
-            [{ text: "OK" }]
-          );
+          // Check if it's a server unavailable error
+          const isServerUnavailable = 
+            error.message?.includes("SERVER_UNAVAILABLE") ||
+            error.message?.includes("Server is not accessible") ||
+            error.message?.includes("Network request failed");
+          
+          if (isServerUnavailable) {
+            Alert.alert(
+              "🔌 Server Not Accessible",
+              "Unable to connect to the server. Please check:\n\n• Your internet connection\n• Server is running\n• Server address is correct\n\nYou can continue working offline with cached data.",
+              [{ text: "OK" }]
+            );
+          } else {
+            Alert.alert(
+              "Connection Issue",
+              "Unable to load Material Requests. Please check your connection and try again.",
+              [{ text: "OK" }]
+            );
+          }
         }
       }
     } finally {
@@ -518,6 +547,7 @@ export default function MaterialRequestListScreen() {
           />
         )}
       </ScrollView>
+      <ScreenFooterFrame />
     </View>
   );
 }

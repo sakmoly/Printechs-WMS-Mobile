@@ -13,12 +13,25 @@ import { useNavigation, useRoute } from "@react-navigation/native";
 import { apiService } from "../services/api.service";
 import { StockLedger, StockTransaction } from "../types";
 
+// New grouped format interface
+interface StockLocationGroup {
+  bin_location: string;
+  cartons: Array<{
+    carton_id: string;
+    qty: number;
+  }>;
+  total_qty: number;
+}
+
 export default function StockDetailScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const { itemCode, warehouse } = (route.params as any) || {};
 
-  const [stockDetails, setStockDetails] = useState<StockLedger[]>([]);
+  const [stockDetails, setStockDetails] = useState<StockLocationGroup[]>([]);
+  const [expandedBinLocation, setExpandedBinLocation] = useState<string | null>(
+    null
+  );
   const [transactions, setTransactions] = useState<StockTransaction[]>([]);
   const [loading, setLoading] = useState(false);
   const [showTransactions, setShowTransactions] = useState(false);
@@ -40,6 +53,19 @@ export default function StockDetailScreen() {
         warehouse
       );
 
+      // Handle 404 (endpoint not found) gracefully
+      if (response === null) {
+        console.log(
+          `ℹ️ Stock item endpoint not found (404) - this endpoint may not be implemented yet`
+        );
+        Alert.alert(
+          "Stock Information",
+          `Stock detail endpoint is not available.\n\nItem: ${itemCode}\nWarehouse: ${warehouse}\n\nThis endpoint may not be implemented on the backend yet.`
+        );
+        navigation.goBack();
+        return;
+      }
+
       // Handle different response formats
       let stockData: any = null;
       if (response && typeof response === "object") {
@@ -58,14 +84,50 @@ export default function StockDetailScreen() {
       }
 
       if (stockData && Array.isArray(stockData)) {
-        setStockDetails(stockData);
+        // Check if it's the new grouped format (has bin_location, cartons, total_qty)
+        const isGroupedFormat =
+          stockData.length > 0 &&
+          stockData[0].bin_location &&
+          Array.isArray(stockData[0].cartons) &&
+          stockData[0].total_qty !== undefined;
+
+        if (isGroupedFormat) {
+          // New grouped format
+          setStockDetails(stockData as StockLocationGroup[]);
+        } else {
+          // Legacy format - convert to grouped format for compatibility
+          const groupedData: StockLocationGroup[] = stockData.map(
+            (item: StockLedger) => ({
+              bin_location: item.bin_location || "No Bin",
+              cartons: [], // Legacy format doesn't have cartons
+              total_qty: item.qty || 0,
+            })
+          );
+          setStockDetails(groupedData);
+        }
       } else {
         Alert.alert("Error", "Stock detail not found");
         navigation.goBack();
       }
     } catch (error: any) {
-      console.error("❌ Error loading stock detail:", error);
-      Alert.alert("Error", `Failed to load stock detail: ${error.message}`);
+      const errorMessage = error.message || error.toString() || "";
+      const is404Error =
+        errorMessage.includes("404") ||
+        errorMessage.includes("not found") ||
+        errorMessage.includes("Route GET /api/stock/item/");
+
+      if (is404Error) {
+        console.log(
+          `ℹ️ Stock item endpoint not found (404) - this endpoint may not be implemented yet`
+        );
+        Alert.alert(
+          "Stock Information",
+          `Stock detail endpoint is not available.\n\nItem: ${itemCode}\nWarehouse: ${warehouse}\n\nThis endpoint may not be implemented on the backend yet.`
+        );
+      } else {
+        console.error("❌ Error loading stock detail:", error);
+        Alert.alert("Error", `Failed to load stock detail: ${error.message}`);
+      }
       navigation.goBack();
     } finally {
       setLoading(false);
@@ -76,27 +138,11 @@ export default function StockDetailScreen() {
     if (!itemCode || !warehouse) return;
 
     try {
-      const response = await apiService.getStockTransactions({
-        item_code: itemCode,
-        warehouse: warehouse,
-      });
-
-      // Handle different response formats
-      let transactionsList: any[] = [];
-      if (Array.isArray(response)) {
-        transactionsList = response;
-      } else if (response && typeof response === "object") {
-        if (Array.isArray(response.data)) {
-          transactionsList = response.data;
-        } else if (Array.isArray(response.items)) {
-          transactionsList = response.items;
-        } else if (Array.isArray(response.transactions)) {
-          transactionsList = response.transactions;
-        }
-      }
-
-      setTransactions(transactionsList);
+      // TODO: Implement getStockTransactions API if needed
+      // For now, show empty transactions list
+      setTransactions([]);
       setShowTransactions(true);
+      console.log("ℹ️ Stock transactions API not yet implemented");
     } catch (error: any) {
       console.error("❌ Error loading transactions:", error);
       Alert.alert("Error", `Failed to load transactions: ${error.message}`);
@@ -104,48 +150,66 @@ export default function StockDetailScreen() {
   };
 
   const calculateTotals = () => {
-    const totalQty = stockDetails.reduce((sum, s) => sum + (s.qty || 0), 0);
-    const totalReserved = stockDetails.reduce(
-      (sum, s) => sum + (s.reserved_qty || 0),
+    const totalQty = stockDetails.reduce(
+      (sum, s) => sum + (s.total_qty || 0),
       0
     );
-    const totalAvailable = stockDetails.reduce(
-      (sum, s) => sum + (s.available_qty || 0),
+    const totalCartons = stockDetails.reduce(
+      (sum, s) => sum + (s.cartons?.length || 0),
       0
     );
-    return { totalQty, totalReserved, totalAvailable };
+    return { totalQty, totalCartons };
   };
 
-  const renderStockByBin = ({ item }: { item: StockLedger }) => {
+  const handleBinLocationPress = (binLocation: string) => {
+    if (expandedBinLocation === binLocation) {
+      setExpandedBinLocation(null);
+    } else {
+      setExpandedBinLocation(binLocation);
+    }
+  };
+
+  const renderStockByBin = ({ item }: { item: StockLocationGroup }) => {
+    const isExpanded = expandedBinLocation === item.bin_location;
+    const hasCartons = item.cartons && item.cartons.length > 0;
+
     return (
-      <View style={styles.binCard}>
+      <TouchableOpacity
+        style={styles.binCard}
+        onPress={() => handleBinLocationPress(item.bin_location)}
+        activeOpacity={0.7}
+      >
         <View style={styles.binHeader}>
-          <Text style={styles.binLocation}>
-            {item.bin_location || "No Bin"}
-          </Text>
-          <Text style={styles.binQty}>{item.qty} units</Text>
-        </View>
-        <View style={styles.binDetails}>
-          <View style={styles.binQtyRow}>
-            <View style={styles.binQtyItem}>
-              <Text style={styles.binQtyLabel}>Total</Text>
-              <Text style={styles.binQtyValue}>{item.qty}</Text>
-            </View>
-            <View style={styles.binQtyItem}>
-              <Text style={styles.binQtyLabel}>Reserved</Text>
-              <Text style={[styles.binQtyValue, { color: "#FF9800" }]}>
-                {item.reserved_qty}
+          <View style={styles.binLocationContainer}>
+            <Text style={styles.binLocation}>{item.bin_location}</Text>
+            {hasCartons && (
+              <Text style={styles.cartonCount}>
+                {item.cartons.length} carton
+                {item.cartons.length !== 1 ? "s" : ""}
               </Text>
-            </View>
-            <View style={styles.binQtyItem}>
-              <Text style={styles.binQtyLabel}>Available</Text>
-              <Text style={[styles.binQtyValue, { color: "#4CAF50" }]}>
-                {item.available_qty}
-              </Text>
-            </View>
+            )}
           </View>
+          <Text style={styles.binQty}>{item.total_qty} units</Text>
         </View>
-      </View>
+
+        {isExpanded && hasCartons && (
+          <View style={styles.cartonsContainer}>
+            <Text style={styles.cartonsTitle}>Cartons:</Text>
+            {item.cartons.map((carton, index) => (
+              <View key={index} style={styles.cartonItem}>
+                <Text style={styles.cartonId}>{carton.carton_id}</Text>
+                <Text style={styles.cartonQty}>{carton.qty} units</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {!hasCartons && (
+          <View style={styles.binDetails}>
+            <Text style={styles.noCartonsText}>No cartons available</Text>
+          </View>
+        )}
+      </TouchableOpacity>
     );
   };
 
@@ -174,9 +238,7 @@ export default function StockDetailScreen() {
           </Text>
         </View>
         <View style={styles.transactionDetails}>
-          <Text style={styles.transactionRef}>
-            Ref: {item.reference_doc}
-          </Text>
+          <Text style={styles.transactionRef}>Ref: {item.reference_doc}</Text>
           {item.wms_transaction_title && (
             <Text style={styles.transactionRef}>
               WMS: {item.wms_transaction_title}
@@ -189,9 +251,7 @@ export default function StockDetailScreen() {
             {item.before_qty} → {item.after_qty}
           </Text>
           {item.performed_by && (
-            <Text style={styles.transactionRef}>
-              By: {item.performed_by}
-            </Text>
+            <Text style={styles.transactionRef}>By: {item.performed_by}</Text>
           )}
         </View>
       </View>
@@ -221,7 +281,7 @@ export default function StockDetailScreen() {
     );
   }
 
-  const { totalQty, totalReserved, totalAvailable } = calculateTotals();
+  const { totalQty, totalCartons } = calculateTotals();
 
   return (
     <ScrollView style={styles.container}>
@@ -238,45 +298,13 @@ export default function StockDetailScreen() {
             <Text style={styles.summaryValue}>{totalQty}</Text>
           </View>
           <View style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>Reserved:</Text>
-            <Text style={[styles.summaryValue, { color: "#FF9800" }]}>
-              {totalReserved}
-            </Text>
-          </View>
-          <View style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>Available:</Text>
-            <Text style={[styles.summaryValue, { color: "#4CAF50" }]}>
-              {totalAvailable}
-            </Text>
-          </View>
-          <View style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>Bins:</Text>
+            <Text style={styles.summaryLabel}>Bin Locations:</Text>
             <Text style={styles.summaryValue}>{stockDetails.length}</Text>
           </View>
-          {stockDetails[0]?.last_transaction_date && (
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Last Transaction:</Text>
-              <Text style={styles.summaryValue}>
-                {new Date(stockDetails[0].last_transaction_date).toLocaleDateString()}
-              </Text>
-            </View>
-          )}
-          {stockDetails[0]?.last_transaction_type && (
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Last Transaction Type:</Text>
-              <Text style={styles.summaryValue}>
-                {stockDetails[0].last_transaction_type}
-              </Text>
-            </View>
-          )}
-          {stockDetails[0]?.last_transaction_ref && (
-            <View style={styles.summaryRow}>
-              <Text style={styles.summaryLabel}>Last Transaction Ref:</Text>
-              <Text style={styles.summaryValue}>
-                {stockDetails[0].last_transaction_ref}
-              </Text>
-            </View>
-          )}
+          <View style={styles.summaryRow}>
+            <Text style={styles.summaryLabel}>Total Cartons:</Text>
+            <Text style={styles.summaryValue}>{totalCartons}</Text>
+          </View>
         </View>
       </View>
 
@@ -286,9 +314,7 @@ export default function StockDetailScreen() {
         </Text>
         <FlatList
           data={stockDetails}
-          keyExtractor={(item, index) =>
-            `${item.bin_location || "no-bin"}-${index}`
-          }
+          keyExtractor={(item, index) => `${item.bin_location}-${index}`}
           renderItem={renderStockByBin}
           scrollEnabled={false}
         />
@@ -316,7 +342,9 @@ export default function StockDetailScreen() {
             ) : (
               <FlatList
                 data={transactions}
-                keyExtractor={(item) => item.transaction_id}
+                keyExtractor={(item, index) =>
+                  item.transaction_id || `transaction-${index}`
+                }
                 renderItem={renderTransaction}
                 scrollEnabled={false}
               />
@@ -430,14 +458,62 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 8,
   },
+  binLocationContainer: {
+    flex: 1,
+  },
   binLocation: {
     fontSize: 16,
     fontWeight: "bold",
     color: "#333",
+    marginBottom: 4,
+  },
+  cartonCount: {
+    fontSize: 12,
+    color: "#666",
   },
   binQty: {
     fontSize: 14,
+    fontWeight: "bold",
+    color: "#4CAF50",
+  },
+  cartonsContainer: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#E0E0E0",
+  },
+  cartonsTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#333",
+    marginBottom: 8,
+  },
+  cartonItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    backgroundColor: "#F5F5F5",
+    borderRadius: 4,
+    marginBottom: 4,
+  },
+  cartonId: {
+    fontSize: 13,
+    fontWeight: "500",
+    color: "#333",
+    flex: 1,
+  },
+  cartonQty: {
+    fontSize: 13,
     color: "#666",
+    marginLeft: 8,
+  },
+  noCartonsText: {
+    fontSize: 13,
+    color: "#999",
+    fontStyle: "italic",
+    marginTop: 8,
   },
   binDetails: {
     marginTop: 8,
@@ -515,4 +591,3 @@ const styles = StyleSheet.create({
     fontStyle: "italic",
   },
 });
-

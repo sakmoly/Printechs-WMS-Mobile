@@ -12,6 +12,7 @@ import { useNavigation } from "@react-navigation/native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApp } from "../context/AppContext";
 import { StatusBadge } from "../components/StatusBadge";
+import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { runAutomatedTest } from "../utils/automated-test";
 import { testAllCartonsInASN } from "../utils/test-all-cartons";
 import { runASNFormatCorrectionTest } from "../utils/test-asn-format-correction";
@@ -52,10 +53,11 @@ export default function HomeScreen() {
       }}
       edges={["top"]}
     >
-      <ScrollView 
-        style={styles.container}
-        contentContainerStyle={styles.scrollContent}
-      >
+      <View style={{ flex: 1 }}>
+        <ScrollView 
+          style={{ flex: 1 }}
+          contentContainerStyle={styles.scrollContent}
+        >
         <View style={styles.banner}>
         <Text style={styles.bannerTitle}>Active Session</Text>
         {activeASN ? (
@@ -378,7 +380,7 @@ export default function HomeScreen() {
           onPress={() => {
             Alert.alert(
               "Clear All Transaction Data",
-              "This will permanently delete ALL transaction data:\n\n• All events\n• All scanned items\n• All workflow states\n• All carton statuses\n• All boxes\n• All transfer cartons\n• All cartons (CTN)\n• All ASN data\n• All transfer orders\n• Active ASN and session\n\nMaster data will also be cleared:\n• Items, users, warehouses, locations\n\n⚠️ Master data will be automatically repopulated from backend during next sync.\n\nThis action cannot be undone!\n\nSettings and demo data structure will be preserved.\n\nAre you sure?",
+              "This will permanently delete ALL transaction data:\n\n• All events\n• All scanned items\n• All workflow states\n• All carton statuses\n• All boxes\n• All transfer cartons\n• All cartons (CTN)\n• All ASN data\n• All transfer orders\n• All transfer in data\n• All material requests\n• All cycle count sessions\n• All cycle count lines\n• All cycle count cache\n• All stock ledger cache\n• All stock transactions\n• All putaway items\n• All inbound sessions\n• Active ASN and session\n\nMaster data will also be cleared:\n• Items, users, warehouses, locations\n• Bins, item barcode maps\n• Warehouse racks\n\n⚠️ Master data will be automatically repopulated from backend during next sync.\n\nThis action cannot be undone!\n\nSettings and demo data structure will be preserved.\n\nAre you sure?",
               [
                 { text: "Cancel", style: "cancel" },
                 {
@@ -431,16 +433,19 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
       </ScrollView>
+      <ScreenFooterFrame />
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
+    // Remove flex: 1 to allow footer to be visible
   },
   scrollContent: {
     flexGrow: 1,
+    paddingBottom: 40, // Add padding to account for footer frame
   },
   banner: {
     backgroundColor: "#007AFF",

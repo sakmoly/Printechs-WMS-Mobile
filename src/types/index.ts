@@ -62,6 +62,7 @@ export interface ScanEvent {
     | "RECEIVE_ITEM_SCAN"
     | "SORT_TO_BOX"
     | "PACK_BOX_TO_TC"
+    | "PACK_ITEM_TO_TC"
     | "TC_DISPATCH"
     | "PUTAWAY_ITEM_SCAN"
     | "PUTAWAY_TO_BOX"

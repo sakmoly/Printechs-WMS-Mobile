@@ -17,7 +17,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import { dataService } from "../services/data.service";
 import { apiService } from "../services/api.service";
-import { addEvent, syncEvents } from "../services/event-queue.service";
+import { addEvent, syncEvents, markEventSynced } from "../services/event-queue.service";
 import { getSettings } from "../services/settings.service";
 import { normalizeASN } from "../utils/asn";
 import { TransferCarton } from "../types";
@@ -750,6 +750,16 @@ export default function PutAwayScreen() {
               (tcObj as any).transfer_in = transferIn;
               (tcObj as any).warehouse = task.warehouse;
               
+              // ✅ FIX: Store task lines/items if available in list response
+              // This avoids needing to fetch full task details later
+              if (task.lines && Array.isArray(task.lines)) {
+                (tcObj as any).task_lines = task.lines;
+                console.warn(`📋 [CARTON_ID_TRACK] Stored ${task.lines.length} line(s) from task list for ${taskId}`);
+              } else if (task.items && Array.isArray(task.items)) {
+                (tcObj as any).task_lines = task.items;
+                console.warn(`📋 [CARTON_ID_TRACK] Stored ${task.items.length} item(s) from task list for ${taskId}`);
+              }
+              
               backendPutawayTasks.push(tcObj);
               console.warn(`✅ PutAwayScreen: Added Transfer In putaway task ${taskId} (transfer_in: ${transferIn}, task_status: ${task.status})`);
             }
@@ -1219,6 +1229,612 @@ export default function PutAwayScreen() {
       setLoading(false);
     }
   }, []);
+
+  // ✅ NEW: Verify putaway transaction status from backend
+  // This checks if the transaction was actually processed on backend, even if sync failed
+  const verifyPutawayTransactionFromBackend = async (
+    tcId: string,
+    locationId: string,
+    asnNo?: string
+  ): Promise<boolean> => {
+    try {
+      const settings = await getSettings();
+      if (!settings.api_url || settings.demo_mode === 1) {
+        console.log(`ℹ️ Cannot verify from backend - API not configured or demo mode`);
+        return false;
+      }
+
+      // Check if we're online
+      const { isDeviceOnline } = await import("../utils/network-check");
+      const online = await isDeviceOnline();
+      if (!online) {
+        console.log(`ℹ️ Cannot verify from backend - device is offline`);
+        return false;
+      }
+
+      // Try to verify by checking putaway tasks or events
+      // We can check if a putaway task exists with this TC and location
+      try {
+        const tasks = await apiService.getPutawayTasks({
+          asn_no: asnNo,
+          status: "Completed,In Progress",
+        });
+
+        const taskArray = Array.isArray(tasks) ? tasks : (tasks?.data || []);
+        
+        // Check if any task matches this TC and location
+        const matchingTask = taskArray.find((task: any) => {
+          const taskBoxId = task.box_id || task.tc_id || task.transfer_carton_id;
+          const taskLocation = task.location_id || task.rack_id || task.bin_id;
+          
+          return (
+            (taskBoxId && taskBoxId.toUpperCase() === tcId.toUpperCase()) &&
+            (taskLocation && taskLocation.toUpperCase() === locationId.toUpperCase())
+          );
+        });
+
+        if (matchingTask) {
+          console.log(`✅ Verified putaway transaction in backend: TC ${tcId} at ${locationId}`);
+          return true;
+        }
+
+        console.log(`ℹ️ Putaway transaction not found in backend tasks: TC ${tcId} at ${locationId}`);
+        return false;
+      } catch (verifyError: any) {
+        console.warn(`⚠️ Error verifying putaway transaction from backend:`, verifyError.message);
+        return false;
+      }
+    } catch (error: any) {
+      console.warn(`⚠️ Error verifying putaway transaction:`, error.message);
+      return false;
+    }
+  };
+
+  // ✅ NEW: Retry and verify putaway transaction
+  // Syncs the event and verifies from backend before marking as synced
+  const handleRetryPutawayTransaction = async (transaction: PutAwayTransaction) => {
+    if (!transaction || !transaction.offline_uuid) {
+      Alert.alert("Error", "Invalid transaction data");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const settings = await getSettings();
+      const db = await getDatabase();
+
+      if (!db) {
+        Alert.alert("Error", "Database not initialized");
+        return;
+      }
+
+      // Step 1: Sync events to backend
+      console.log(`🔄 Retrying sync for putaway transaction: ${transaction.tc_id}`);
+      const syncResult = await syncEvents();
+      console.log(`✅ Sync result: ${syncResult.synced} synced, ${syncResult.failed} failed`);
+
+      // Step 2: Verify from backend if transaction was processed
+      const locationId = transaction.rack || transaction.tc_id || "";
+      const isVerified = await verifyPutawayTransactionFromBackend(
+        transaction.tc_id,
+        locationId,
+        transaction.asn_no
+      );
+
+      if (isVerified) {
+        // ✅ Backend confirmed - mark as synced
+        await markEventSynced(transaction.offline_uuid);
+        console.log(`✅ Transaction ${transaction.tc_id} verified and marked as synced`);
+
+        // Also check and mark PUTAWAY_DISPATCH event if exists
+        const dispatchEvent = await db.getFirstAsync<{ offline_uuid: string }>(
+          `SELECT offline_uuid FROM event_queue 
+           WHERE event_type = 'PUTAWAY_DISPATCH' 
+             AND tc_id = ? 
+             AND synced = 0 
+           LIMIT 1`,
+          [transaction.tc_id]
+        );
+
+        if (dispatchEvent) {
+          await markEventSynced(dispatchEvent.offline_uuid);
+          console.log(`✅ Dispatch event also marked as synced for TC ${transaction.tc_id}`);
+        }
+
+        // Update TC status to "Completed" if not already
+        const tcStatus = await db.getFirstAsync<{ status: string }>(
+          "SELECT status FROM tc_cache WHERE tc_id = ?",
+          [transaction.tc_id]
+        );
+
+        if (tcStatus && tcStatus.status !== "Completed") {
+          await dataService.updateTransferCartonStatus(transaction.tc_id, "Completed");
+          console.log(`✅ TC ${transaction.tc_id} status updated to Completed`);
+        }
+
+        Alert.alert(
+          "Success",
+          `Putaway transaction verified and completed.\n\nTC: ${transaction.tc_id}\nLocation: ${transaction.rack}\n\nStatus updated in local database.`
+        );
+
+        // Reload transactions to refresh the list
+        await loadTransactions();
+      } else {
+        // Backend doesn't confirm - check if event was synced anyway
+        const event = await db.getFirstAsync<{ synced: number }>(
+          "SELECT synced FROM event_queue WHERE offline_uuid = ?",
+          [transaction.offline_uuid]
+        );
+
+        if (event && event.synced === 1) {
+          // Event was synced but backend doesn't show it - might be pending processing
+          Alert.alert(
+            "Partial Success",
+            `Event synced to backend but verification pending.\n\nTC: ${transaction.tc_id}\nLocation: ${transaction.rack}\n\nBackend may still be processing the transaction. Please check again later.`
+          );
+          await loadTransactions();
+        } else {
+          // Event still not synced
+          Alert.alert(
+            "Sync Failed",
+            `Could not sync or verify putaway transaction.\n\nTC: ${transaction.tc_id}\nLocation: ${transaction.rack}\n\nPlease ensure you're online and try again.`
+          );
+        }
+      }
+    } catch (error: any) {
+      console.error(`❌ Error retrying putaway transaction:`, error);
+      Alert.alert("Error", error.message || "Failed to retry putaway transaction");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ✅ NEW: Update stock for synced putaway transaction
+  // This ensures stock is updated in backend even if the transaction was synced but not completed
+  const handleUpdateStockForPutaway = async (transaction: PutAwayTransaction) => {
+    if (!transaction || !transaction.tc_id) {
+      Alert.alert("Error", "Invalid transaction data");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const settings = await getSettings();
+      const db = await getDatabase();
+
+      if (!db) {
+        Alert.alert("Error", "Database not initialized");
+        return;
+      }
+
+      // Check if we're online
+      const { isDeviceOnline } = await import("../utils/network-check");
+      const online = await isDeviceOnline();
+      if (!online) {
+        Alert.alert("Offline", "Please ensure you're online to update stock in backend.");
+        return;
+      }
+
+      const tcId = transaction.tc_id;
+      const locationId = transaction.rack || "";
+      const asnNo = transaction.asn_no || "";
+
+      console.log(`🔄 Updating stock for putaway transaction: TC ${tcId} at ${locationId}`);
+
+      // Step 1: Try to find putaway task for this TC
+      let putawayTask: string | null = null;
+      let taskDetails: any = null;
+      try {
+        // First, try to find task by searching for tasks with matching TC/box ID
+        const tasks = await apiService.getPutawayTasks({
+          asn_no: asnNo,
+          status: "In Progress,Completed",
+        });
+
+        const taskArray = Array.isArray(tasks) ? tasks : (tasks?.data || []);
+        
+        console.log(`📋 Found ${taskArray.length} putaway task(s) for ASN ${asnNo || 'all'}`);
+        if (taskArray.length > 0) {
+          console.log(`📋 Sample task data:`, {
+            title: taskArray[0].title || taskArray[0].putaway_task || taskArray[0].id,
+            box_id: taskArray[0].box_id || taskArray[0].tc_id || taskArray[0].transfer_carton_id,
+            status: taskArray[0].status,
+            asn_no: taskArray[0].asn_no || taskArray[0].advance_shipping_notice,
+          });
+        }
+        
+        // Find task matching this TC
+        // Strategy 1: Match by box_id/tc_id directly
+        // Strategy 2: Match by carton_id prefix (e.g., PAW-ASN365425473-SKU-HAT-301-BLU-OS starts with PAW-ASN365425473-)
+        // Strategy 3: Match by checking all tasks with "In Progress" status (if no direct match)
+        let matchingTask = taskArray.find((task: any) => {
+          const taskBoxId = task.box_id || task.tc_id || task.transfer_carton_id || "";
+          
+          // Direct match by box_id/tc_id
+          if (taskBoxId && taskBoxId.toUpperCase() === tcId.toUpperCase()) {
+            return true;
+          }
+          
+          // Match by TC ID prefix (e.g., if TC is PAW-ASN365425473-1768132558343, match tasks with box_id starting with PAW-ASN365425473-)
+          const tcIdPrefix = tcId.split('-').slice(0, -1).join('-'); // Remove last segment (timestamp)
+          if (tcIdPrefix && taskBoxId.toUpperCase().startsWith(tcIdPrefix.toUpperCase())) {
+            return true;
+          }
+          
+          return false;
+        });
+
+        // If not found, try matching by status and ASN (fallback for tasks without box_id)
+        // Since we can't fetch individual task details (getPutawayTask endpoint doesn't exist),
+        // we'll try to match by ASN and "In Progress" status
+        if (!matchingTask && taskArray.length > 0) {
+          console.log(`ℹ️ No direct match found, trying fallback matching for TC ${tcId}...`);
+          
+          // Find tasks with matching ASN and "In Progress" status
+          // This is a best-effort match when box_id/tc_id isn't available in list response
+          const inProgressTasks = taskArray.filter((task: any) => {
+            const taskStatus = (task.status || "").toUpperCase();
+            const taskASN = task.asn_no || task.advance_shipping_notice || "";
+            return taskStatus === "IN PROGRESS" && taskASN.toUpperCase() === (asnNo || "").toUpperCase();
+          });
+          
+          if (inProgressTasks.length === 1) {
+            // Only one matching task - likely the correct one
+            matchingTask = inProgressTasks[0];
+            console.log(`✅ Found matching task by ASN and status: ${matchingTask.title || matchingTask.putaway_task || matchingTask.id}`);
+          } else if (inProgressTasks.length > 1) {
+            // Multiple matching tasks - can't determine which one
+            console.warn(`⚠️ Found ${inProgressTasks.length} tasks with matching ASN and status - cannot determine which one matches TC ${tcId}`);
+          }
+        }
+
+        if (matchingTask) {
+          putawayTask = matchingTask.title || matchingTask.putaway_task || matchingTask.id || null;
+          console.log(`✅ Found putaway task: ${putawayTask}`);
+          
+          // Use task details from the matching task if available
+          // Note: The singular getPutawayTask endpoint might not exist on backend
+          // So we use the task data from the list response instead
+          taskDetails = matchingTask;
+          console.log(`✅ Using task data from list for ${putawayTask}:`, {
+            status: taskDetails?.status || taskDetails?.data?.status,
+            box_id: taskDetails?.box_id || taskDetails?.tc_id,
+          });
+          
+          // Note: We don't try to get full task details since getPutawayTask endpoint doesn't exist
+          // We use the task data from the list response instead
+          // Items will be retrieved from local DB
+        } else {
+          console.warn(`⚠️ No putaway task found for TC ${tcId}`);
+        }
+      } catch (taskError: any) {
+        console.warn(`⚠️ Error fetching putaway tasks:`, taskError.message);
+      }
+
+      if (!putawayTask) {
+        Alert.alert(
+          "No Putaway Task",
+          `No putaway task found for TC ${tcId}.\n\nStock update requires a putaway task. The transaction may have been completed without a task.\n\nPlease contact administrator to update stock manually.`
+        );
+        return;
+      }
+
+      // Check task status - if already completed, no need to update
+      const taskStatus = taskDetails?.status || taskDetails?.data?.status || "";
+      if (taskStatus && taskStatus.toUpperCase() === "COMPLETED") {
+        Alert.alert(
+          "Already Completed",
+          `Putaway task ${putawayTask} is already completed.\n\nTC: ${tcId}\nLocation: ${locationId}\n\nStock should already be updated in backend.`
+        );
+        return;
+      }
+
+      // Step 2: Get items - prefer from task details (more accurate), fallback to local DB
+      let items: Array<{
+        item_code: string;
+        qty: number;
+        carton_id?: string;
+        location_id?: string;
+        source_bin?: string;
+        target_bin?: string;
+        completed?: boolean;
+      }> = [];
+
+      // Try to get items from task details first (more reliable)
+      if (taskDetails && (taskDetails.lines || taskDetails.data?.lines)) {
+        const taskLines = taskDetails.lines || taskDetails.data?.lines || [];
+        if (taskLines.length > 0) {
+          console.warn(`📋 [CARTON_ID_TRACK] Getting items from task details. Task lines count: ${taskLines.length}`);
+          items = taskLines.map((line: any) => {
+            const item = {
+              item_code: line.item_code || line.itemCode || line.item,
+              qty: Number(line.qty || line.quantity || 0),
+              // ✅ FIX: Use scanned carton_id if available, otherwise use line's carton_id
+              carton_id: selectedCartonOrItem || line.carton_id || line.cartonId || null,
+              location_id: locationId || line.location_id || line.locationId,
+              source_bin: "DOCK-01",
+              target_bin: locationId || line.target_bin || line.targetBin,
+              completed: true,
+            };
+            console.warn(`📋 [CARTON_ID_TRACK] Item from task line: ${item.item_code}, carton_id from line: ${line.carton_id || line.cartonId || 'null'}, final carton_id: ${item.carton_id || 'null'}`);
+            return item;
+          }).filter((item: any) => item.item_code && item.qty > 0);
+
+          console.log(`✅ Found ${items.length} item(s) from task details for ${putawayTask}`);
+          console.warn(`📋 [CARTON_ID_TRACK] Items from task details summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+          
+          // ✅ FIX: For items missing carton_id, look up box_id from scanned_items
+          // This is critical for Transfer In items that were put into BOXes
+          const itemsMissingCartonId = items.filter((item: any) => !item.carton_id);
+          console.warn(`📋 [CARTON_ID_TRACK] Checking for missing carton_id. Total items: ${items.length}, Missing carton_id: ${itemsMissingCartonId.length}`);
+          if (itemsMissingCartonId.length > 0) {
+            console.warn(`📋 [CARTON_ID_TRACK] Items missing carton_id:`, itemsMissingCartonId.map(i => i.item_code));
+          }
+          if (itemsMissingCartonId.length > 0 && db) {
+            console.warn(`⚠️ Found ${itemsMissingCartonId.length} item(s) without carton_id, looking up box_id from scanned_items...`);
+            console.warn(`📋 [CARTON_ID_TRACK] Starting box_id lookup for TC: ${tcId}, ASN: ${asnNo}`);
+            
+            try {
+              // Get boxes that were packed into this TC
+              const packedBoxes = await db.getAllAsync<{ box_id: string }>(
+                `SELECT DISTINCT box_id 
+                 FROM event_queue 
+                 WHERE event_type = 'PACK_BOX_TO_TC' 
+                   AND tc_id = ? 
+                   AND box_id IS NOT NULL 
+                   AND box_id != ''`,
+                [tcId]
+              );
+              
+              if (packedBoxes.length > 0) {
+                const boxIds = packedBoxes.map(b => b.box_id);
+                const placeholders = boxIds.map(() => '?').join(',');
+                const itemCodes = itemsMissingCartonId.map((i: any) => i.item_code);
+                const itemPlaceholders = itemCodes.map(() => '?').join(',');
+                
+                // Look up box_id for items missing carton_id
+                const boxIdLookup = await db.getAllAsync<{
+                  item_code: string;
+                  box_id: string;
+                }>(
+                  `SELECT DISTINCT item_code, box_id
+                   FROM scanned_items
+                   WHERE box_id IN (${placeholders})
+                     AND item_code IN (${itemPlaceholders})
+                     AND asn_no = ?
+                   GROUP BY item_code, box_id`,
+                  [...boxIds, ...itemCodes, asnNo || '']
+                );
+                
+                // Create a map of item_code -> box_id (use first box_id found for each item)
+                const boxIdMap = new Map<string, string>();
+                for (const lookup of boxIdLookup) {
+                  if (!boxIdMap.has(lookup.item_code)) {
+                    boxIdMap.set(lookup.item_code, lookup.box_id);
+                  }
+                }
+                
+                // Update items with box_id as carton_id
+                console.warn(`📋 [CARTON_ID_TRACK] Box ID lookup results:`, Array.from(boxIdMap.entries()).map(([code, boxId]) => ({ item_code: code, box_id: boxId })));
+                for (const item of items) {
+                  if (!item.carton_id && boxIdMap.has(item.item_code)) {
+                    const foundBoxId = boxIdMap.get(item.item_code);
+                    item.carton_id = foundBoxId;
+                    console.warn(`📦 [CARTON_ID_TRACK] ✅ Added box_id as carton_id for item ${item.item_code}: ${foundBoxId}`);
+                  } else if (!item.carton_id) {
+                    console.warn(`📦 [CARTON_ID_TRACK] ❌ No box_id found for item ${item.item_code} in lookup map`);
+                  }
+                }
+                console.warn(`📋 [CARTON_ID_TRACK] After box_id lookup, items status:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'STILL MISSING' })));
+              } else {
+                // No boxes found - might be a Putaway box (BOX ID = TC ID)
+                // Check if items are in scanned_items with tcId as box_id
+                const itemCodes = itemsMissingCartonId.map((i: any) => i.item_code);
+                const itemPlaceholders = itemCodes.map(() => '?').join(',');
+                
+                const directBoxIdLookup = await db.getAllAsync<{
+                  item_code: string;
+                  box_id: string;
+                }>(
+                  `SELECT DISTINCT item_code, box_id
+                   FROM scanned_items
+                   WHERE box_id = ?
+                     AND item_code IN (${itemPlaceholders})
+                     AND asn_no = ?
+                   GROUP BY item_code, box_id`,
+                  [tcId, ...itemCodes, asnNo || '']
+                );
+                
+                if (directBoxIdLookup.length > 0) {
+                  console.warn(`📋 [CARTON_ID_TRACK] Direct box_id lookup found ${directBoxIdLookup.length} record(s) for Putaway box ${tcId}`);
+                  // Use TC ID as carton_id for Putaway boxes
+                  for (const item of items) {
+                    if (!item.carton_id && directBoxIdLookup.some(l => l.item_code === item.item_code)) {
+                      item.carton_id = tcId; // BOX ID = TC ID for Putaway boxes
+                      console.warn(`📦 [CARTON_ID_TRACK] ✅ Added BOX ID (${tcId}) as carton_id for item ${item.item_code} in Putaway box`);
+                    } else if (!item.carton_id) {
+                      console.warn(`📦 [CARTON_ID_TRACK] ❌ Item ${item.item_code} not found in directBoxIdLookup for Putaway box ${tcId}`);
+                    }
+                  }
+                  console.warn(`📋 [CARTON_ID_TRACK] After Putaway box lookup, items status:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'STILL MISSING' })));
+                } else {
+                  console.warn(`📋 [CARTON_ID_TRACK] ❌ No direct box_id lookup results for Putaway box ${tcId}`);
+                }
+              }
+            } catch (lookupError: any) {
+              console.warn(`⚠️ Error looking up box_id for items:`, lookupError.message);
+              // Continue without box_id - backend will reject if required
+            }
+          }
+        }
+      }
+
+      // Fallback: Get items from local scanned_items if task details don't have items
+      if (items.length === 0) {
+        try {
+        // Get boxes that were packed into this TC
+        const packedBoxes = await db.getAllAsync<{ box_id: string }>(
+          `SELECT DISTINCT box_id 
+           FROM event_queue 
+           WHERE event_type = 'PACK_BOX_TO_TC' 
+             AND tc_id = ? 
+             AND box_id IS NOT NULL 
+             AND box_id != ''`,
+          [tcId]
+        );
+
+        if (packedBoxes.length > 0) {
+          // Get scanned items from those boxes
+          const boxIds = packedBoxes.map(b => b.box_id);
+          const placeholders = boxIds.map(() => '?').join(',');
+          
+          // ✅ FIX: Get box_id along with items to include as carton_id
+          const scannedItems = await db.getAllAsync<{
+            item_code: string;
+            scanned_qty: number;
+            box_id: string;
+          }>(
+            `SELECT item_code, SUM(scanned_qty) as scanned_qty, box_id
+             FROM scanned_items
+             WHERE box_id IN (${placeholders})
+               AND asn_no = ?
+             GROUP BY item_code, box_id
+             HAVING scanned_qty > 0`,
+            [...boxIds, asnNo || '']
+          );
+
+          // ✅ FIX: Track box_id per item for Transfer In items (box_id needs to be sent as carton_id)
+          const itemBoxMap = new Map<string, { qty: number; box_id: string }[]>();
+          for (const item of scannedItems) {
+            const key = item.item_code;
+            if (!itemBoxMap.has(key)) {
+              itemBoxMap.set(key, []);
+            }
+            const itemList = itemBoxMap.get(key)!;
+            const existingBox = itemList.find(b => b.box_id === item.box_id);
+            if (existingBox) {
+              existingBox.qty += item.scanned_qty || 0;
+            } else {
+              itemList.push({ qty: item.scanned_qty || 0, box_id: item.box_id });
+            }
+          }
+
+          items = Array.from(itemBoxMap.entries()).map(([item_code, boxList]) => {
+            const totalQty = boxList.reduce((sum, b) => sum + b.qty, 0);
+            const primaryBoxId = boxList[0]?.box_id;
+            const item: any = {
+              item_code,
+              qty: Number(totalQty.toFixed(2)),
+              location_id: locationId,
+              source_bin: "DOCK-01",
+              target_bin: locationId,
+              completed: true,
+            };
+            // ✅ FIX: Include box_id as carton_id for Transfer In items from BOXes
+            if (primaryBoxId) {
+              item.carton_id = primaryBoxId;
+              console.warn(`📦 [CARTON_ID_TRACK] ✅ Including box_id as carton_id for item ${item_code}: ${primaryBoxId}`);
+            } else {
+              console.warn(`📦 [CARTON_ID_TRACK] ❌ No primaryBoxId found for item ${item_code} from fallback boxes`);
+            }
+            return item;
+          });
+          
+          console.warn(`📋 [CARTON_ID_TRACK] Fallback items from boxes summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+
+          console.log(`✅ Found ${items.length} item(s) from boxes for TC ${tcId}`);
+        } else {
+          // No boxes found - might be a Putaway box (BOX ID = TC ID)
+          const directItems = await db.getAllAsync<{
+            item_code: string;
+            scanned_qty: number;
+          }>(
+            `SELECT item_code, SUM(scanned_qty) as scanned_qty
+             FROM scanned_items
+             WHERE box_id = ?
+               AND asn_no = ?
+             GROUP BY item_code
+             HAVING scanned_qty > 0`,
+            [tcId, asnNo || '']
+          );
+
+          items = directItems.map(item => {
+            const itemObj: any = {
+              item_code: item.item_code,
+              qty: Number((item.scanned_qty || 0).toFixed(2)),
+              location_id: locationId,
+              source_bin: "DOCK-01",
+              target_bin: locationId,
+              completed: true,
+            };
+            // ✅ FIX: Include BOX ID as carton_id for Putaway boxes (BOX ID = TC ID)
+            if (tcId) {
+              itemObj.carton_id = tcId;
+              console.warn(`📦 [CARTON_ID_TRACK] ✅ Including BOX ID (${tcId}) as carton_id for item ${item.item_code} in Putaway box (fallback)`);
+            } else {
+              console.warn(`📦 [CARTON_ID_TRACK] ❌ tcId is null, cannot set carton_id for item ${item.item_code} in fallback`);
+            }
+            return itemObj;
+          });
+          
+          console.warn(`📋 [CARTON_ID_TRACK] Fallback direct items summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+
+          console.log(`✅ Found ${items.length} item(s) directly from scanned_items for TC ${tcId}`);
+        }
+        } catch (itemsError: any) {
+          console.warn(`⚠️ Error getting items:`, itemsError.message);
+          Alert.alert(
+            "Warning",
+            `Could not retrieve items for stock update.\n\nItems: ${itemsError.message}\n\nWill try to update without items array.`
+          );
+        }
+      }
+
+      // Step 3: Call completePutaway API to update stock
+      try {
+        const requestBody: any = {
+          putaway_task: putawayTask,
+          completed_by: settings.user_id || settings.user_code || undefined,
+          performed_by: settings.user_id || settings.user_code || undefined,
+          location_id: locationId,
+        };
+
+        if (items.length > 0) {
+          requestBody.items = items;
+          console.log(`📤 Sending ${items.length} item(s) to complete putaway:`, JSON.stringify(items, null, 2));
+        } else {
+          console.warn(`⚠️ No items found - sending completion without items array`);
+        }
+
+        const response = await apiService.completePutaway(requestBody);
+        console.log(`✅ Putaway completion API response:`, JSON.stringify(response).substring(0, 500));
+
+        // Step 4: Completion API called successfully
+        // Note: We don't verify completion since getPutawayTask endpoint doesn't exist
+        // The completion API should update the task status to "Completed" and update stock
+        Alert.alert(
+          "Success",
+          `Completion API called successfully!\n\nTC: ${tcId}\nLocation: ${locationId}\nPutaway Task: ${putawayTask}\nItems: ${items.length}\n\nStock should now be updated in backend. Please check backend to verify task status is "Completed".`
+        );
+
+        // Reload transactions to refresh status
+        await loadTransactions();
+      } catch (apiError: any) {
+        console.error(`❌ Error updating stock:`, apiError);
+        
+        const errorMessage = apiError.message || apiError.toString() || "Unknown error";
+        Alert.alert(
+          "Stock Update Failed",
+          `Failed to update stock in backend.\n\nError: ${errorMessage}\n\nTC: ${tcId}\nLocation: ${locationId}\n\nPlease check backend logs or contact administrator.`
+        );
+      }
+    } catch (error: any) {
+      console.error(`❌ Error updating stock for putaway:`, error);
+      Alert.alert("Error", error.message || "Failed to update stock for putaway transaction");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Load sealed TCs when screen is focused
   useFocusEffect(
@@ -1713,10 +2329,19 @@ export default function PutAwayScreen() {
           
           // For Transfer In tasks with putaway_task, simplified workflow:
           // Only send putaway_task and location_id - backend assigns location to all items
+          // BUT: If user scanned a carton_id, include it so backend can update carton_id in putaway lines
           if (isTransferIn) {
-            // Simplified workflow: Just putaway_task + location_id (no carton/item needed)
-            console.warn(`🔄 Assigning location ${locationIdUpper} to all items in Transfer In putaway task ${putawayTask}`);
-            // Don't send carton_id or item_code - backend handles all items automatically
+            // ✅ FIX: Include carton_id if user scanned it (for Transfer In putaway)
+            if (selectedCartonOrItem) {
+              requestBody.carton_id = selectedCartonOrItem;
+              console.warn(`🔄 Assigning location ${locationIdUpper} to carton ${selectedCartonOrItem} in Transfer In putaway task ${putawayTask}`);
+            } else if (selectedItemCode) {
+              requestBody.item_code = selectedItemCode;
+              console.warn(`🔄 Assigning location ${locationIdUpper} to item ${selectedItemCode} in Transfer In putaway task ${putawayTask}`);
+            } else {
+              // No carton/item scanned - backend assigns location to all items in task
+              console.warn(`🔄 Assigning location ${locationIdUpper} to all items in Transfer In putaway task ${putawayTask}`);
+            }
           } else {
             // For ASN tasks, we might still need carton/item info
             if (selectedCartonOrItem) {
@@ -1830,6 +2455,8 @@ export default function PutAwayScreen() {
         asn_no: normalizedASN,
         inbound_session: session,
         tc_id: selectedTC,
+        carton_id: selectedCartonOrItem || undefined, // ✅ FIX: Include carton_id if scanned
+        item_code: selectedItemCode || undefined, // ✅ FIX: Include item_code if scanned (for loose items)
         rack: rack,
         bin: bin,
         device_id: settings.device_id,
@@ -1891,6 +2518,18 @@ export default function PutAwayScreen() {
       const session = activeSession || settings?.active_session || "";
       const db = await getDatabase();
       
+      // ✅ FIX: Get putaway_task from selectedTCObj (not state variable)
+      // The putaway_task is stored in the TC object when tasks are loaded
+      const currentPutawayTask = (selectedTCObj as any).putaway_task || putawayTask || null;
+      
+      // ✅ TRACK: Log initial state
+      console.warn(`📋 [CARTON_ID_TRACK] ========== START PUTAWAY COMPLETION ==========`);
+      console.warn(`📋 [CARTON_ID_TRACK] TC: ${selectedTC}`);
+      console.warn(`📋 [CARTON_ID_TRACK] Putaway Task: ${currentPutawayTask}`);
+      console.warn(`📋 [CARTON_ID_TRACK] ASN: ${asn}`);
+      console.warn(`📋 [CARTON_ID_TRACK] Selected Location: ${selectedLocationId || selectedRack || selectedBin || 'N/A'}`);
+      console.warn(`📋 [CARTON_ID_TRACK] ============================================`);
+      
       // Get items from the Transfer Carton
       // Items are in boxes that were packed into this TC via PACK_BOX_TO_TC events
       let items: Array<{
@@ -1899,9 +2538,47 @@ export default function PutAwayScreen() {
         source_bin?: string;
         target_bin?: string;
         completed?: boolean;
+        carton_id?: string;
+        location_id?: string;
       }> = [];
       
-      if (db) {
+      // ✅ FIX: Determine if this is a Putaway box (BOX ID = TC ID)
+      // For Transfer In putaway, TC ID format is TI-PUT-* or PAW-*
+      const isPutawayBox = selectedTC?.startsWith("PAW-") || selectedTC?.startsWith("TI-PUT-");
+      const isTransferInPutaway = (selectedTCObj as any)?.source_type === "TransferIn" || selectedTC?.startsWith("TI-PUT-");
+      
+      // ✅ FIX: First, check if task lines/items are already stored in selectedTCObj
+      // This avoids needing to fetch from backend if we already have them
+      const storedTaskLines = (selectedTCObj as any)?.task_lines;
+      if (storedTaskLines && Array.isArray(storedTaskLines) && storedTaskLines.length > 0) {
+        console.warn(`📋 [CARTON_ID_TRACK] ✅ Found ${storedTaskLines.length} stored task line(s) in selectedTCObj`);
+        items = storedTaskLines.map((line: any) => {
+          const item: any = {
+            item_code: line.item_code || line.itemCode || line.item,
+            qty: Number(line.qty || line.quantity || 0),
+            carton_id: line.carton_id || line.cartonId || null,
+            location_id: selectedLocationId || selectedRack || selectedBin || undefined,
+            source_bin: "DOCK-01",
+            target_bin: selectedBin || selectedRack || undefined,
+            completed: true,
+          };
+          console.warn(`📋 [CARTON_ID_TRACK] Item from stored task lines: ${item.item_code}, carton_id from line: ${line.carton_id || line.cartonId || 'null'}, final carton_id: ${item.carton_id || 'MISSING'}`);
+          
+          // ✅ CRITICAL FIX: For Transfer In putaway, ALWAYS use TC ID as carton_id if missing
+          // Backend task lines don't have carton_id, so we must add it
+          if (!item.carton_id && (isPutawayBox || isTransferInPutaway)) {
+            item.carton_id = selectedTC; // BOX ID = TC ID for Putaway boxes
+            console.warn(`📋 [CARTON_ID_TRACK] ✅ Added TC ID as carton_id for item ${item.item_code}: ${selectedTC} (isPutawayBox: ${isPutawayBox}, isTransferInPutaway: ${isTransferInPutaway})`);
+          }
+          
+          return item;
+        }).filter((item: any) => item.item_code && item.qty > 0);
+        
+        console.warn(`📋 [CARTON_ID_TRACK] Items from stored task lines summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+      }
+      
+      // If no items found from stored task lines, try other methods
+      if (items.length === 0 && db) {
         try {
           // Get boxes that were packed into this TC
           const packedBoxes = await db.getAllAsync<{ box_id: string }>(
@@ -1936,53 +2613,77 @@ export default function PutAwayScreen() {
             );
             
             console.warn(`📦 Found ${scannedItems.length} item record(s) in boxes for TC ${selectedTC}`);
+            console.warn(`📋 [CARTON_ID_TRACK] Scanned items from boxes (raw):`, scannedItems.map(i => ({ item_code: i.item_code, box_id: i.box_id, qty: i.scanned_qty })));
             
-            // Group by item_code and sum quantities
-            const itemMap = new Map<string, number>();
+            // ✅ FIX: Track box_id per item for Transfer In items (box_id needs to be sent as carton_id)
+            // Group by item_code and box_id to preserve box_id information
+            const itemBoxMap = new Map<string, { qty: number; box_id: string }[]>();
             for (const item of scannedItems) {
-              const currentQty = itemMap.get(item.item_code) || 0;
-              itemMap.set(item.item_code, currentQty + (item.scanned_qty || 0));
+              console.warn(`📋 [CARTON_ID_TRACK] Processing scanned item: ${item.item_code}, box_id: ${item.box_id}`);
+              const key = item.item_code;
+              if (!itemBoxMap.has(key)) {
+                itemBoxMap.set(key, []);
+              }
+              const itemList = itemBoxMap.get(key)!;
+              // Check if this box_id already exists for this item_code
+              const existingBox = itemList.find(b => b.box_id === item.box_id);
+              if (existingBox) {
+                existingBox.qty += item.scanned_qty || 0;
+              } else {
+                itemList.push({ qty: item.scanned_qty || 0, box_id: item.box_id });
+              }
             }
             
             // Build items array for API
-            // Check if this is a Putaway box (for box_id in items)
-            const isPutawayBox = selectedTC?.startsWith("PAW-");
-            
-            // Ensure we only create ONE item per item_code (aggregated from all boxes)
-            // The itemMap already aggregates quantities by item_code, so we should have unique item_codes
-            // NOTE: location_id is NOT included in items - it will be sent at header level in the API request
-            items = Array.from(itemMap.entries()).map(([item_code, qty]) => {
-              const item: any = {
-                item_code,
-                qty: Number(qty.toFixed(2)), // Round to 2 decimal places
-                source_bin: "DOCK-01", // Default source bin (can be enhanced to get from settings or event)
-                // location_id removed - will be sent at header level instead
-                target_bin: selectedBin || selectedRack || undefined, // Backward compatibility: also send target_bin
-                completed: true,
-              };
-              // NOTE: Backend doesn't accept box_id in items array - it gets box_id from putaway_task
-              // The backend table tabPutawayLine uses carton_id, not box_id
-              // Backend will map box_id to carton_id based on the putaway_task
-              return item;
+            // ✅ FIX: For Transfer In items from BOXes, include box_id as carton_id
+            // ✅ CRITICAL: Send separate items per box (Option 2) to preserve carton_id for each box
+            // This ensures backend receives separate items for each box, each with its own carton_id
+            items = Array.from(itemBoxMap.entries()).flatMap(([item_code, boxList]) => {
+              // Option 2: Send separate items per box (one per box_id)
+              // This is important when the same item_code is in multiple boxes
+              return boxList.map(box => {
+                const item: any = {
+                  item_code,
+                  qty: Number(box.qty.toFixed(2)), // Quantity for this specific box
+                  source_bin: "DOCK-01", // Default source bin (can be enhanced to get from settings or event)
+                  // location_id removed - will be sent at header level instead
+                  target_bin: selectedBin || selectedRack || undefined, // Backward compatibility: also send target_bin
+                  completed: true,
+                };
+                
+                // ✅ FIX: Include box_id as carton_id for Transfer In items from BOXes
+                // This ensures backend can track BOX ID in Stock Ledger, Transaction History, and Item Bin Location
+                if (box.box_id) {
+                  item.carton_id = box.box_id; // Backend uses carton_id field for box_id tracking
+                  console.warn(`📦 [CARTON_ID_TRACK] Including box_id as carton_id for item ${item_code}: ${box.box_id} (qty: ${box.qty})`);
+                } else {
+                  console.warn(`📦 [CARTON_ID_TRACK] ⚠️ Box entry missing box_id for item ${item_code}`);
+                }
+                
+                return item;
+              });
             });
             
-            // Verify no duplicates by item_code
-            const itemCodes = items.map(i => i.item_code);
-            const uniqueItemCodes = new Set(itemCodes);
-            if (itemCodes.length !== uniqueItemCodes.size) {
-              console.error(`❌ ERROR: Duplicate item_code(s) found in items array!`, {
+            // ✅ FIX: Verify duplicates by item_code + carton_id combination
+            // Allow multiple items with same item_code if they have different carton_ids
+            // This is important for Transfer In putaway where items might be in different boxes
+            const itemKeys = items.map(i => `${i.item_code}|${i.carton_id || 'NO_CARTON'}`);
+            const uniqueKeys = new Set(itemKeys);
+            if (itemKeys.length !== uniqueKeys.size) {
+              console.warn(`⚠️ [CARTON_ID_TRACK] Duplicate item_code+carton_id combinations found!`, {
                 totalItems: items.length,
-                uniqueItems: uniqueItemCodes.size,
-                duplicates: itemCodes.filter((code, index) => itemCodes.indexOf(code) !== index)
+                uniqueItems: uniqueKeys.size,
+                duplicates: itemKeys.filter((key, index) => itemKeys.indexOf(key) !== index)
               });
-              // Remove duplicates by keeping only the first occurrence of each item_code
+              // Remove duplicates by keeping only the first occurrence of each item_code+carton_id combination
               const seen = new Set<string>();
               items = items.filter(item => {
-                if (seen.has(item.item_code)) {
-                  console.warn(`⚠️ Removing duplicate item: ${item.item_code}`);
+                const key = `${item.item_code}|${item.carton_id || 'NO_CARTON'}`;
+                if (seen.has(key)) {
+                  console.warn(`⚠️ [CARTON_ID_TRACK] Removing duplicate item: ${item.item_code} with carton_id: ${item.carton_id || 'MISSING'}`);
                   return false;
                 }
-                seen.add(item.item_code);
+                seen.add(key);
                 return true;
               });
             }
@@ -1993,25 +2694,52 @@ export default function PutAwayScreen() {
               target_bin: i.target_bin,
               box_id: i.box_id
             })));
-          } else {
+            } else {
             // No boxes found - might be a Putaway box (BOX ID = TC ID)
+            // ✅ FIX: For Transfer In putaway, TC ID format is TI-PUT-* (not just PAW-*)
             // Try to get items directly from scanned_items using TC ID as box_id
-            const isPutawayBox = selectedTC?.startsWith("PAW-");
-            const directItems = await db.getAllAsync<{
+            // Note: isPutawayBox is already defined above, but we'll use it here too
+            console.warn(`📋 [CARTON_ID_TRACK] No boxes found, trying direct lookup. TC: ${selectedTC}, isPutawayBox: ${isPutawayBox}, isTransferInPutaway: ${isTransferInPutaway}, ASN: ${asn}`);
+            
+            // ✅ FIX: Try multiple queries for Transfer In items
+            // 1. Try with asn_no (if Transfer In items are stored with asn_no = Transfer In number)
+            // 2. Try without asn_no filter (in case items don't have asn_no)
+            let directItems = await db.getAllAsync<{
               item_code: string;
               scanned_qty: number;
             }>(
               `SELECT item_code, SUM(scanned_qty) as scanned_qty
                FROM scanned_items
                WHERE box_id = ?
-                 AND asn_no = ?
+                 AND (asn_no = ? OR asn_no IS NULL OR asn_no = '')
                GROUP BY item_code
                HAVING scanned_qty > 0`,
               [selectedTC, asn || '']
             );
             
+            console.warn(`📋 [CARTON_ID_TRACK] Direct lookup with ASN filter found ${directItems.length} item(s)`);
+            
+            // If no items found, try without asn_no filter (for Transfer In items that might not have asn_no)
+            if (directItems.length === 0) {
+              console.warn(`📋 [CARTON_ID_TRACK] No items found with ASN filter, trying without ASN filter...`);
+              directItems = await db.getAllAsync<{
+                item_code: string;
+                scanned_qty: number;
+              }>(
+                `SELECT item_code, SUM(scanned_qty) as scanned_qty
+                 FROM scanned_items
+                 WHERE box_id = ?
+                 GROUP BY item_code
+                 HAVING scanned_qty > 0`,
+                [selectedTC]
+              );
+              console.warn(`📋 [CARTON_ID_TRACK] Direct lookup without ASN filter found ${directItems.length} item(s)`);
+            }
+            
             if (directItems.length > 0) {
-              // NOTE: location_id is NOT included in items - it will be sent at header level in the API request
+              console.warn(`📋 [CARTON_ID_TRACK] ✅ Found ${directItems.length} item(s) for Putaway box ${selectedTC}`);
+              // ✅ FIX: For Putaway boxes (BOX ID = TC ID), include box_id as carton_id
+              // This is especially important for Transfer In items received without carton_id and then put into BOXes
               items = directItems.map(item => {
                 const itemObj: any = {
                   item_code: item.item_code,
@@ -2021,30 +2749,136 @@ export default function PutAwayScreen() {
                   target_bin: selectedBin || selectedRack || undefined, // Backward compatibility: also send target_bin
                   completed: true,
                 };
-                // NOTE: Backend doesn't accept box_id in items array - it gets box_id from putaway_task
-                // The backend table tabPutawayLine uses carton_id, not box_id
-                // Backend will map box_id to carton_id based on the putaway_task
+                
+                // ✅ FIX: Include BOX ID as carton_id for Putaway boxes
+                // This ensures backend can track BOX ID in Stock Ledger, Transaction History, and Item Bin Location
+                if (selectedTC) {
+                  itemObj.carton_id = selectedTC; // BOX ID = TC ID for Putaway boxes
+                  console.warn(`📦 [CARTON_ID_TRACK] ✅ Including BOX ID (${selectedTC}) as carton_id for item ${item.item_code} in Putaway box`);
+                } else {
+                  console.warn(`📦 [CARTON_ID_TRACK] ❌ selectedTC is null, cannot set carton_id for item ${item.item_code}`);
+                }
+                
                 return itemObj;
               });
               
               console.warn(`✅ Found ${items.length} item(s) directly from scanned_items for Putaway box ${selectedTC}`);
+              console.warn(`📋 [CARTON_ID_TRACK] Direct items summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+            } else {
+              // ✅ FIX: If no items found locally, try to get from backend putaway task
+              console.warn(`📋 [CARTON_ID_TRACK] ❌ No items found in scanned_items for ${selectedTC}, trying backend task...`);
+              if (currentPutawayTask) {
+                try {
+                  // Try to get task details from backend
+                  const taskDetails = await apiService.getPutawayTask(currentPutawayTask);
+                  console.warn(`📋 [CARTON_ID_TRACK] Backend task details response:`, taskDetails ? 'Found' : 'Not found');
+                  
+                  const taskLines = taskDetails?.lines || taskDetails?.data?.lines || taskDetails?.items || [];
+                  if (taskLines.length > 0) {
+                    console.warn(`📋 [CARTON_ID_TRACK] Found ${taskLines.length} line(s) in backend task ${currentPutawayTask}`);
+                    
+                    items = taskLines.map((line: any, index: number) => {
+                      const item: any = {
+                        item_code: line.item_code || line.itemCode || line.item,
+                        qty: Number(line.qty || line.quantity || 0),
+                        carton_id: line.carton_id || line.cartonId || null,
+                        location_id: selectedLocationId || selectedRack || selectedBin || undefined,
+                        source_bin: "DOCK-01",
+                        target_bin: selectedBin || selectedRack || undefined,
+                        completed: true,
+                      };
+                      console.warn(`📋 [CARTON_ID_TRACK] Item ${index + 1}/${taskLines.length} from backend task: ${item.item_code}, carton_id from line: ${line.carton_id || line.cartonId || 'null'}, final carton_id BEFORE fix: ${item.carton_id || 'MISSING'}`);
+                      
+                      // ✅ CRITICAL FIX: For Transfer In putaway, ALWAYS use TC ID as carton_id if missing
+                      // Backend task lines don't have carton_id, so we must add it to ALL items
+                      if (!item.carton_id && (isPutawayBox || isTransferInPutaway)) {
+                        item.carton_id = selectedTC; // BOX ID = TC ID for Putaway boxes
+                        console.warn(`📋 [CARTON_ID_TRACK] ✅ Added TC ID as carton_id for item ${item.item_code} (line ${index + 1}): ${selectedTC} (isPutawayBox: ${isPutawayBox}, isTransferInPutaway: ${isTransferInPutaway})`);
+                      }
+                      
+                      console.warn(`📋 [CARTON_ID_TRACK] Item ${index + 1}/${taskLines.length} FINAL: ${item.item_code}, qty: ${item.qty}, carton_id: ${item.carton_id || 'MISSING'}`);
+                      return item;
+                    }).filter((item: any) => item.item_code && item.qty > 0);
+                    
+                    console.warn(`📋 [CARTON_ID_TRACK] Items from backend task summary:`, items.map(i => ({ item_code: i.item_code, carton_id: i.carton_id || 'MISSING' })));
+                  } else {
+                    console.warn(`📋 [CARTON_ID_TRACK] ⚠️ Backend task ${currentPutawayTask} has no lines/items`);
+                  }
+                } catch (taskError: any) {
+                  console.warn(`📋 [CARTON_ID_TRACK] ⚠️ Error getting items from backend task:`, taskError.message);
+                  // If getPutawayTask fails, try getPutawayTasks as fallback
+                  try {
+                    const taskResponse = await apiService.getPutawayTasks({});
+                    const allTasks = Array.isArray(taskResponse) ? taskResponse : (taskResponse?.data || []);
+                    const matchingTask = allTasks.find((t: any) => 
+                      (t.putaway_task || t.title || t.id) === currentPutawayTask
+                    );
+                    
+                    if (matchingTask && (matchingTask.lines || matchingTask.items)) {
+                      const taskLines = matchingTask.lines || matchingTask.items || [];
+                      console.warn(`📋 [CARTON_ID_TRACK] Found ${taskLines.length} line(s) in backend task list response`);
+                      
+                      items = taskLines.map((line: any) => {
+                        const item: any = {
+                          item_code: line.item_code || line.itemCode || line.item,
+                          qty: Number(line.qty || line.quantity || 0),
+                          carton_id: line.carton_id || line.cartonId || null,
+                          location_id: selectedLocationId || selectedRack || selectedBin || undefined,
+                          source_bin: "DOCK-01",
+                          target_bin: selectedBin || selectedRack || undefined,
+                          completed: true,
+                        };
+                        
+                        // ✅ CRITICAL FIX: For Transfer In putaway, ALWAYS use TC ID as carton_id if missing
+                        if (!item.carton_id && (isPutawayBox || isTransferInPutaway)) {
+                          item.carton_id = selectedTC; // BOX ID = TC ID for Putaway boxes
+                          console.warn(`📋 [CARTON_ID_TRACK] ✅ Added TC ID as carton_id for item ${item.item_code}: ${selectedTC} (isPutawayBox: ${isPutawayBox}, isTransferInPutaway: ${isTransferInPutaway})`);
+                        }
+                        
+                        return item;
+                      }).filter((item: any) => item.item_code && item.qty > 0);
+                    }
+                  } catch (fallbackError: any) {
+                    console.warn(`📋 [CARTON_ID_TRACK] ⚠️ Fallback task lookup also failed:`, fallbackError.message);
+                  }
+                }
+              } else {
+                console.warn(`📋 [CARTON_ID_TRACK] ❌ No putaway task available to fetch items from backend`);
+              }
             }
           }
         } catch (itemsError: any) {
           console.warn(`⚠️ Error getting items from TC:`, itemsError.message);
+          console.warn(`📋 [CARTON_ID_TRACK] ❌ Exception in item retrieval:`, itemsError.message);
           // Continue without items - backend might be able to determine items from putaway task
         }
       }
       
-      // Try to call API to complete putaway task (if putawayTask exists)
-      // If no putawayTask, we'll use event-based tracking
+      // ✅ CRITICAL FIX: Final validation - ensure ALL items have carton_id before sending
+      // This is especially important for Transfer In putaway where backend task doesn't have carton_id
+      if (items.length > 0) {
+        const itemsMissingCartonId = items.filter(item => !item.carton_id);
+        if (itemsMissingCartonId.length > 0 && (isPutawayBox || isTransferInPutaway)) {
+          console.warn(`📋 [CARTON_ID_TRACK] ⚠️ Found ${itemsMissingCartonId.length} item(s) missing carton_id, adding TC ID...`);
+          items = items.map(item => {
+            if (!item.carton_id && (isPutawayBox || isTransferInPutaway)) {
+              item.carton_id = selectedTC;
+              console.warn(`📋 [CARTON_ID_TRACK] ✅ Added TC ID as carton_id for item ${item.item_code}: ${selectedTC}`);
+            }
+            return item;
+          });
+        }
+      }
+      
+      // Try to call API to complete putaway task (if currentPutawayTask exists)
+      // If no currentPutawayTask, we'll use event-based tracking
       let apiSuccess = false;
       let apiErrorOccurred = false;
       
-      if (putawayTask) {
+      if (currentPutawayTask) {
         try {
           const requestBody: any = {
-            putaway_task: putawayTask,
+            putaway_task: currentPutawayTask,
             completed_by: settings.user_id || settings.user_code || undefined,
             // Also send performed_by for backward compatibility
             performed_by: settings.user_id || settings.user_code || undefined,
@@ -2057,7 +2891,7 @@ export default function PutAwayScreen() {
             console.warn(`📤 Sending header-level location_id: ${selectedLocationId}`);
           } else {
             // Try to get location_id from the putaway task (if it was stored when fetching tasks)
-            const taskObj = sealedTCs.find(tc => (tc as any).putaway_task === putawayTask);
+            const taskObj = sealedTCs.find(tc => (tc as any).putaway_task === currentPutawayTask);
             if (taskObj && (taskObj as any).location_id) {
               requestBody.location_id = (taskObj as any).location_id;
               console.warn(`📤 Using location_id from task: ${(taskObj as any).location_id}`);
@@ -2066,18 +2900,20 @@ export default function PutAwayScreen() {
           
           // Include items array if we have items
           if (items.length > 0) {
-            // Final check: Ensure no duplicates before sending
-            const finalItemCodes = items.map(i => i.item_code);
-            const finalUniqueCodes = new Set(finalItemCodes);
-            if (finalItemCodes.length !== finalUniqueCodes.size) {
-              console.error(`❌ CRITICAL: Duplicate items detected before API call! Removing duplicates...`);
+            // ✅ FIX: Final check - ensure no duplicates by item_code + carton_id combination
+            // Allow multiple items with same item_code if they have different carton_ids
+            const finalItemKeys = items.map(i => `${i.item_code}|${i.carton_id || 'NO_CARTON'}`);
+            const finalUniqueKeys = new Set(finalItemKeys);
+            if (finalItemKeys.length !== finalUniqueKeys.size) {
+              console.warn(`⚠️ [CARTON_ID_TRACK] Duplicate item_code+carton_id combinations detected before API call! Removing duplicates...`);
               const seen = new Set<string>();
               items = items.filter(item => {
-                if (seen.has(item.item_code)) {
-                  console.warn(`⚠️ Removing duplicate item before API call: ${item.item_code}`);
+                const key = `${item.item_code}|${item.carton_id || 'NO_CARTON'}`;
+                if (seen.has(key)) {
+                  console.warn(`⚠️ [CARTON_ID_TRACK] Removing duplicate item before API call: ${item.item_code} with carton_id: ${item.carton_id || 'MISSING'}`);
                   return false;
                 }
-                seen.add(item.item_code);
+                seen.add(key);
                 return true;
               });
             }
@@ -2097,15 +2933,41 @@ export default function PutAwayScreen() {
             }
             
             const itemsWithLocation = items.map(item => {
-              return {
+              const finalItem = {
                 ...item,
                 location_id: locationIdToUse, // Ensure each item has location_id
                 completed: true, // Ensure completed flag is set
               };
+              
+              // ✅ CRITICAL FIX: Final check - if carton_id is still missing, add it
+              // This is a safety net to ensure ALL items have carton_id before sending
+              if (!finalItem.carton_id && (isPutawayBox || isTransferInPutaway)) {
+                finalItem.carton_id = selectedTC; // BOX ID = TC ID for Putaway boxes
+                console.warn(`📋 [CARTON_ID_TRACK] ✅ FINAL FIX: Added TC ID as carton_id for item ${finalItem.item_code}: ${selectedTC}`);
+              }
+              
+              // ✅ TRACK: Log each item's carton_id status before sending
+              if (!finalItem.carton_id) {
+                console.warn(`⚠️ [CARTON_ID_TRACK] ❌ CRITICAL: Item ${finalItem.item_code} is missing carton_id in final request!`);
+              } else {
+                console.warn(`✅ [CARTON_ID_TRACK] Item ${finalItem.item_code} has carton_id: ${finalItem.carton_id}`);
+              }
+              return finalItem;
             });
             
             requestBody.items = itemsWithLocation;
-            console.warn(`📤 Sending ${itemsWithLocation.length} unique item(s) in putaway completion request (location_id: ${locationIdToUse} at header and item level):`, JSON.stringify(itemsWithLocation, null, 2));
+            
+            // ✅ TRACK: Comprehensive logging of final request
+            const itemsWithCartonId = itemsWithLocation.filter(i => i.carton_id);
+            const itemsWithoutCartonId = itemsWithLocation.filter(i => !i.carton_id);
+            console.warn(`📤 [CARTON_ID_TRACK] ========== FINAL PUTAWAY REQUEST SUMMARY ==========`);
+            console.warn(`📤 [CARTON_ID_TRACK] Total items: ${itemsWithLocation.length}`);
+            console.warn(`📤 [CARTON_ID_TRACK] Items WITH carton_id: ${itemsWithCartonId.length}`, itemsWithCartonId.map(i => ({ item_code: i.item_code, carton_id: i.carton_id })));
+            console.warn(`📤 [CARTON_ID_TRACK] Items WITHOUT carton_id: ${itemsWithoutCartonId.length}`, itemsWithoutCartonId.map(i => ({ item_code: i.item_code })));
+            console.warn(`📤 [CARTON_ID_TRACK] Full request body:`, JSON.stringify(requestBody, null, 2));
+            console.warn(`📤 [CARTON_ID_TRACK] ================================================`);
+            
+            console.warn(`📤 Sending ${itemsWithLocation.length} unique item(s) in putaway completion request (location_id: ${locationIdToUse} at header and item level)`);
           } else {
             console.warn(`⚠️ No items found for TC ${selectedTC} - sending completion without items array`);
           }
@@ -2113,7 +2975,7 @@ export default function PutAwayScreen() {
           const response = await apiService.completePutaway(requestBody);
           apiSuccess = true;
           apiErrorOccurred = false;
-          console.warn(`✅ Putaway task completed via API: ${putawayTask}`);
+          console.warn(`✅ Putaway task completed via API: ${currentPutawayTask}`);
           
           // After successful API call, sync master data back to update status
           try {
@@ -2147,7 +3009,7 @@ export default function PutAwayScreen() {
             // Continue with event-based approach below
           } else if (apiError.message?.includes("TASK_NOT_FOUND")) {
             // Task not found - continue with event-based approach instead of blocking
-            console.warn(`⚠️ Putaway task ${putawayTask} not found in backend - using event-based approach`);
+            console.warn(`⚠️ Putaway task ${currentPutawayTask} not found in backend - using event-based approach`);
             // Continue with event-based approach below
           } else if (isTransferCartonNotFound) {
             // Transfer carton not found error - likely Putaway box not recognized
@@ -2174,10 +3036,12 @@ export default function PutAwayScreen() {
         console.warn(`ℹ️ No putaway task available - using event-based tracking for putaway completion`);
       }
 
-      // Always record event for local tracking (backward compatibility and offline support)
+      // ✅ CRITICAL: Only update local database AFTER backend confirmation
+      // Always record event for local tracking first (offline support)
+      let dispatchEventId: string | null = null;
       if (asn) {
         const normalizedASN = normalizeASN(asn);
-        await addEvent({
+        dispatchEventId = await addEvent({
           event_type: "PUTAWAY_DISPATCH",
           asn_no: normalizedASN,
           inbound_session: session,
@@ -2188,31 +3052,126 @@ export default function PutAwayScreen() {
         });
       }
 
-      // Update TC status to "Completed"
-      await dataService.updateTransferCartonStatus(selectedTC, "Completed");
-      console.log(`✅ PutAwayScreen: TC ${selectedTC} marked as Completed`);
-
-      // Sync events to backend to ensure putaway transaction appears in backend
+      // ✅ Sync events to backend FIRST
+      let syncSuccess = false;
       try {
         console.warn(`🔄 Syncing putaway events to backend...`);
         const syncResult = await syncEvents();
         console.warn(`✅ Synced ${syncResult.synced} event(s), ${syncResult.failed} failed`);
+        syncSuccess = syncResult.failed === 0;
         
         if (syncResult.failed > 0) {
           console.warn(`⚠️ Some events failed to sync. Please check Sync Center.`);
         }
       } catch (syncError: any) {
         console.warn(`⚠️ Error syncing events:`, syncError.message);
-        // Don't block user - events will sync later
+        // Continue - will verify from backend below
       }
 
-      if (apiSuccess && putawayTask && !apiErrorOccurred) {
+      // ✅ Verify from backend that transaction was processed
+      // Only update local database status AFTER backend confirmation
+      const locationId = selectedLocationId || selectedRack || selectedBin || "";
+      const backendConfirmed = await verifyPutawayTransactionFromBackend(
+        selectedTC,
+        locationId,
+        asn
+      );
+
+      if (backendConfirmed) {
+        // ✅ Backend confirmed - safe to update local database
+        await dataService.updateTransferCartonStatus(selectedTC, "Completed");
+        console.log(`✅ PutAwayScreen: TC ${selectedTC} marked as Completed (backend confirmed)`);
+
+        // Mark dispatch event as synced if it exists
+        if (dispatchEventId) {
+          await markEventSynced(dispatchEventId);
+          console.log(`✅ Dispatch event marked as synced`);
+        }
+
+        // Also mark PUTAWAY_TO_RACK event as synced if exists
+        const putawayToRackEvent = await db.getFirstAsync<{ offline_uuid: string }>(
+          `SELECT offline_uuid FROM event_queue 
+           WHERE event_type = 'PUTAWAY_TO_RACK' 
+             AND tc_id = ? 
+             AND synced = 0 
+           ORDER BY event_time DESC 
+           LIMIT 1`,
+          [selectedTC]
+        );
+
+        if (putawayToRackEvent) {
+          await markEventSynced(putawayToRackEvent.offline_uuid);
+          console.log(`✅ PUTAWAY_TO_RACK event marked as synced`);
+        }
+      } else if (apiSuccess && currentPutawayTask && !apiErrorOccurred) {
+        // ✅ API succeeded - safe to update even if verification didn't work
+        await dataService.updateTransferCartonStatus(selectedTC, "Completed");
+        console.log(`✅ PutAwayScreen: TC ${selectedTC} marked as Completed (API success)`);
+
+        if (dispatchEventId) {
+          await markEventSynced(dispatchEventId);
+        }
+
+        // Also mark PUTAWAY_TO_RACK event as synced
+        const putawayToRackEvent = await db.getFirstAsync<{ offline_uuid: string }>(
+          `SELECT offline_uuid FROM event_queue 
+           WHERE event_type = 'PUTAWAY_TO_RACK' 
+             AND tc_id = ? 
+             AND synced = 0 
+           ORDER BY event_time DESC 
+           LIMIT 1`,
+          [selectedTC]
+        );
+
+        if (putawayToRackEvent) {
+          await markEventSynced(putawayToRackEvent.offline_uuid);
+        }
+      } else if (syncSuccess) {
+        // ✅ Events synced successfully - use as confirmation for offline-first architecture
+        // This is especially important for Transfer In putaway where putawayTask might not be available
+        await dataService.updateTransferCartonStatus(selectedTC, "Completed");
+        console.log(`✅ PutAwayScreen: TC ${selectedTC} marked as Completed (events synced successfully)`);
+
+        if (dispatchEventId) {
+          await markEventSynced(dispatchEventId);
+        }
+
+        // Also mark PUTAWAY_TO_RACK event as synced
+        const putawayToRackEvent = await db.getFirstAsync<{ offline_uuid: string }>(
+          `SELECT offline_uuid FROM event_queue 
+           WHERE event_type = 'PUTAWAY_TO_RACK' 
+             AND tc_id = ? 
+             AND synced = 0 
+           ORDER BY event_time DESC 
+           LIMIT 1`,
+          [selectedTC]
+        );
+
+        if (putawayToRackEvent) {
+          await markEventSynced(putawayToRackEvent.offline_uuid);
+        }
+      } else {
+        // ❌ Backend not confirmed, API didn't succeed, and events didn't sync
+        // Don't update local status - transaction is stuck
+        console.warn(`⚠️ PutAwayScreen: TC ${selectedTC} NOT marked as Completed - backend confirmation failed`);
+        console.warn(`⚠️ User will need to retry/verify from Put Away Transactions list`);
+        console.warn(`⚠️ Debug info: apiSuccess=${apiSuccess}, putawayTask=${currentPutawayTask}, apiErrorOccurred=${apiErrorOccurred}, syncSuccess=${syncSuccess}`);
+        
+        Alert.alert(
+          "Warning",
+          `Put Away completion recorded locally but backend confirmation failed.\n\nTC: ${selectedTC}\n\nPlease check "Put Away Transactions" and retry if needed.`
+        );
+        // Don't update status - let user retry from transactions list
+        return; // Exit early - don't show success message
+      }
+
+      if (apiSuccess && currentPutawayTask && !apiErrorOccurred) {
         // API succeeded with putaway task
         Alert.alert(
           "Success",
-          `Put Away completed for Putaway box ${selectedTC}\n\nPutaway task: ${putawayTask}\n\nEvents synced to backend.`
+          `Put Away completed for Putaway box ${selectedTC}\n\nPutaway task: ${currentPutawayTask}\n\nEvents synced to backend.`
         );
-      } else if (putawayTask && apiErrorOccurred) {
+      } else if (currentPutawayTask && apiErrorOccurred) {
         // Had putaway task but API failed
         Alert.alert(
           "Success",
@@ -2561,6 +3520,30 @@ export default function PutAwayScreen() {
                         </Text>
                       </View>
                     </View>
+                    {/* ✅ NEW: Retry button for unsynced transactions */}
+                    {item.synced === 0 && (
+                      <TouchableOpacity
+                        style={styles.retryButton}
+                        onPress={() => handleRetryPutawayTransaction(item)}
+                        disabled={loading}
+                      >
+                        <Text style={styles.retryButtonText}>
+                          {loading ? "Verifying..." : "Retry & Verify"}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                    {/* ✅ NEW: Update Stock button for synced transactions */}
+                    {item.synced === 1 && (
+                      <TouchableOpacity
+                        style={styles.updateStockButton}
+                        onPress={() => handleUpdateStockForPutaway(item)}
+                        disabled={loading}
+                      >
+                        <Text style={styles.updateStockButtonText}>
+                          {loading ? "Updating Stock..." : "Update Stock"}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
                 )}
                 scrollEnabled={false}
@@ -3025,6 +4008,30 @@ const styles = StyleSheet.create({
   },
   syncBadgeTextPending: {
     color: "#fff",
+  },
+  retryButton: {
+    backgroundColor: "#FF9800",
+    padding: 12,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  retryButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  updateStockButton: {
+    backgroundColor: "#4CAF50",
+    padding: 12,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  updateStockButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
   },
   transactionDetails: {
     marginTop: 4,

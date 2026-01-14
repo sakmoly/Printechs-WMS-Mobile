@@ -1666,6 +1666,22 @@ export const dataService = {
       console.log("  - Clearing transfer order allocations...");
       await db.runAsync("DELETE FROM transfer_order_cache");
       
+      // 5a. Clear transfer in cache
+      console.log("  - Clearing transfer in cache...");
+      try {
+        await db.runAsync("DELETE FROM transfer_in_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear transfer_in_cache:", error.message);
+      }
+      
+      // 5b. Clear material request cache
+      console.log("  - Clearing material request cache...");
+      try {
+        await db.runAsync("DELETE FROM material_request_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear material_request_cache:", error.message);
+      }
+      
       // 6. Clear ASN cache
       console.log("  - Clearing ASN cache...");
       await db.runAsync("DELETE FROM asn_cache");
@@ -1688,7 +1704,46 @@ export const dataService = {
       console.log("  - Clearing warehouse rack cache...");
       await db.runAsync("DELETE FROM warehouse_rack_cache");
       
-      // 9. Clear master data tables (will be repopulated from backend during sync)
+      // 9. Clear cycle count data
+      console.log("  - Clearing cycle count data...");
+      try {
+        await db.runAsync("DELETE FROM cycle_count_lines");
+        console.log("    - Cycle count lines cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_lines:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM cycle_count_sessions");
+        console.log("    - Cycle count sessions cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_sessions:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM cycle_count_cache");
+        console.log("    - Cycle count cache cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_cache:", error.message);
+      }
+      
+      // 10. Clear stock ledger cache (sources expected quantities for cycle count)
+      console.log("  - Clearing stock ledger cache...");
+      try {
+        await db.runAsync("DELETE FROM stock_ledger_cache");
+        console.log("    - Stock ledger cache cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear stock_ledger_cache:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM stock_transaction_cache");
+        console.log("    - Stock transaction cache cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear stock_transaction_cache:", error.message);
+      }
+      
+      // 11. Clear master data tables (will be repopulated from backend during sync)
       console.log("  - Clearing master data (will sync from backend)...");
       console.log("    - Item master...");
       await db.runAsync("DELETE FROM item_master");
@@ -1715,6 +1770,20 @@ export const dataService = {
       console.log("    - Locations...");
       await db.runAsync("DELETE FROM location_cache");
       
+      console.log("    - Bin master...");
+      try {
+        await db.runAsync("DELETE FROM bin_master_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear bin_master_cache:", error.message);
+      }
+      
+      console.log("    - Item barcode map...");
+      try {
+        await db.runAsync("DELETE FROM item_barcode_map");
+      } catch (error: any) {
+        console.warn("    - Could not clear item_barcode_map:", error.message);
+      }
+      
       // Clear active session from settings (but keep other settings)
       console.log("  - Clearing active session from settings...");
       await db.runAsync(
@@ -1724,8 +1793,10 @@ export const dataService = {
       console.log("✅ All transaction data and master data cleared successfully");
       console.log("   - Events, scanned items, workflow states");
       console.log("   - Cartons (CTN), boxes, transfer cartons");
-      console.log("   - ASN data, transfer orders, sessions");
-      console.log("   - Master data (items, users, warehouses, locations)");
+      console.log("   - ASN data, transfer orders, transfer in, material requests, sessions");
+      console.log("   - Cycle count data (sessions, lines, cache)");
+      console.log("   - Stock ledger and transaction cache");
+      console.log("   - Master data (items, users, warehouses, locations, bins, barcode maps)");
       console.log("   ℹ️  Master data will be repopulated from backend during next sync");
     });
   },
@@ -2274,6 +2345,45 @@ export const dataService = {
 
       console.log("  - Clearing warehouse racks...");
       await db.runAsync("DELETE FROM warehouse_rack_cache");
+      
+      // Clear cycle count data
+      console.log("  - Clearing cycle count data...");
+      try {
+        await db.runAsync("DELETE FROM cycle_count_lines");
+        console.log("    - Cycle count lines cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_lines:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM cycle_count_sessions");
+        console.log("    - Cycle count sessions cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_sessions:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM cycle_count_cache");
+        console.log("    - Cycle count cache cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear cycle_count_cache:", error.message);
+      }
+      
+      // Clear stock ledger cache (sources expected quantities for cycle count)
+      console.log("  - Clearing stock ledger cache...");
+      try {
+        await db.runAsync("DELETE FROM stock_ledger_cache");
+        console.log("    - Stock ledger cache cleared (this was the source of 'Exp: 74')");
+      } catch (error: any) {
+        console.warn("    - Could not clear stock_ledger_cache:", error.message);
+      }
+      
+      try {
+        await db.runAsync("DELETE FROM stock_transaction_cache");
+        console.log("    - Stock transaction cache cleared");
+      } catch (error: any) {
+        console.warn("    - Could not clear stock_transaction_cache:", error.message);
+      }
 
       console.log("  - Clearing item master...");
       await db.runAsync("DELETE FROM item_master");
@@ -2286,6 +2396,34 @@ export const dataService = {
 
       console.log("  - Clearing locations...");
       await db.runAsync("DELETE FROM location_cache");
+      
+      console.log("  - Clearing transfer in cache...");
+      try {
+        await db.runAsync("DELETE FROM transfer_in_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear transfer_in_cache:", error.message);
+      }
+      
+      console.log("  - Clearing material request cache...");
+      try {
+        await db.runAsync("DELETE FROM material_request_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear material_request_cache:", error.message);
+      }
+      
+      console.log("  - Clearing bin master cache...");
+      try {
+        await db.runAsync("DELETE FROM bin_master_cache");
+      } catch (error: any) {
+        console.warn("    - Could not clear bin_master_cache:", error.message);
+      }
+      
+      console.log("  - Clearing item barcode map...");
+      try {
+        await db.runAsync("DELETE FROM item_barcode_map");
+      } catch (error: any) {
+        console.warn("    - Could not clear item_barcode_map:", error.message);
+      }
 
       // 3. Clear active session from settings (but keep other settings)
       console.log("  - Clearing active session from settings...");

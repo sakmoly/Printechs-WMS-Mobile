@@ -197,13 +197,21 @@ export default function TransferInReceivingScreen() {
       }
 
       // Also call API directly for immediate backend update (if online)
+      // ✅ FIX: Send individual item updates with carton_id for each item
+      // This ensures backend can properly associate carton_id with each item
       let apiSuccess = false;
       try {
-        await apiService.receiveTransferInLine(transferIn.title, {
-          carton_id: cartonId,
-          received_by: receivedBy,
-        });
+        // Option 1: Send one API call per item (more granular, ensures carton_id is captured per item)
+        for (const item of itemsInCarton) {
+          await apiService.receiveTransferInLine(transferIn.title, {
+            carton_id: cartonId,
+            item_code: item.item_code,
+            received_qty: item.qty, // Full quantity for cartonized items
+            received_by: receivedBy,
+          });
+        }
         apiSuccess = true;
+        console.log(`✅ Sent ${itemsInCarton.length} receive-line API call(s) with carton_id for carton ${cartonId}`);
       } catch (apiError: any) {
         // If API call fails, events are still queued and will sync later
         // 404 errors are expected if backend endpoint is not implemented yet
@@ -221,6 +229,7 @@ export default function TransferInReceivingScreen() {
       }
 
       // Update local state to reflect received quantities (for immediate UI update)
+      // ✅ FIX: Also update carton_id in local state to ensure it's preserved
       if (transferIn && itemsInCarton.length > 0) {
         const updatedItems = transferIn.items.map((item) => {
           const itemInCarton = itemsInCarton.find(
@@ -230,6 +239,7 @@ export default function TransferInReceivingScreen() {
             return {
               ...item,
               received_qty: item.qty, // Mark as fully received
+              carton_id: cartonId, // ✅ FIX: Update carton_id in local state
             };
           }
           return item;

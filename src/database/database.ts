@@ -216,6 +216,38 @@ export async function runSchemaMigrations(db: SQLite.SQLiteDatabase) {
       }
     }
 
+    // Check if cycle_count_lines table exists and has carton_id column
+    try {
+      const cycleCountLinesColumns = await db.getAllAsync<{ name: string }>(
+        "PRAGMA table_info(cycle_count_lines)"
+      );
+      if (cycleCountLinesColumns.length > 0) {
+        const hasCartonId = cycleCountLinesColumns.some(
+          (col) => col.name === "carton_id"
+        );
+        if (!hasCartonId) {
+          console.log("📝 Adding carton_id column to cycle_count_lines table...");
+          try {
+            await db.execAsync("ALTER TABLE cycle_count_lines ADD COLUMN carton_id TEXT");
+            console.log("✅ Added carton_id column to cycle_count_lines");
+          } catch (error: any) {
+            if (error?.message?.includes("duplicate column")) {
+              console.log("ℹ️ carton_id column already exists in cycle_count_lines");
+            } else {
+              throw error;
+            }
+          }
+        }
+      }
+    } catch (error: any) {
+      if (!error?.message?.includes("no such table")) {
+        console.error(
+          "❌ Error checking/adding carton_id column to cycle_count_lines:",
+          error
+        );
+      }
+    }
+
     if (
       hasActiveAsn &&
       hasActiveSession &&

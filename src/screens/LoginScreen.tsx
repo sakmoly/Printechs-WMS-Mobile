@@ -11,12 +11,15 @@ import {
 } from "react-native";
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
+import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { getSettings } from "../services/settings.service";
 import { apiService } from "../services/api.service";
+import { useNetworkStatus } from "../hooks/useNetworkStatus";
 
 export default function LoginScreen() {
   const navigation = useNavigation();
   const { refreshSettings } = useApp();
+  const { isOnline, isChecking } = useNetworkStatus();
   const [userCode, setUserCode] = useState("");
   const [password, setPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
@@ -138,13 +141,33 @@ export default function LoginScreen() {
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <View style={{ flex: 1 }}>
+      <ScrollView style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Printechs WMS</Text>
         <Text style={styles.subtitle}>Login</Text>
       </View>
 
       <View style={styles.form}>
+        {/* Network Status Indicator */}
+        <View style={styles.networkStatusContainer}>
+          <View style={[
+            styles.networkStatusBadge,
+            isOnline ? styles.networkStatusOnline : styles.networkStatusOffline
+          ]}>
+            {isChecking ? (
+              <ActivityIndicator size="small" color="#fff" style={{ marginRight: 6 }} />
+            ) : (
+              <Text style={styles.networkStatusIcon}>
+                {isOnline ? "🟢" : "🔴"}
+              </Text>
+            )}
+            <Text style={styles.networkStatusText}>
+              {isChecking ? "Checking..." : (isOnline ? "Online" : "Offline")}
+            </Text>
+          </View>
+        </View>
+
         {demoMode ? (
           <View style={styles.demoInfo}>
             <Text style={styles.demoText}>
@@ -198,6 +221,8 @@ export default function LoginScreen() {
         </TouchableOpacity>
       </View>
     </ScrollView>
+    <ScreenFooterFrame />
+    </View>
   );
 }
 
@@ -281,5 +306,41 @@ const styles = StyleSheet.create({
     color: "#007AFF",
     fontSize: 16,
     fontWeight: "600",
+  },
+  networkStatusContainer: {
+    alignItems: "center",
+    marginBottom: 20,
+    marginTop: 8,
+  },
+  networkStatusBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+    shadowColor: "#000",
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
+  },
+  networkStatusOnline: {
+    backgroundColor: "#4CAF50",
+  },
+  networkStatusOffline: {
+    backgroundColor: "#F44336",
+  },
+  networkStatusIcon: {
+    fontSize: 12,
+    marginRight: 8,
+  },
+  networkStatusText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+    letterSpacing: 0.5,
   },
 });
