@@ -11,11 +11,49 @@ let isSyncing = false;
 const SYNC_DEBOUNCE_MS = 2000; // Wait 2 seconds after last event before syncing
 const MAX_BATCH_SIZE = 1000; // Backend limit: max 1000 events per batch
 
+/**
+ * Check if an error message indicates a duplicate UUID (which should be treated as success)
+ * Backend correctly rejects duplicates, but mobile should treat them as ACK success
+ */
+function isDuplicateUuidError(msg: string): boolean {
+  const m = (msg || "").toLowerCase();
+  return (
+    m.includes("duplicate") ||
+    m.includes("already exists") ||
+    m.includes("unique constraint") ||
+    m.includes("primary key")
+  );
+}
+
 export const addEvent = async (
   event: Omit<ScanEvent, "offline_uuid" | "synced" | "event_time">
 ): Promise<string> => {
   const db = await getDatabase();
   const settings = await getSettings();
+
+  // ✅ CRITICAL VALIDATION: TRANSFER_IN_RECEIVE events MUST include transfer_in
+  if (event.event_type === "TRANSFER_IN_RECEIVE") {
+    if (!event.transfer_in || event.transfer_in.trim() === "") {
+      const errorMsg = `❌ CRITICAL ERROR: TRANSFER_IN_RECEIVE event is missing required 'transfer_in' field! Event will be rejected.`;
+      console.error(errorMsg);
+      console.error(`   Event details:`, {
+        item_code: event.item_code,
+        carton_id: event.carton_id,
+        qty: event.qty,
+      });
+      throw new Error(`TRANSFER_IN_RECEIVE event requires 'transfer_in' field. Please include transfer_in when creating the event.`);
+    }
+    
+    // Also validate that item_code is present (required for backend processing)
+    if (!event.item_code || event.item_code.trim() === "") {
+      const errorMsg = `❌ CRITICAL ERROR: TRANSFER_IN_RECEIVE event is missing required 'item_code' field!`;
+      console.error(errorMsg);
+      throw new Error(`TRANSFER_IN_RECEIVE event requires 'item_code' field.`);
+    }
+    
+    // Log successful validation
+    console.log(`✅ TRANSFER_IN_RECEIVE event validated: transfer_in=${event.transfer_in}, item_code=${event.item_code}, carton_id=${event.carton_id || 'N/A'}`);
+  }
 
   const offline_uuid = generateUUID();
   const event_time = new Date().toISOString();
@@ -267,10 +305,45 @@ export const syncEvents = async (): Promise<{
       qty: event.qty != null ? Number(event.qty) : undefined,
     }));
 
-    // Split events into chunks of MAX_BATCH_SIZE to comply with backend limit
+    // ✅ FIX: Deduplicate PUTAWAY_TO_RACK events before sending
+    // Group by event_type + tc_id + rack to identify duplicates
+    // Keep only the most recent event for each unique combination
+    const deduplicatedEvents: ScanEvent[] = [];
+    const eventKeyMap = new Map<string, ScanEvent>();
+    
+    for (const event of normalizedEvents) {
+      // For PUTAWAY_TO_RACK events, create a unique key from tc_id + rack
+      if (event.event_type === "PUTAWAY_TO_RACK" && event.tc_id && event.rack) {
+        const key = `PUTAWAY_TO_RACK:${event.tc_id}:${event.rack}`;
+        const existing = eventKeyMap.get(key);
+        
+        // Keep the most recent event (by event_time)
+        if (!existing || new Date(event.event_time) > new Date(existing.event_time)) {
+          eventKeyMap.set(key, event);
+        } else {
+          console.warn(`⚠️ Deduplicating PUTAWAY_TO_RACK event: TC ${event.tc_id} at ${event.rack} (keeping older event: ${existing.offline_uuid.substring(0, 8)}...)`);
+        }
+      } else {
+        // For other events, add them as-is (no deduplication needed)
+        deduplicatedEvents.push(event);
+      }
+    }
+    
+    // Add deduplicated PUTAWAY_TO_RACK events
+    for (const [key, event] of eventKeyMap.entries()) {
+      deduplicatedEvents.push(event);
+    }
+    
+    if (normalizedEvents.length !== deduplicatedEvents.length) {
+      const duplicatesRemoved = normalizedEvents.length - deduplicatedEvents.length;
+      console.warn(`✅ Deduplicated ${duplicatesRemoved} duplicate PUTAWAY_TO_RACK event(s) before sending`);
+      console.warn(`   Original: ${normalizedEvents.length} events → Deduplicated: ${deduplicatedEvents.length} events`);
+    }
+
+    // Split deduplicated events into chunks of MAX_BATCH_SIZE to comply with backend limit
     const chunks: ScanEvent[][] = [];
-    for (let i = 0; i < normalizedEvents.length; i += MAX_BATCH_SIZE) {
-      const chunk = normalizedEvents.slice(i, i + MAX_BATCH_SIZE);
+    for (let i = 0; i < deduplicatedEvents.length; i += MAX_BATCH_SIZE) {
+      const chunk = deduplicatedEvents.slice(i, i + MAX_BATCH_SIZE);
       // Safety check: ensure chunk never exceeds MAX_BATCH_SIZE
       if (chunk.length > MAX_BATCH_SIZE) {
         console.error(
@@ -297,7 +370,7 @@ export const syncEvents = async (): Promise<{
     }
 
     console.warn(
-      `📦 Syncing ${normalizedEvents.length} events in ${chunks.length} batch(es) of max ${MAX_BATCH_SIZE}`
+      `📦 Syncing ${deduplicatedEvents.length} events in ${chunks.length} batch(es) of max ${MAX_BATCH_SIZE}`
     );
 
     // Log chunk sizes for debugging (use warn so it shows up)
@@ -362,6 +435,36 @@ export const syncEvents = async (): Promise<{
               asn_no: e.asn_no,
               device_id: e.device_id,
               user_id: e.user_id
+            });
+          });
+        }
+
+        // ✅ CRITICAL: Log TRANSFER_IN_RECEIVE events to verify transfer_in is included
+        const transferInEvents = chunk.filter(e => e.event_type === "TRANSFER_IN_RECEIVE");
+        if (transferInEvents.length > 0) {
+          console.warn(`📦 TRANSFER_IN_RECEIVE events in this batch (${transferInEvents.length}):`);
+          transferInEvents.forEach((e, idx) => {
+            const hasTransferIn = e.transfer_in !== undefined && e.transfer_in !== null && e.transfer_in.trim() !== "";
+            const hasCartonId = e.carton_id !== undefined && e.carton_id !== null && e.carton_id.trim() !== "";
+            const hasItemCode = e.item_code !== undefined && e.item_code !== null && e.item_code.trim() !== "";
+            
+            if (!hasTransferIn) {
+              console.error(`❌ CRITICAL: TRANSFER_IN_RECEIVE event ${idx + 1} is MISSING transfer_in field!`);
+              console.error(`   This event will be SKIPPED by backend processing.`);
+            }
+            
+            console.warn(`   Event ${idx + 1}:`, {
+              uuid: e.offline_uuid?.substring(0, 12) + '...',
+              event_type: e.event_type,
+              transfer_in: e.transfer_in || "❌ MISSING",
+              has_transfer_in: hasTransferIn,
+              item_code: e.item_code || "❌ MISSING",
+              has_item_code: hasItemCode,
+              carton_id: e.carton_id || "❌ MISSING",
+              has_carton_id: hasCartonId,
+              qty: e.qty,
+              device_id: e.device_id,
+              user_id: e.user_id,
             });
           });
         }
@@ -575,19 +678,49 @@ export const syncEvents = async (): Promise<{
           }
         }
 
-        // Mark failed events
+        // ✅ FIX: Treat duplicate UUID errors as success (events were already processed)
+        // Mark failed events (but exclude duplicates which should be treated as ACK)
         if (failedItems.length > 0) {
+          const duplicateUuids: string[] = [];
+          const realFailedItems: any[] = [];
+          
           for (const failure of failedItems) {
             const failureUuid = failure.uuid || failure.offline_uuid;
-            if (failureUuid) {
-              await markEventFailed(
-                failureUuid,
-                failure.message || "Unknown error"
-              );
-              totalFailedCount++;
+            const errorMsg = failure.message || "Unknown error";
+            
+            if (failureUuid && isDuplicateUuidError(errorMsg)) {
+              // ✅ Duplicate UUID = event was already processed by backend = success
+              duplicateUuids.push(failureUuid);
+              console.log(`ℹ️ Event ${failureUuid.substring(0, 8)}... is duplicate - treating as ACK success`);
+            } else if (failureUuid) {
+              // Real failure - mark as failed
+              realFailedItems.push(failure);
             }
           }
-          console.log(`❌ Marked ${failedItems.length} events as failed`);
+          
+          // Mark duplicate UUIDs as synced (they were already processed)
+          if (duplicateUuids.length > 0) {
+            for (const uuid of duplicateUuids) {
+              await markEventSynced(uuid);
+              totalSyncedCount++;
+            }
+            console.log(`✅ Marked ${duplicateUuids.length} duplicate events as synced (already processed by backend)`);
+          }
+          
+          // Mark real failures
+          if (realFailedItems.length > 0) {
+            for (const failure of realFailedItems) {
+              const failureUuid = failure.uuid || failure.offline_uuid;
+              if (failureUuid) {
+                await markEventFailed(
+                  failureUuid,
+                  failure.message || "Unknown error"
+                );
+                totalFailedCount++;
+              }
+            }
+            console.log(`❌ Marked ${realFailedItems.length} events as failed`);
+          }
         }
 
         // Check if PACK_BOX_TO_TC events were acked

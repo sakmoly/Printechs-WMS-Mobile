@@ -278,11 +278,15 @@ export default function TransferInReceivingScreen() {
               },
             },
             {
-              text: "Go to Putaway Tasks",
+              text: "Go to Box Management",
               onPress: () => {
                 setScanValue("");
                 loadTransferIn(); // Reload to get latest data
-                (navigation as any).navigate("PutAway");
+                // ✅ NEW: Navigate to Box Management to create Transfer In boxes with TI- naming series
+                (navigation as any).navigate("BoxManagement", { 
+                  transferIn: transferIn.title,
+                  sourceType: "TransferIn" 
+                });
               },
             },
           ]
@@ -463,11 +467,15 @@ export default function TransferInReceivingScreen() {
               },
             },
             {
-              text: "Go to Putaway Tasks",
+              text: "Go to Box Management",
               onPress: () => {
                 setScanValue("");
                 loadTransferIn(); // Reload to get latest data
-                (navigation as any).navigate("PutAway");
+                // ✅ NEW: Navigate to Box Management to create Transfer In boxes with TI- naming series
+                (navigation as any).navigate("BoxManagement", { 
+                  transferIn: transferIn.title,
+                  sourceType: "TransferIn" 
+                });
               },
             },
           ]
@@ -755,10 +763,14 @@ export default function TransferInReceivingScreen() {
           <TouchableOpacity
             style={styles.putawayButton}
             onPress={() => {
-              (navigation as any).navigate("PutAway");
+              // ✅ NEW: Navigate to Box Management to create Transfer In boxes with TI- naming series
+              (navigation as any).navigate("BoxManagement", { 
+                transferIn: transferIn.title,
+                sourceType: "TransferIn" 
+              });
             }}
           >
-            <Text style={styles.putawayButtonText}>Go to Putaway Tasks</Text>
+            <Text style={styles.putawayButtonText}>Go to Box Management</Text>
           </TouchableOpacity>
         </View>
       )}

@@ -254,7 +254,7 @@ export default function TransferInListScreen() {
               {totalItems} item(s) • {totalQty} qty
             </Text>
           </View>
-          {(item.status === "Submitted" || item.status === "In Transit") && (
+          {(item.status === "Submitted" || item.status === "In Transit" || item.status === "Receiving") && (
             <View style={styles.detailRow}>
               <Text style={styles.detailLabel}>Received:</Text>
               <Text style={styles.detailValue}>

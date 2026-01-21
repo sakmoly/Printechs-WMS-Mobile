@@ -294,6 +294,42 @@ export const CREATE_MATERIAL_REQUEST_PICKING_SESSIONS_TABLE = `
   );
 `;
 
+export const CREATE_TRANSFER_IN_RECEIVING_SESSIONS_TABLE = `
+  CREATE TABLE IF NOT EXISTS transfer_in_receiving_sessions (
+    session_id TEXT PRIMARY KEY,
+    transfer_in_no TEXT,
+    transaction_no TEXT,
+    active_carton_id TEXT,
+    status TEXT DEFAULT 'Draft',
+    started_by TEXT,
+    started_at TEXT,
+    updated_at TEXT,
+    scanned_total INTEGER DEFAULT 0,
+    synced INTEGER DEFAULT 0,
+    FOREIGN KEY (transfer_in_no) REFERENCES transfer_in_cache(title)
+  );
+`;
+
+// Relocation Sessions Table
+export const CREATE_RELOCATION_SESSIONS_TABLE = `
+  CREATE TABLE IF NOT EXISTS relocation_sessions (
+    session_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    policy TEXT,
+    from_bin TEXT,
+    from_carton TEXT,
+    to_bin TEXT,
+    to_carton TEXT,
+    scanned_lines_json TEXT,
+    status TEXT DEFAULT 'Draft',
+    started_by TEXT,
+    started_at TEXT,
+    updated_at TEXT,
+    warehouse TEXT,
+    user_id TEXT
+  );
+`;
+
 // Cycle Count Cache Table
 export const CREATE_CYCLE_COUNT_CACHE_TABLE = `
   CREATE TABLE IF NOT EXISTS cycle_count_cache (
@@ -447,4 +483,6 @@ export const ALL_MIGRATIONS = [
   CREATE_STOCK_LEDGER_CACHE_TABLE,
   CREATE_STOCK_TRANSACTION_CACHE_TABLE,
   CREATE_MATERIAL_REQUEST_PICKING_SESSIONS_TABLE,
+  CREATE_TRANSFER_IN_RECEIVING_SESSIONS_TABLE,
+  CREATE_RELOCATION_SESSIONS_TABLE,
 ];

@@ -30,12 +30,14 @@ import DispatchScreen from "./src/screens/DispatchScreen";
 import SyncCenterScreen from "./src/screens/SyncCenterScreen";
 import PutAwayScreen from "./src/screens/PutAwayScreen";
 import ASNListScreen from "./src/screens/ASNListScreen";
-// Import logger first to suppress info logs (only show warnings and errors)
+// Import logger first to suppress all logs except errors
 import "./src/utils/logger";
 
 import TransferInListScreen from "./src/screens/TransferInListScreen";
 import TransferInDetailScreen from "./src/screens/TransferInDetailScreen";
 import TransferInReceivingScreen from "./src/screens/TransferInReceivingScreen";
+import TransferInReceivingScanCartonScreen from "./src/screens/TransferInReceivingScanCartonScreen";
+import TransferInReceivingScanItemsScreen from "./src/screens/TransferInReceivingScanItemsScreen";
 import StockLedgerListScreen from "./src/screens/StockLedgerListScreen";
 import StockDetailScreen from "./src/screens/StockDetailScreen";
 import StockTransactionHistoryScreen from "./src/screens/StockTransactionHistoryScreen";
@@ -54,6 +56,12 @@ import CycleCountScanBinScreen from "./src/screens/CycleCountScanBinScreen";
 import CycleCountBinCountingScreen from "./src/screens/CycleCountBinCountingScreen";
 import CycleCountDraftsScreen from "./src/screens/CycleCountDraftsScreen";
 import RemainingItemsScreen from "./src/screens/RemainingItemsScreen";
+import RelocationHomeScreen from "./src/screens/RelocationHomeScreen";
+import RelocationScanFromBinScreen from "./src/screens/RelocationScanFromBinScreen";
+import RelocationScanFromCartonScreen from "./src/screens/RelocationScanFromCartonScreen";
+import RelocationScanToBinScreen from "./src/screens/RelocationScanToBinScreen";
+import RelocationScanToCartonScreen from "./src/screens/RelocationScanToCartonScreen";
+import RelocationExecuteScreen from "./src/screens/RelocationExecuteScreen";
 
 const Stack = createStackNavigator();
 
@@ -407,6 +415,14 @@ export default function App() {
             component={TransferInReceivingScreen}
           />
           <Stack.Screen
+            name="TransferInReceivingScanCarton"
+            component={TransferInReceivingScanCartonScreen}
+          />
+          <Stack.Screen
+            name="TransferInReceivingScanItems"
+            component={TransferInReceivingScanItemsScreen}
+          />
+          <Stack.Screen
             name="StockLedgerList"
             component={StockLedgerListScreen}
           />
@@ -474,6 +490,30 @@ export default function App() {
           <Stack.Screen
             name="RemainingItems"
             component={RemainingItemsScreen}
+          />
+          <Stack.Screen
+            name="RelocationHome"
+            component={RelocationHomeScreen}
+          />
+          <Stack.Screen
+            name="RelocationScanFromBin"
+            component={RelocationScanFromBinScreen}
+          />
+          <Stack.Screen
+            name="RelocationScanFromCarton"
+            component={RelocationScanFromCartonScreen}
+          />
+          <Stack.Screen
+            name="RelocationScanToBin"
+            component={RelocationScanToBinScreen}
+          />
+          <Stack.Screen
+            name="RelocationScanToCarton"
+            component={RelocationScanToCartonScreen}
+          />
+          <Stack.Screen
+            name="RelocationExecute"
+            component={RelocationExecuteScreen}
           />
         </Stack.Navigator>
       </NavigationContainer>

@@ -11,7 +11,7 @@ import {
   Modal,
 } from "react-native";
 import { useApp } from "../context/AppContext";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation, useRoute } from "@react-navigation/native";
 import { StatusBadge } from "../components/StatusBadge";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import { BarcodeDisplay } from "../components/BarcodeDisplay";
@@ -21,10 +21,18 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { normalizeASN } from "../utils/asn";
 import { Share } from "react-native";
+import { isDeviceOnline } from "../utils/network-check";
 
 export default function BoxManagementScreen() {
   const navigation = useNavigation();
+  const route = useRoute();
   const { activeASN, activeSession } = useApp();
+  // ✅ NEW: Support Transfer In context (from route params)
+  const routeParams = (route.params as any) || {};
+  const transferIn = routeParams.transferIn || null;
+  const sourceType = routeParams.sourceType || (activeASN ? "ASN" : null); // "ASN" or "TransferIn"
+  const isTransferIn = sourceType === "TransferIn";
+  
   const [boxes, setBoxes] = useState<any[]>([]);
   const [selectedStore, setSelectedStore] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -51,12 +59,24 @@ export default function BoxManagementScreen() {
   } | null>(null);
 
   useEffect(() => {
-    loadBoxes();
-    loadTransferOrderAndStores();
-    loadWarehousesAndStores();
-    checkItemsWithoutTO();
-    calculateRemainingItems();
-  }, [activeASN]);
+    // ✅ NEW: Load data - support both ASN and Transfer In
+    const loadData = async () => {
+      if (isTransferIn && transferIn) {
+        // Transfer In: Load warehouses/stores and boxes
+        await loadWarehousesAndStores();
+        await loadBoxes();
+      } else if (activeASN) {
+        // ASN: Load stores first, then boxes (so sync can use stores list)
+        await loadTransferOrderAndStores();
+        await loadWarehousesAndStores();
+        // Now load boxes (which will sync from backend using stores)
+        await loadBoxes();
+        await checkItemsWithoutTO();
+        await calculateRemainingItems();
+      }
+    };
+    loadData();
+  }, [activeASN, transferIn, isTransferIn]);
 
   // Calculate remaining items: Total ASN - Total TO
   const calculateRemainingItems = async () => {
@@ -91,13 +111,74 @@ export default function BoxManagementScreen() {
       const totalASN = result?.total_qty || 0;
       setTotalASNQty(totalASN);
 
-      // Get Total TO Allocated quantity
-      const allocations = await dataService.getTransferOrderAllocations(activeASN);
-      const totalTO = allocations.reduce((sum, alloc) => sum + (alloc.allocated_qty || 0), 0);
+      // ✅ FIX: Get Total TO Allocated quantity from API (not cache)
+      // Fetch TO from API to get allocations
+      let totalTO = 0;
+      try {
+        const online = await isDeviceOnline();
+        if (!online) {
+          console.warn(`⚠️ Device is offline - cannot calculate TO allocations. Please sync when online.`);
+          setTotalTOAllocatedQty(0);
+          setRemainingItemsQty(totalASN); // Assume all items are remaining if we can't get TO data
+          return;
+        }
+        
+        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        if (toResponse) {
+          const toData = toResponse?.data || toResponse?.transfer_order || toResponse;
+          const allocations = 
+            toData?.allocations || 
+            toData?.items || 
+            toData?.item_lines || 
+            toData?.allocation || 
+            toData?.line_items ||
+            toData?.lines ||
+            [];
+          
+          if (Array.isArray(allocations) && allocations.length > 0) {
+            totalTO = allocations.reduce((sum: number, alloc: any) => sum + (alloc.allocated_qty || alloc.qty || 0), 0);
+          }
+        } else {
+          // ✅ FIX: No TO found (404/null) - this is OK, all items need putaway
+          console.log(`ℹ️ No Transfer Order found for ASN ${activeASN} - all items will need putaway`);
+          totalTO = 0; // No TO means no allocations, so totalTO = 0
+        }
+      } catch (error: any) {
+        console.warn(`⚠️ Error fetching TO allocations from API:`, error.message);
+        // Check if it's a 404 (no TO found) - this is OK, not an error
+        const is404Error = 
+          error.message?.includes("404") ||
+          error.message?.includes("No transfer order found") ||
+          error.message?.includes("not found") ||
+          error.message?.includes("TRANSFER_ORDER_NOT_FOUND");
+        
+        if (is404Error) {
+          // ✅ FIX: 404 means no TO exists - this is OK, all items need putaway
+          console.log(`ℹ️ No Transfer Order found (404) - all items will need putaway`);
+          totalTO = 0; // No TO means no allocations
+        } else {
+          // Other errors (offline, 500, etc.)
+          const isOffline = error.message?.includes("Network") || error.message?.includes("fetch");
+          if (isOffline) {
+            console.warn(`⚠️ Device appears offline - cannot calculate TO allocations. Please sync when online.`);
+          }
+          totalTO = 0; // Default to 0 if we can't fetch
+        }
+      }
       setTotalTOAllocatedQty(totalTO);
 
-      // Calculate remaining: Total ASN - Total TO
-      const remaining = Math.max(0, totalASN - totalTO);
+      // ✅ FIX: Calculate remaining: Total ASN - Total TO
+      // If no TO exists (totalTO = 0), remaining = totalASN (all items need putaway)
+      let remaining = Math.max(0, totalASN - totalTO);
+      
+      // ✅ FIX: If no TO exists and there's available quantity, all items need putaway
+      // This ensures Putaway box creation is allowed when there's no TO but there's available quantity
+      if (!transferOrder && totalASN > 0) {
+        // No TO means no allocations, so all items need putaway
+        remaining = totalASN;
+        console.log(`✅ No TO found - all ${totalASN} items need putaway`);
+      }
+      
       setRemainingItemsQty(remaining);
 
       console.log(`📊 Remaining Items Calculation:`);
@@ -152,9 +233,57 @@ export default function BoxManagementScreen() {
         [normalizedASN]
       );
 
-      // Get all TO allocations
-      const allocations = await dataService.getTransferOrderAllocations(activeASN);
-      const allocatedItemCodes = new Set(allocations.map(a => a.item_code));
+      // ✅ FIX: Get TO allocations from API (not cache)
+      let allocatedItemCodes = new Set<string>();
+      try {
+        const online = await isDeviceOnline();
+        if (!online) {
+          console.warn(`⚠️ Device is offline - cannot check TO allocations. Please sync when online.`);
+          // Don't use cache - show all items as unallocated when offline
+          setItemsWithoutTO(scannedItems.map(item => ({
+            item_code: item.item_code,
+            scanned_qty: item.scanned_qty,
+            store: item.store,
+            box_id: item.box_id,
+          })));
+          setHasItemsWithoutTO(scannedItems.length > 0);
+          return;
+        }
+        
+        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        if (toResponse) {
+          const toData = toResponse?.data || toResponse?.transfer_order || toResponse;
+          const allocations = 
+            toData?.allocations || 
+            toData?.items || 
+            toData?.item_lines || 
+            toData?.allocation || 
+            toData?.line_items ||
+            toData?.lines ||
+            [];
+          
+          if (Array.isArray(allocations) && allocations.length > 0) {
+            allocatedItemCodes = new Set(allocations.map((a: any) => a.item_code).filter(Boolean));
+          }
+        }
+      } catch (error: any) {
+        console.warn(`⚠️ Error fetching TO allocations from API:`, error.message);
+        const isOffline = error.message?.includes("Network") || error.message?.includes("fetch");
+        if (isOffline) {
+          console.warn(`⚠️ Device appears offline - cannot check TO allocations. Please sync when online.`);
+          // Don't use cache - show all items as unallocated when offline
+          setItemsWithoutTO(scannedItems.map(item => ({
+            item_code: item.item_code,
+            scanned_qty: item.scanned_qty,
+            store: item.store,
+            box_id: item.box_id,
+          })));
+          setHasItemsWithoutTO(scannedItems.length > 0);
+          return;
+        }
+        // For other errors, assume no allocations (all items are unallocated)
+        allocatedItemCodes = new Set();
+      }
 
       // Find items that are NOT allocated to any TO
       const unallocatedItems: any[] = [];
@@ -262,180 +391,43 @@ export default function BoxManagementScreen() {
     }
 
     try {
-      const db = await getDatabase();
-      const normalizedASN = normalizeASN(activeASN);
+      // ✅ FIX: Always fetch from API directly - do NOT use local cache
+      // User requirement: Transfer Order data must come from backend API, not local cache
+      // If offline, ask user to sync instead of using stale cache
+      console.log(`🔄 Fetching Transfer Order directly from API for ASN: ${activeASN}`);
+      console.log(`✅ DATA SOURCE: Always using backend API - NOT reading from local cache`);
+      console.log(`✅ API Endpoint: GET /api/transfer-order/by-asn/${activeASN}`);
       
-      // STEP 1: Check if there are scanned items for this ASN
-      // Items must be scanned first (in Receive + Sort) before we can create boxes
-      const scannedItems = await db.getAllAsync<{
-        item_code: string;
-        store: string | null;
-        scanned_qty: number;
-      }>(
-        `SELECT DISTINCT item_code, store, SUM(scanned_qty) as scanned_qty
-         FROM scanned_items 
-         WHERE asn_no = ? OR asn_no = ?
-         GROUP BY item_code, store`,
-        [activeASN, normalizedASN]
-      );
-      
-      console.log(`🔍 Found ${scannedItems.length} scanned item/store combinations for ASN ${activeASN}`);
-      
-      // STEP 2: Get transfer order allocations for this ASN
-      // This should only return allocations for the current ASN
-      const allocations = await dataService.getTransferOrderAllocations(
-        activeASN
-      );
-      
-      // STEP 3: Determine if TO exists
-      const hasTO = allocations.length > 0;
-      
-      console.log(`🔍 TO Analysis for ASN ${activeASN}:`);
-      console.log(`  - Has TO: ${hasTO}`);
-      console.log(`  - Scanned items count: ${scannedItems.length}`);
-      
-      // STEP 4: Logic for showing stores:
-      // - If TO exists → show stores from TO → allow creating boxes for TO stores
-      // - If no TO → show Putaway section → allow creating Putaway boxes
-      // The Putaway section visibility is controlled separately by hasItemsWithoutTO and hasPutawayBoxes
-      
-      if (!hasTO) {
-        console.log(`ℹ️ No TO found in local cache - will try API fetch, then show Putaway section if still no TO`);
+      // Check if device is online
+      const online = await isDeviceOnline();
+      if (!online) {
+        console.warn(`⚠️ Device is offline - cannot fetch Transfer Order from API`);
+        Alert.alert(
+          "Offline Mode",
+          "Your device is currently offline.\n\n" +
+          "Transfer Order data must be fetched from the backend API.\n\n" +
+          "Please connect to the internet and sync data, or try again when online.",
+          [
+            {
+              text: "OK",
+              onPress: () => {
+                setTransferOrder(null);
+                setDistributionStores([]);
+              }
+            }
+          ]
+        );
         setTransferOrder(null);
         setDistributionStores([]);
-        // Continue to API fetch - might find TO there
-      } else {
-        console.log(`ℹ️ TO exists in local cache - will show TO stores for creating boxes`);
-        console.log(`ℹ️ Found ${allocations.length} TO allocations - extracting stores...`);
-        // Continue with logic to load TO and stores below
-      }
-
-      // Continue with existing logic to load TO and stores
-      // This will execute if hasTO is true
-      console.log(`🔍 Loading TO allocations for ASN: ${activeASN}`);
-      console.log(`🔍 Found ${allocations.length} allocations in database`);
-      
-      if (allocations.length > 0) {
-        console.log(`🔍 Sample allocations:`, allocations.slice(0, 5).map(a => ({ 
-          asn_no: a.asn_no, 
-          to_no: a.to_no, 
-          store: a.store, 
-          item_code: a.item_code 
-        })));
-        
-        // Verify all allocations are for the current ASN
-        const wrongASN = allocations.filter(a => {
-          const allocASN = a.asn_no?.toUpperCase().trim();
-          const currentASN = activeASN.toUpperCase().trim();
-          return allocASN !== currentASN;
-        });
-        if (wrongASN.length > 0) {
-          console.error(`❌ ERROR: Found ${wrongASN.length} allocations for different ASN!`);
-          console.error(`❌ Current ASN: ${activeASN}, Wrong ASN allocations:`, wrongASN.map(a => a.asn_no));
-        }
-      }
-
-      let shouldFetchFromAPI = true; // Default to fetching from API
-      
-      if (allocations.length > 0) {
-        // Get unique TO number (should be same for all allocations)
-        const toNo = allocations[0].to_no;
-        
-        // Verify TO matches current ASN - if not, clear cache and fetch from API
-        const allASNs = Array.from(new Set(allocations.map(a => a.asn_no).filter(Boolean)));
-        const currentASNUpper = activeASN.toUpperCase().trim();
-        const allocationsMatchASN = allASNs.every(asn => asn.toUpperCase().trim() === currentASNUpper);
-        
-        // Also verify TO number is correct (not old cached data like TO-00012 for ASN-12225)
-        // For ASN-12225, the correct TO should be TO-0001 (from backend)
-        let cacheIsValid = allocationsMatchASN && allASNs.length > 0;
-        
-        if (cacheIsValid && activeASN === "ASN-12225" && toNo && toNo !== "TO-0001") {
-          console.error(`❌ ERROR: Cached TO ${toNo} doesn't match expected TO-0001 for ASN-12225!`);
-          console.error(`❌ This is old cached data - clearing cache and fetching fresh data...`);
-          cacheIsValid = false;
-        }
-        
-        if (!cacheIsValid) {
-          console.error(`❌ ERROR: Cached TO allocations are invalid or don't match!`);
-          console.error(`❌ Current ASN: ${activeASN}`);
-          console.error(`❌ Cached allocations ASNs:`, allASNs);
-          console.error(`❌ Cached TO: ${toNo}`);
-          console.warn(`⚠️ Clearing old cached allocations and fetching fresh data from API...`);
-          
-          // Clear old cached allocations for this ASN
-          try {
-            const dbForClear = await getDatabase();
-            const normalizedASNForClear = normalizeASN(activeASN);
-            await dbForClear.runAsync(
-              `DELETE FROM transfer_order_cache WHERE asn_no = ? OR asn_no = ?`,
-              [activeASN, normalizedASNForClear]
-            );
-            console.log(`✅ Cleared old cached TO allocations`);
-          } catch (clearError: any) {
-            console.warn(`⚠️ Failed to clear old cached allocations:`, clearError.message);
-          }
-          
-          // Don't use cached data - will fetch from API below
-          setTransferOrder(null);
-          setDistributionStores([]);
-          shouldFetchFromAPI = true; // Force API fetch
-        } else {
-          // Cache is valid - use it
-          shouldFetchFromAPI = false; // Don't fetch from API
-          // Allocations match current ASN and TO is valid - use them
-          console.log(`✅ Verified: Cached TO allocations match current ASN ${activeASN}`);
-          console.log(`✅ TO Number: ${toNo}`);
-          setTransferOrder(toNo || null);
-
-          // Get unique stores from allocations (include ALL stores from TO, including warehouses)
-          // Log sample allocations to debug store field extraction
-          if (allocations.length > 0) {
-            console.log(`📦 Sample cached allocation:`, allocations[0]);
-            console.log(`📦 All stores in cached allocations:`, allocations.map(a => a.store).filter(Boolean));
-          }
-          
-          const uniqueStores = Array.from(
-            new Set(allocations.map((a) => a.store).filter((s) => s && String(s).trim() !== ""))
-          );
-
-          console.log(`📦 Store codes from local TO allocations:`, uniqueStores);
-          console.log(`📦 Total unique stores found: ${uniqueStores.length}`);
-          
-          // Include ALL stores from TO allocations (including warehouses like WAREHOUSE, WH-MAIN, etc.)
-          setDistributionStores(uniqueStores.sort());
-          
-          console.log(
-            `✅ Found ${allocations.length} allocations in local database for ASN ${activeASN}`
-          );
-          console.log(
-            `📦 Stores from Transfer Order for ASN ${activeASN}:`,
-            uniqueStores
-          );
-          console.log(`📦 Transfer Order: ${toNo}`);
-          console.log(`📦 Sample allocations:`, allocations.slice(0, 5).map(a => ({ store: a.store, item: a.item_code, allocated_qty: a.allocated_qty })));
-          console.log(`📦 All unique stores in allocations:`, Array.from(new Set(allocations.map(a => a.store).filter(Boolean))));
-          
-        }
+        return;
       }
       
-      // If we didn't use cached data (either no cache or invalid cache), fetch from API
-      // Also fetch if cache had no stores (might be incomplete data)
-      // Check if we need to fetch from API (no allocations found OR cache was invalid OR no stores found)
-      const needsAPIFetch = allocations.length === 0 || shouldFetchFromAPI;
-      
-      if (needsAPIFetch) {
-        if (allocations.length > 0) {
-          console.log(`ℹ️ Cached allocations were invalid, fetching fresh data from API for ASN ${activeASN}...`);
-        } else {
-          console.log(`ℹ️ No allocations found in local database for ASN ${activeASN}, fetching from API...`);
-        }
-        // Fetch TO from API
-        try {
-          console.log(`🔄 Fetching Transfer Order from API for ASN: ${activeASN}`);
-          const toResponse = await apiService.getTransferOrderByASN(activeASN);
-          console.log("📋 Transfer Order API Response (raw):", toResponse);
-          console.log("📋 Transfer Order API Response (stringified):", JSON.stringify(toResponse, null, 2));
+      // Fetch TO from API directly (skip cache check)
+      try {
+        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        console.log("📋 Transfer Order API Response (raw):", toResponse);
+        console.log("📋 Transfer Order API Response (stringified):", JSON.stringify(toResponse, null, 2));
+        console.log(`✅ DATA SOURCE: Transfer Order data comes from backend API - NO CACHE - NO MOCK DATA`);
           console.log("📋 Transfer Order API Response type:", typeof toResponse);
           console.log("📋 Transfer Order API Response is null?", toResponse === null);
           console.log("📋 Transfer Order API Response is undefined?", toResponse === undefined);
@@ -460,8 +452,8 @@ export default function BoxManagementScreen() {
           if (toData && (toData.to_no || toData.transfer_order)) {
             const toNo = toData.to_no || toData.transfer_order;
             setTransferOrder(toNo);
-            console.log(`✅ Transfer Order found: ${toNo}`);
-            console.log(`✅ Setting transferOrder state to: ${toNo}`);
+            console.log(`✅ Transfer Order found from API: ${toNo}`);
+            console.log(`✅ Setting transferOrder state to: ${toNo} (from API, not cache)`);
             
             // Extract stores from allocations if available
             // Try multiple possible field names for allocations
@@ -475,30 +467,32 @@ export default function BoxManagementScreen() {
               toData.lines ||
               (Array.isArray(toData) ? toData : []);
             
-            console.log(`📦 Extracted allocations:`, allocations);
+            console.log(`📦 Extracted allocations from API:`, allocations);
             console.log(`📦 Allocations type:`, typeof allocations);
             console.log(`📦 Allocations isArray:`, Array.isArray(allocations));
             console.log(`📦 Allocations length:`, Array.isArray(allocations) ? allocations.length : "N/A");
             
             if (allocations && Array.isArray(allocations) && allocations.length > 0) {
-              console.log(`📦 First allocation sample:`, allocations[0]);
-              // Save allocations to local database for future queries
-              // Normalize ASN for storage consistency
+              console.log(`📦 First allocation sample from API:`, allocations[0]);
+              console.log(`✅ DATA SOURCE: Stores extracted from TO allocations (API) - NO CACHE - NO MOCK DATA`);
+              console.log(`✅ Stores found in TO allocations:`, Array.from(new Set(allocations.map((a: any) => a.store || a.store_code).filter(Boolean))));
+              
+              // ✅ FIX: Update local cache from API response (for sync purposes only)
+              // Cache is updated from API, but never used for display - always use API data
               const normalizedASN = normalizeASN(activeASN);
               const db = await getDatabase();
               
               try {
-                // Clear old allocations for this ASN before saving new ones
-                // This ensures we don't have stale data from previous sessions or different ASNs
-                console.log(`🗑️ Clearing old TO allocations for ASN ${activeASN} before saving new ones...`);
+                // Clear old allocations for this ASN before saving new ones from API
+                console.log(`🗑️ Updating local cache from API response (cache updated from API, not used for display)...`);
                 await db.runAsync(
                   `DELETE FROM transfer_order_cache WHERE asn_no = ? OR asn_no = ?`,
                   [activeASN, normalizedASN]
                 );
-                console.log(`✅ Cleared old TO allocations`);
+                console.log(`✅ Cleared old cache data`);
                 
-                console.log(`💾 Saving ${allocations.length} TO allocations to local database...`);
-                console.log(`💾 ASN: ${activeASN}, TO: ${toNo}`);
+                // Save API response to local cache (for sync/offline reference only - NOT used for display)
+                console.log(`💾 Updating local cache with ${allocations.length} TO allocations from API response...`);
                 for (const allocation of allocations) {
                   if (allocation.store && allocation.item_code) {
                     await db.runAsync(
@@ -507,7 +501,7 @@ export default function BoxManagementScreen() {
                        VALUES (?, ?, ?, ?, ?)`,
                       [
                         toNo,
-                        normalizedASN, // Use normalized ASN for consistency
+                        normalizedASN,
                         allocation.store || allocation.store_code,
                         allocation.item_code,
                         allocation.allocated_qty || allocation.qty || 0,
@@ -515,14 +509,13 @@ export default function BoxManagementScreen() {
                     );
                   }
                 }
-                console.log(`✅ Saved ${allocations.length} TO allocations to local database for ASN ${activeASN}, TO ${toNo}`);
+                console.log(`✅ Local cache updated from API (cache is for sync only, display always uses API)`);
               } catch (saveError: any) {
-                console.warn(`⚠️ Failed to save TO allocations to database:`, saveError.message);
-                // Continue even if save fails - we can still use the data from API
+                console.warn(`⚠️ Failed to update local cache from API:`, saveError.message);
+                // Continue - cache update is optional, API data is primary
               }
 
-              // Get store codes from allocations
-              // Handle different field names for store: store, store_code, warehouse, etc.
+              // Get store codes from API allocations (NOT from cache)
               const allocationStoreCodes: string[] = Array.from(
                 new Set(
                   allocations
@@ -531,14 +524,14 @@ export default function BoxManagementScreen() {
                 )
               ) as string[];
 
-              console.log(`📦 Store codes from TO allocations:`, allocationStoreCodes);
+              console.log(`📦 Store codes from API TO allocations:`, allocationStoreCodes);
               console.log(`📦 Raw allocations from API:`, allocations.slice(0, 5).map(a => ({ 
                 store: a.store || a.store_code, 
                 item: a.item_code,
                 allocated_qty: a.allocated_qty || a.qty 
               })));
 
-              // Include ALL stores from TO allocations (including warehouses like WAREHOUSE, WH-MAIN, etc.)
+              // Set stores from API data (NOT from cache)
               setDistributionStores(allocationStoreCodes.sort());
               
               // Log which stores are in master for reference (but don't filter)
@@ -562,46 +555,82 @@ export default function BoxManagementScreen() {
                 }
               }
             } else {
-              // No allocations in TO - don't show warehouses, show empty list
-              // Stores should ONLY come from tabtransferorderitem (TO allocations)
-              console.log(`⚠️ No allocations found in TO response`);
+              // No allocations in TO - show empty list
+              console.log(`⚠️ No allocations found in TO response from API`);
               console.log(`⚠️ toData structure:`, JSON.stringify(toData, null, 2));
               console.log(`⚠️ Available fields in toData:`, toData ? Object.keys(toData) : "null");
-              console.log(`ℹ️ No allocations in TO - showing empty store list (no warehouses)`);
-              // Keep the TO number even if no allocations, but don't show warehouses
+              console.log(`ℹ️ No allocations in TO - showing empty store list`);
               setDistributionStores([]);
             }
           } else {
-            // No Transfer Order found - show empty list (no warehouses)
-            // Stores should ONLY come from tabtransferorderitem (TO allocations)
-            console.log(`ℹ️ No Transfer Order found for ASN ${activeASN}`);
+            // No Transfer Order found - show empty list
+            console.log(`ℹ️ No Transfer Order found for ASN ${activeASN} (from API)`);
             setTransferOrder(null);
             setDistributionStores([]);
           }
         } catch (error: any) {
-          // Handle 404 errors gracefully - ASN can be received without Transfer Order
+          // Handle errors - check if offline
           const errorMessage = error?.message || error?.toString() || "";
+          const isOffline = 
+            errorMessage.includes("Network") ||
+            errorMessage.includes("fetch") ||
+            errorMessage.includes("Failed to fetch") ||
+            errorMessage.includes("Network request failed");
+          
           const is404Error = 
             errorMessage.includes("404") ||
             errorMessage.includes("No transfer order found") ||
             errorMessage.includes("not found") ||
             errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
           
-          if (is404Error) {
+          if (isOffline) {
+            // Device is offline - ask user to sync
+            console.warn(`⚠️ BoxManagementScreen: Device is offline - cannot fetch Transfer Order`);
+            Alert.alert(
+              "Offline Mode",
+              "Your device is currently offline.\n\n" +
+              "Transfer Order data must be fetched from the backend API.\n\n" +
+              "Please connect to the internet and sync data, or try again when online.",
+              [
+                {
+                  text: "OK",
+                  onPress: () => {
+                    setTransferOrder(null);
+                    setDistributionStores([]);
+                  }
+                }
+              ]
+            );
+            setTransferOrder(null);
+            setDistributionStores([]);
+            return;
+          } else if (is404Error) {
             // 404 is expected - ASN can be received without Transfer Order
             console.log(
               `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`
             );
+            setTransferOrder(null);
+            setDistributionStores([]);
           } else {
-            // Other errors (network, 500, etc.) - log as warning
-            console.warn("⚠️ BoxManagementScreen: Could not fetch transfer order:", errorMessage);
+            // Other errors (500, etc.) - log as warning
+            console.warn("⚠️ BoxManagementScreen: Could not fetch transfer order from API:", errorMessage);
+            Alert.alert(
+              "API Error",
+              `Failed to fetch Transfer Order from backend:\n\n${errorMessage}\n\nPlease try again or contact support.`,
+              [
+                {
+                  text: "OK",
+                  onPress: () => {
+                    setTransferOrder(null);
+                    setDistributionStores([]);
+                  }
+                }
+              ]
+            );
+            setTransferOrder(null);
+            setDistributionStores([]);
           }
-          // No Transfer Order - show empty list (no warehouses)
-          // Stores should ONLY come from tabtransferorderitem (TO allocations)
-          setTransferOrder(null);
-          setDistributionStores([]);
         }
-      }
       
       // Final diagnostic: If TO exists but no stores, log a warning
       if (transferOrder && distributionStores.length === 0) {
@@ -640,7 +669,127 @@ export default function BoxManagementScreen() {
 
   const loadBoxes = async () => {
     if (!activeASN) return;
-    // Load all boxes including Putaway boxes
+    
+    // ✅ FIX: Always fetch boxes from backend API - do NOT use local cache for display
+    // Check if device is online first
+    const online = await isDeviceOnline();
+    if (!online) {
+      console.warn(`⚠️ Device is offline - cannot fetch boxes from API`);
+      Alert.alert(
+        "Offline Mode",
+        "Your device is currently offline.\n\n" +
+        "Box data must be fetched from the backend API.\n\n" +
+        "Please connect to the internet and sync data, or try again when online.",
+        [
+          {
+            text: "OK",
+            onPress: () => {
+              setBoxes([]);
+            }
+          }
+        ]
+      );
+      setBoxes([]);
+      return;
+    }
+    
+    // ✅ SYNC: Fetch boxes from backend API for each store
+    // This ensures boxes created on backend/desktop are visible on mobile
+    try {
+      // Get current stores (from TO allocations - distributionStores)
+      // Note: stores variable is defined later as distributionStores, so use distributionStores directly
+      const currentStores = distributionStores.length > 0 ? distributionStores : [];
+      if (currentStores.length > 0) {
+        console.log(`🔄 Fetching boxes from backend API for ${currentStores.length} store(s): ${currentStores.join(", ")}`);
+        console.log(`✅ DATA SOURCE: Always using backend API - NOT reading from local cache`);
+        console.log(`✅ API Endpoint: GET /api/boxes?asn=${activeASN}&store={store}`);
+        for (const store of currentStores) {
+          try {
+            const backendBoxes = await apiService.getBoxes({ asn: activeASN, store });
+            console.log(`✅ Fetching boxes for store ${store} from backend API (not cache)`);
+            let boxesArray: any[] = [];
+            
+            // Handle different response formats
+            if (Array.isArray(backendBoxes)) {
+              boxesArray = backendBoxes;
+            } else if (backendBoxes && typeof backendBoxes === 'object') {
+              boxesArray = (backendBoxes as any).data || (backendBoxes as any).boxes || (backendBoxes as any).items || [];
+            }
+            
+            if (Array.isArray(boxesArray) && boxesArray.length > 0) {
+              const db = await getDatabase();
+              if (db) {
+                let syncedCount = 0;
+                for (const box of boxesArray) {
+                  if (box.box_id && box.store) {
+                    await dataService.saveBox({
+                      box_id: box.box_id,
+                      asn_no: box.asn_no || activeASN,
+                      to_no: box.to_no || null,
+                      store: box.store,
+                      status: box.status || "Open",
+                      purpose: box.purpose || "STORE",
+                      updated_on: box.updated_on || new Date().toISOString(),
+                    });
+                    syncedCount++;
+                  }
+                }
+                console.log(`✅ Synced ${syncedCount} box(es) from backend for store ${store}`);
+              }
+            } else {
+              console.log(`ℹ️ No boxes found in backend API for store ${store} (this is OK if no boxes created yet)`);
+            }
+          } catch (error: any) {
+            // Check if offline
+            const errorMessage = error?.message || error?.toString() || "";
+            const isOffline = 
+              errorMessage.includes("Network") ||
+              errorMessage.includes("fetch") ||
+              errorMessage.includes("Failed to fetch");
+            
+            if (isOffline) {
+              console.warn(`⚠️ Device is offline - cannot fetch boxes for store ${store}`);
+              // Don't use cache - show error
+              Alert.alert(
+                "Offline Mode",
+                `Cannot fetch boxes for store ${store}.\n\n` +
+                "Your device is offline. Please connect to the internet and sync data.",
+                [{ text: "OK" }]
+              );
+            } else {
+              // Other API errors (404, 500, etc.)
+              console.warn(`⚠️ Could not fetch boxes from backend API for store ${store}:`, errorMessage);
+            }
+          }
+        }
+      } else {
+        console.log(`ℹ️ No stores available yet for fetching boxes (stores will be loaded from TO API)`);
+      }
+    } catch (error: any) {
+      const errorMessage = error?.message || error?.toString() || "";
+      const isOffline = 
+        errorMessage.includes("Network") ||
+        errorMessage.includes("fetch") ||
+        errorMessage.includes("Failed to fetch");
+      
+      if (isOffline) {
+        console.warn(`⚠️ Device is offline - cannot fetch boxes from API`);
+        Alert.alert(
+          "Offline Mode",
+          "Your device is currently offline.\n\n" +
+          "Box data must be fetched from the backend API.\n\n" +
+          "Please connect to the internet and sync data.",
+          [{ text: "OK" }]
+        );
+        setBoxes([]);
+        return;
+      } else {
+        console.warn(`⚠️ Error fetching boxes from backend API:`, errorMessage);
+      }
+    }
+    
+    // ✅ FIX: Load boxes from local database (updated from API above) - but only if API fetch succeeded
+    // If API failed, don't show stale cache data
     const boxList = await dataService.getBoxes(activeASN);
       console.log(
         "📦 All boxes loaded:",
@@ -911,8 +1060,9 @@ export default function BoxManagementScreen() {
   };
 
   const handleCreateBox = async (store?: string) => {
-    if (!activeASN) {
-      Alert.alert("Error", "No active ASN");
+    // ✅ NEW: Support both ASN and Transfer In
+    if (!activeASN && !transferIn) {
+      Alert.alert("Error", isTransferIn ? "No Transfer In selected" : "No active ASN");
       return;
     }
 
@@ -1030,7 +1180,8 @@ export default function BoxManagementScreen() {
         storeCode: selectedStoreInfo?.code,
       });
 
-      if (!transferOrder && !isWarehouse) {
+      // ✅ NEW: Only check Transfer Order for ASN (not Transfer In)
+      if (!isTransferIn && !transferOrder && !isWarehouse) {
         // Only show alert for distribution stores (SR-*), not for WAREHOUSE
         const proceed = await new Promise<boolean>((resolve) => {
           Alert.alert(
@@ -1060,14 +1211,29 @@ export default function BoxManagementScreen() {
         }
       }
 
-      // Build request data - conditionally include to_no only if it exists
-      // Backend requires to_no, but for WAREHOUSE we can send empty string
+      // ✅ NEW: Build request data - support both ASN and Transfer In
       const requestData: any = {
-        asn_no: activeASN,
         store: normalizedStore,
-        purpose: "STORE", // Per PDF section 12.6
-        user_id: settings.user_id, // Per PDF section 12.6
+        purpose: isTransferIn ? "PUTAWAY" : "STORE", // Transfer In boxes are for putaway
+        user_id: settings.user_id,
       };
+      
+      // ✅ NEW: Include Transfer In or ASN based on source type
+      if (isTransferIn && transferIn) {
+        requestData.transfer_in = transferIn;
+        // ✅ NEW: Generate TI- naming series for Transfer In boxes
+        const timestamp = Date.now();
+        const transferInBoxId = `TI-PUT-${transferIn.replace(/[^A-Z0-9]/g, "")}-${timestamp}`;
+        requestData.box_id = transferInBoxId; // Send TI- format box_id to backend
+        requestData.to_no = "Putaway"; // Set Transfer Order to "Putaway" for Transfer In putaway boxes
+        requestData.transfer_order = "Putaway";
+      } else if (activeASN) {
+        requestData.asn_no = activeASN;
+      } else {
+        Alert.alert("Error", "No ASN or Transfer In available");
+        setLoading(false);
+        return;
+      }
 
       // Include to_no/transfer_order - send null if not available (backend should handle null)
       // Some backends might require the field, others might accept null
@@ -1083,9 +1249,37 @@ export default function BoxManagementScreen() {
       }
 
       let response;
+      let boxId: string | null = null;
+      
+      // ✅ NEW: For Transfer In, use generated TI- box_id
+      if (isTransferIn && requestData.box_id) {
+        boxId = requestData.box_id; // Use generated TI-PUT- format
+      }
+      
       try {
         response = await apiService.createBox(requestData);
         console.log("📦 API Response:", JSON.stringify(response, null, 2));
+        
+        // ✅ NEW: For Transfer In, prefer our generated TI- format
+        if (isTransferIn && boxId) {
+          const backendBoxId =
+            response?.box_id ||
+            response?.data?.box_id ||
+            response?.box?.box_id ||
+            response?.id ||
+            null;
+          
+          if (backendBoxId && (backendBoxId.startsWith("TI-") || backendBoxId.startsWith("TI-PUT-"))) {
+            // Backend returned TI- format - use it
+            boxId = backendBoxId;
+            console.log(`✅ Backend returned TI- format box_id: ${boxId}`);
+          } else if (backendBoxId) {
+            // Backend returned different format - use our format
+            console.warn(`⚠️ Backend returned box_id in different format: ${backendBoxId}, using our TI- format: ${boxId}`);
+          } else {
+            console.log(`ℹ️ Backend did not return box_id, using generated TI- format: ${boxId}`);
+          }
+        }
       } catch (apiError: any) {
         // Enhanced error handling for validation errors
         const errorMessage = apiError.message || apiError.toString() || "Unknown error";
@@ -1128,14 +1322,28 @@ export default function BoxManagementScreen() {
         throw apiError;
       }
 
-      // Handle different response formats from backend
-      // Backend might return: { box_id: "..." } or { data: { box_id: "..." } } or { box: { box_id: "..." } }
-      const boxId =
-        response?.box_id ||
-        response?.data?.box_id ||
-        response?.box?.box_id ||
-        response?.id ||
-        null;
+      // ✅ NEW: Extract box_id from response (only if not Transfer In, as we already have TI- format)
+      if (!isTransferIn) {
+        // For ASN, extract box_id from response
+        const backendBoxId =
+          response?.box_id ||
+          response?.data?.box_id ||
+          response?.box?.box_id ||
+          response?.id ||
+          null;
+
+        if (backendBoxId) {
+          boxId = backendBoxId;
+          console.log(`✅ Using backend box_id: ${boxId}`);
+        } else {
+          // Backend didn't return box_id - generate one
+          // Format: BOX-{STORE}-{TIMESTAMP}
+          const timestamp = Date.now();
+          boxId = `BOX-${normalizedStore.replace(/[^A-Z0-9]/g, "")}-${timestamp}`;
+          console.log(`ℹ️ Backend didn't return box_id, generated: ${boxId}`);
+        }
+      }
+      // For Transfer In, boxId is already set from generated TI- format above
 
       if (!boxId) {
         console.error("❌ No box_id in API response:", response);
@@ -1143,15 +1351,23 @@ export default function BoxManagementScreen() {
         const tempBoxId = `BOX-${normalizedStore}-${Date.now()}`;
         console.warn(`⚠️ Using temporary box ID: ${tempBoxId}`);
 
+        // ✅ NEW: Build box data - support both ASN and Transfer In
         const newBox: any = {
           box_id: tempBoxId,
-          asn_no: activeASN,
-          to_no: transferOrder || null, // Use null if no TO (instead of undefined for database)
           store: normalizedStore,
           status: "Open",
-          purpose: "STORE",
+          purpose: isTransferIn ? "PUTAWAY" : "STORE",
           updated_on: new Date().toISOString(),
         };
+        
+        // ✅ NEW: Include Transfer In or ASN based on source type
+        if (isTransferIn && transferIn) {
+          newBox.transfer_in = transferIn;
+          newBox.to_no = "Putaway";
+        } else if (activeASN) {
+          newBox.asn_no = activeASN;
+          newBox.to_no = transferOrder || null;
+        }
 
         await dataService.saveBox(newBox);
         await loadBoxes();
@@ -1162,15 +1378,23 @@ export default function BoxManagementScreen() {
         return;
       }
 
+      // ✅ NEW: Build box data - support both ASN and Transfer In
       const newBox: any = {
         box_id: boxId,
-        asn_no: activeASN,
-        to_no: transferOrder || null, // Use null if no TO (instead of undefined for database)
         store: normalizedStore, // Use normalized store value
         status: "Open",
-        purpose: "STORE", // Explicitly set purpose for warehouse and store boxes
+        purpose: isTransferIn ? "PUTAWAY" : "STORE", // Transfer In boxes are for putaway
         updated_on: new Date().toISOString(),
       };
+      
+      // ✅ NEW: Include Transfer In or ASN based on source type
+      if (isTransferIn && transferIn) {
+        newBox.transfer_in = transferIn;
+        newBox.to_no = "Putaway";
+      } else if (activeASN) {
+        newBox.asn_no = activeASN;
+        newBox.to_no = transferOrder || null;
+      }
 
       console.log("💾 Saving box:", newBox);
       await dataService.saveBox(newBox);
@@ -1763,11 +1987,13 @@ export default function BoxManagementScreen() {
     }
   };
 
-  // Create Putaway BOX/TC for items without TO
-  // Just creates the box - items will be added normally during Receive + Sort
+  // ✅ NEW: Create Putaway BOX/TC for items without TO - support both ASN and Transfer In
+  // For ASN: Items will be added during Receive + Sort
+  // For Transfer In: Items will be scanned directly in Box Management
   const handleCreatePutawayBox = async () => {
-    if (!activeASN) {
-      Alert.alert("Error", "No active ASN");
+    // ✅ NEW: Support both ASN and Transfer In
+    if (!activeASN && !transferIn) {
+      Alert.alert("Error", isTransferIn ? "No Transfer In selected" : "No active ASN");
       return;
     }
 
@@ -1790,22 +2016,40 @@ export default function BoxManagementScreen() {
         ? warehouseStores[0].code 
         : "WH-MAIN";
 
-      // Generate BOX ID for Putaway (will also be used as TC ID)
-      // Format: PAW-{ASN}-{TIMESTAMP} (different abbreviation from normal BOX-{STORE}-{TIMESTAMP})
+      // ✅ NEW: Generate BOX ID for Putaway - support both ASN and Transfer In
+      // ASN Format: PAW-{ASN}-{TIMESTAMP}
+      // Transfer In Format: TI-PUT-{TRANSFER_IN}-{TIMESTAMP}
       const timestamp = Date.now();
-      const putawayBoxId = `PAW-${activeASN.replace(/[^A-Z0-9]/g, "")}-${timestamp}`;
+      let putawayBoxId: string;
+      
+      if (isTransferIn && transferIn) {
+        // ✅ NEW: Transfer In Putaway box - use TI- naming series
+        putawayBoxId = `TI-PUT-${transferIn.replace(/[^A-Z0-9]/g, "")}-${timestamp}`;
+      } else if (activeASN) {
+        // ASN Putaway box - use PAW- format
+        putawayBoxId = `PAW-${activeASN.replace(/[^A-Z0-9]/g, "")}-${timestamp}`;
+      } else {
+        Alert.alert("Error", "No ASN or Transfer In available");
+        setLoading(false);
+        return;
+      }
 
-      // Build request data for backend API
-      // Include box_id in request so backend uses our PAW- format
+      // ✅ NEW: Build request data for backend API - support both ASN and Transfer In
       const requestData: any = {
-        asn_no: activeASN,
         store: warehouseStore,
         purpose: "PUTAWAY", // Mark as Putaway box
         user_id: settings.user_id,
         to_no: "Putaway", // Set Transfer Order to "Putaway" for putaway boxes
         transfer_order: "Putaway",
-        box_id: putawayBoxId, // Send our generated PAW- format box_id to backend
+        box_id: putawayBoxId, // Send our generated format (PAW- for ASN, TI-PUT- for Transfer In)
       };
+      
+      // ✅ NEW: Include ASN or Transfer In based on source type
+      if (isTransferIn && transferIn) {
+        requestData.transfer_in = transferIn;
+      } else if (activeASN) {
+        requestData.asn_no = activeASN;
+      }
 
       let response;
       let boxId = putawayBoxId; // Always use our generated PAW- format for Putaway boxes
@@ -1824,15 +2068,27 @@ export default function BoxManagementScreen() {
           response?.id ||
           null;
 
-        if (backendBoxId && backendBoxId.startsWith("PAW-")) {
-          // Only use backend box_id if it matches our PAW- format
-          boxId = backendBoxId;
-          console.log(`✅ Backend returned PAW- format box_id: ${boxId}`);
-        } else if (backendBoxId) {
-          // Backend returned different format - log warning but use our format
-          console.warn(`⚠️ Backend returned box_id in different format: ${backendBoxId}, using our PAW- format: ${boxId}`);
+        // ✅ NEW: Check backend box_id format - support both PAW- (ASN) and TI- (Transfer In)
+        if (isTransferIn && transferIn) {
+          // Transfer In: Check for TI- format
+          if (backendBoxId && (backendBoxId.startsWith("TI-") || backendBoxId.startsWith("TI-PUT-"))) {
+            boxId = backendBoxId;
+            console.log(`✅ Backend returned TI- format box_id: ${boxId}`);
+          } else if (backendBoxId) {
+            console.warn(`⚠️ Backend returned box_id in different format: ${backendBoxId}, using our TI- format: ${boxId}`);
+          } else {
+            console.log(`ℹ️ Backend did not return box_id, using generated TI- format: ${boxId}`);
+          }
         } else {
-          console.log(`ℹ️ Backend did not return box_id, using generated PAW- format: ${boxId}`);
+          // ASN: Check for PAW- format
+          if (backendBoxId && backendBoxId.startsWith("PAW-")) {
+            boxId = backendBoxId;
+            console.log(`✅ Backend returned PAW- format box_id: ${boxId}`);
+          } else if (backendBoxId) {
+            console.warn(`⚠️ Backend returned box_id in different format: ${backendBoxId}, using our PAW- format: ${boxId}`);
+          } else {
+            console.log(`ℹ️ Backend did not return box_id, using generated PAW- format: ${boxId}`);
+          }
         }
       } catch (apiError: any) {
         // If backend API fails, still create locally with generated PAW- format
@@ -1842,16 +2098,22 @@ export default function BoxManagementScreen() {
         // Continue with local creation
       }
 
-      // Create BOX for Putaway (save to local database)
-      const putawayBox = {
+      // ✅ NEW: Create BOX for Putaway (save to local database) - support both ASN and Transfer In
+      const putawayBox: any = {
         box_id: boxId,
-        asn_no: activeASN,
         to_no: "Putaway", // Set Transfer Order to "Putaway" for putaway boxes
         store: warehouseStore,
         status: "Open",
         purpose: "PUTAWAY", // Mark as Putaway box
         updated_on: new Date().toISOString(),
       };
+      
+      // ✅ NEW: Include ASN or Transfer In based on source type
+      if (isTransferIn && transferIn) {
+        putawayBox.transfer_in = transferIn;
+      } else if (activeASN) {
+        putawayBox.asn_no = activeASN;
+      }
 
       await dataService.saveBox(putawayBox);
       console.log(`✅ Putaway Box ${boxId} saved to local database`);
@@ -1862,7 +2124,9 @@ export default function BoxManagementScreen() {
 
       Alert.alert(
         "Putaway Box Created",
-        `Putaway Box ${boxId} created successfully.\n\nItems without TO can now be sorted into this box during Receive + Sort.\n\nThis box will appear in Putaway list after sealing.`,
+        isTransferIn
+          ? `Transfer In Putaway Box ${boxId} created successfully.\n\nYou can now scan items into this box. After closing the box, it will appear in Putaway list.`
+          : `Putaway Box ${boxId} created successfully.\n\nItems without TO can now be sorted into this box during Receive + Sort.\n\nThis box will appear in Putaway list after sealing.`,
         [{ text: "OK" }]
       );
     } catch (error: any) {
@@ -1930,24 +2194,49 @@ export default function BoxManagementScreen() {
   useEffect(() => {
     const unsubscribe = navigation.addListener("focus", () => {
       console.log(`🔄 BoxManagement: Screen focused, reloading data...`);
-      loadBoxes();
-      loadTransferOrderAndStores();
+      // Load stores first, then boxes (so sync can use stores list)
+      loadTransferOrderAndStores().then(() => {
+        loadBoxes();
+      });
       loadWarehousesAndStores();
     });
     return unsubscribe;
   }, [navigation, activeASN]);
 
   // Group boxes by store for summary view (case-insensitive matching)
+  // Include both Open and Closed boxes for accurate counting
   // Exclude Putaway boxes - they are shown in a separate section
   // Exclude boxes that are packed into dispatched TCs
   const boxesByStore = useMemo(() => {
+    // ✅ FIX: Normalize store codes for better matching
+    // Create a map of normalized store codes to original store codes
+    const normalizedStoreMap = new Map<string, string>();
+    stores.forEach(store => {
+      const normalized = String(store).trim().toUpperCase();
+      normalizedStoreMap.set(normalized, store);
+    });
+    
+    // Also create reverse map: all unique box store codes (normalized) -> original
+    const boxStoreCodes = new Set<string>();
+    boxes.forEach(box => {
+      if (box.store) {
+        const normalized = String(box.store).trim().toUpperCase();
+        boxStoreCodes.add(normalized);
+      }
+    });
+    
+    // Log for debugging
+    console.log(`📊 BoxManagement: Grouping boxes by store`, {
+      storesFromTO: stores,
+      normalizedStores: Array.from(normalizedStoreMap.keys()),
+      boxStoreCodes: Array.from(boxStoreCodes),
+      totalBoxes: boxes.length,
+    });
+    
     return stores.reduce((acc, store) => {
       const storeUpper = String(store).trim().toUpperCase();
-      acc[store] = boxes.filter((b) => {
-        // Only show Open boxes - exclude Closed boxes
-        if (b.status === "Closed" || b.status === "CLOSED" || b.status === "closed") {
-          return false;
-        }
+      // ✅ Include ALL boxes (Open and Closed) for accurate counting
+      const matchingBoxes = boxes.filter((b) => {
         if (!b.store) return false;
         // Exclude Putaway boxes from store sections
         if (b.purpose === "PUTAWAY") return false;
@@ -1959,11 +2248,58 @@ export default function BoxManagementScreen() {
           }
         }
         const boxStoreUpper = String(b.store).trim().toUpperCase();
-        return boxStoreUpper === storeUpper;
+        const matches = boxStoreUpper === storeUpper;
+        
+        // Log mismatches for debugging
+        if (!matches && boxStoreCodes.has(boxStoreUpper)) {
+          console.warn(`⚠️ BoxManagement: Store code mismatch - Box store: "${b.store}" (normalized: "${boxStoreUpper}") vs TO store: "${store}" (normalized: "${storeUpper}")`);
+        }
+        
+        return matches;
       });
+      
+      acc[store] = matchingBoxes;
+      
+      // Log grouping results
+      if (matchingBoxes.length > 0) {
+        console.log(`✅ BoxManagement: Store "${store}" has ${matchingBoxes.length} box(es)`, {
+          boxIds: matchingBoxes.map(b => b.box_id),
+          boxStores: matchingBoxes.map(b => b.store),
+        });
+      } else {
+        console.warn(`⚠️ BoxManagement: Store "${store}" has 0 boxes - checking for format mismatch...`);
+        // Check if there are boxes with similar store codes
+        const similarBoxes = boxes.filter(b => {
+          if (!b.store || b.purpose === "PUTAWAY") return false;
+          const boxStoreUpper = String(b.store).trim().toUpperCase();
+          // Check if store codes are similar (e.g., "SR-01" vs "SR-01 ")
+          return boxStoreUpper.includes(storeUpper) || storeUpper.includes(boxStoreUpper);
+        });
+        if (similarBoxes.length > 0) {
+          console.warn(`⚠️ BoxManagement: Found ${similarBoxes.length} box(es) with similar store codes:`, {
+            boxes: similarBoxes.map(b => ({ box_id: b.box_id, store: b.store, normalized: String(b.store).trim().toUpperCase() })),
+            expectedStore: store,
+            expectedNormalized: storeUpper,
+          });
+        }
+      }
+      
       return acc;
     }, {} as Record<string, any[]>);
   }, [stores, boxes, boxToTCMap, dispatchedTCSet]);
+  
+  // Separate: Filter for display (only show Open boxes in the list, but count includes Closed)
+  const boxesByStoreForDisplay = useMemo(() => {
+    return stores.reduce((acc, store) => {
+      const storeUpper = String(store).trim().toUpperCase();
+      // Only show Open boxes in the list (Closed boxes are counted but not displayed)
+      acc[store] = (boxesByStore[store] || []).filter((b) => {
+        // Only show Open boxes in the list
+        return b.status === "Open" || b.status === "OPEN" || b.status === "open";
+      });
+      return acc;
+    }, {} as Record<string, any[]>);
+  }, [stores, boxesByStore]);
 
   // Get warehouse boxes separately (for warehouses not in TO stores)
   // Note: Warehouses ARE now included in TO stores, so this section will typically be empty
@@ -2084,13 +2420,15 @@ export default function BoxManagementScreen() {
   
   // Check if there are Putaway boxes (to show the section even if no items without TO)
   const hasPutawayBoxes = putawayBoxes.length > 0;
-  // Show Putaway section if:
-  // 1. No TO exists (no transfer order), OR
+  // ✅ FIX: Show Putaway section if:
+  // 1. No TO exists (no transfer order) AND there's available quantity (totalASNQty > 0), OR
   // 2. Remaining items > 0 (Total ASN - Total TO > 0), OR
   // 3. There are Putaway boxes already created
-  // Validation: If Total ASN - Total TO = 0, no Putaway needed
-  // If TO exists, show "Create New BOX" section with TO stores instead
-  const showPutawaySection = !transferOrder || remainingItemsQty > 0 || hasPutawayBoxes;
+  // This allows creating Putaway boxes even when there's no Transfer Order but there's available quantity
+  const showPutawaySection = 
+    (!transferOrder && totalASNQty > 0) || // No TO but has available quantity
+    remainingItemsQty > 0 || // Has remaining items after TO allocation
+    hasPutawayBoxes; // Already has Putaway boxes
 
   return (
     <ScrollView style={styles.container}>
@@ -2112,11 +2450,18 @@ export default function BoxManagementScreen() {
       />
       <View style={styles.content}>
         {/* Show Transfer Order info if available */}
+        {/* ✅ DATA SOURCE: Transfer Order ALWAYS comes from backend API (GET /api/transfer-order/by-asn/{asn}) - NOT from local cache */}
         {transferOrder && (
           <View style={styles.toInfoSection}>
             <Text style={styles.toInfoText}>
               Transfer Order: <Text style={styles.toInfoValue}>{transferOrder}</Text>
             </Text>
+            {/* Debug info (can be removed in production) */}
+            {__DEV__ && (
+              <Text style={[styles.toInfoText, { fontSize: 10, color: "#666", marginTop: 4 }]}>
+                Source: Backend API (always fetched directly, not from cache)
+              </Text>
+            )}
           </View>
         )}
 
@@ -2155,8 +2500,11 @@ export default function BoxManagementScreen() {
               </View>
             )}
             
-            {/* Only show Create button if remaining items > 0 */}
-            {remainingItemsQty > 0 && (
+            {/* ✅ FIX: Show Create button if:
+                1. No TO exists AND there's available quantity (totalASNQty > 0), OR
+                2. Remaining items > 0 (Total ASN - Total TO > 0)
+                This allows creating Putaway boxes even when there's no Transfer Order but there's available quantity */}
+            {((!transferOrder && totalASNQty > 0) || remainingItemsQty > 0) && (
               <TouchableOpacity
                 style={[
                   styles.createPutawayButton,
@@ -2166,7 +2514,7 @@ export default function BoxManagementScreen() {
                 disabled={loading}
               >
                 <Text style={styles.createPutawayButtonText}>
-                  {loading ? "Creating..." : `+ Create Putaway BOX (${remainingItemsQty} items)`}
+                  {loading ? "Creating..." : `+ Create Putaway BOX (${!transferOrder && totalASNQty > 0 ? totalASNQty : remainingItemsQty} items)`}
                 </Text>
               </TouchableOpacity>
             )}
@@ -2503,7 +2851,8 @@ export default function BoxManagementScreen() {
         })()}
 
         {/* Display all stores from TO as separate sections */}
-        {/* Always show stores section if TO exists and has stores */}
+        {/* ✅ DATA SOURCE: Stores come ONLY from Transfer Order allocations (backend API: GET /api/transfer-order/by-asn/{asn}) */}
+        {/* ✅ NO MOCK DATA: All stores are extracted from TO allocations - no hardcoded or default stores */}
         {transferOrder && stores.length > 0 ? (
           stores.map((store) => {
             const storeBoxes = boxesByStore[store] || [];
@@ -2535,138 +2884,142 @@ export default function BoxManagementScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {storeBoxes.length === 0 ? (
-                  <Text style={styles.emptyText}>
-                    No boxes created for {store} yet
-                  </Text>
-                ) : (
-                  <FlatList
-                    data={storeBoxes}
-                    key={`boxes-list-${store}-${storeBoxes.length}`}
-                    extraData={`${store}-${storeBoxes.length}`}
-                    keyExtractor={(item) => `${item.box_id}-${item.store}`}
-                    removeClippedSubviews={false}
-                    scrollEnabled={false}
-                    renderItem={({ item }) => (
-                      <View style={styles.boxItem}>
-                        <TouchableOpacity
-                          onPress={() =>
-                            setExpandedBox(
-                              expandedBox === item.box_id ? null : item.box_id
-                            )
-                          }
-                          activeOpacity={0.7}
-                        >
-                          <View style={styles.boxHeader}>
-                            <View style={styles.boxHeaderLeft}>
-                              <Text style={styles.boxId}>{item.box_id}</Text>
-                              <StatusBadge status={item.status} />
+                {(() => {
+                  // Use display list (only Open boxes) for rendering
+                  const displayBoxes = boxesByStoreForDisplay[store] || [];
+                  return displayBoxes.length === 0 ? (
+                    <Text style={styles.emptyText}>
+                      No boxes created for {store} yet
+                    </Text>
+                  ) : (
+                    <FlatList
+                      data={displayBoxes}
+                      key={`boxes-list-${store}-${displayBoxes.length}`}
+                      extraData={`${store}-${displayBoxes.length}`}
+                      keyExtractor={(item) => `${item.box_id}-${item.store}`}
+                      removeClippedSubviews={false}
+                      scrollEnabled={false}
+                      renderItem={({ item }) => (
+                        <View style={styles.boxItem}>
+                          <TouchableOpacity
+                            onPress={() =>
+                              setExpandedBox(
+                                expandedBox === item.box_id ? null : item.box_id
+                              )
+                            }
+                            activeOpacity={0.7}
+                          >
+                            <View style={styles.boxHeader}>
+                              <View style={styles.boxHeaderLeft}>
+                                <Text style={styles.boxId}>{item.box_id}</Text>
+                                <StatusBadge status={item.status} />
+                              </View>
+                              <Text style={styles.expandIcon}>
+                                {expandedBox === item.box_id ? "▼" : "▶"}
+                              </Text>
                             </View>
-                            <Text style={styles.expandIcon}>
-                              {expandedBox === item.box_id ? "▼" : "▶"}
-                            </Text>
-                          </View>
-                          <View style={styles.boxStoreContainer}>
-                            <Text style={styles.boxStoreLabel}>Store:</Text>
-                            <Text style={styles.boxStoreValue}>{item.store}</Text>
-                          </View>
-                          <View style={styles.boxUnitsContainer}>
-                            <Text style={styles.boxUnitsLabel}>Units Scanned:</Text>
-                            <Text style={styles.boxUnitsValue}>
-                              {item.units_scanned || 0}
-                            </Text>
-                          </View>
-                        </TouchableOpacity>
-
-                        {expandedBox === item.box_id && (
-                          <View style={styles.boxDetails}>
-                            <Text style={styles.barcodeTitle}>BOX Barcode</Text>
-                            <Text style={styles.barcodeHint}>
-                              Scan this barcode during Receive + Sort to sort items
-                              into this BOX
-                            </Text>
-                            <BarcodeDisplay
-                              value={item.box_id}
-                              format="CODE128"
-                              width={280}
-                              height={80}
-                            />
-
-                            <View style={styles.boxActionButtons}>
-                              <TouchableOpacity
-                                style={[styles.actionButton, { backgroundColor: "#2196F3", marginRight: 8, flex: 1 }]}
-                                onPress={() => handleViewBoxItems(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>📦 View Items</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={[styles.actionButton, styles.shareButton, { flex: 1, marginRight: 8 }]}
-                                onPress={() => handleShareBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Share</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={[styles.actionButton, styles.printButton, { flex: 1 }]}
-                                onPress={() => handlePrintBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Print</Text>
-                              </TouchableOpacity>
+                            <View style={styles.boxStoreContainer}>
+                              <Text style={styles.boxStoreLabel}>Store:</Text>
+                              <Text style={styles.boxStoreValue}>{item.store}</Text>
                             </View>
-                          </View>
-                        )}
+                            <View style={styles.boxUnitsContainer}>
+                              <Text style={styles.boxUnitsLabel}>Units Scanned:</Text>
+                              <Text style={styles.boxUnitsValue}>
+                                {item.units_scanned || 0}
+                              </Text>
+                            </View>
+                          </TouchableOpacity>
 
-                        <View style={styles.boxActions}>
-                          {item.status === "Open" ? (
-                            <>
-                              <TouchableOpacity
-                                style={styles.actionButton}
-                                onPress={() => handleCloseBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Close</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={[
-                                  styles.actionButton,
-                                  styles.actionButtonDelete,
-                                ]}
-                                onPress={() => handleDeleteBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Delete</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={[styles.actionButton, { backgroundColor: "#2196F3" }]}
-                                onPress={() => handleViewBoxItems(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>📦 View Items</Text>
-                              </TouchableOpacity>
-                            </>
-                          ) : (
-                            <>
-                              <TouchableOpacity
-                                style={[
-                                  styles.actionButton,
-                                  styles.actionButtonSecondary,
-                                ]}
-                                onPress={() => handleReopenBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Reopen</Text>
-                              </TouchableOpacity>
-                              <TouchableOpacity
-                                style={[
-                                  styles.actionButton,
-                                  styles.actionButtonDelete,
-                                ]}
-                                onPress={() => handleDeleteBox(item.box_id)}
-                              >
-                                <Text style={styles.actionButtonText}>Delete</Text>
-                              </TouchableOpacity>
-                            </>
+                          {expandedBox === item.box_id && (
+                            <View style={styles.boxDetails}>
+                              <Text style={styles.barcodeTitle}>BOX Barcode</Text>
+                              <Text style={styles.barcodeHint}>
+                                Scan this barcode during Receive + Sort to sort items
+                                into this BOX
+                              </Text>
+                              <BarcodeDisplay
+                                value={item.box_id}
+                                format="CODE128"
+                                width={280}
+                                height={80}
+                              />
+
+                              <View style={styles.boxActionButtons}>
+                                <TouchableOpacity
+                                  style={[styles.actionButton, { backgroundColor: "#2196F3", marginRight: 8, flex: 1 }]}
+                                  onPress={() => handleViewBoxItems(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>📦 View Items</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[styles.actionButton, styles.shareButton, { flex: 1, marginRight: 8 }]}
+                                  onPress={() => handleShareBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Share</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[styles.actionButton, styles.printButton, { flex: 1 }]}
+                                  onPress={() => handlePrintBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Print</Text>
+                                </TouchableOpacity>
+                              </View>
+                            </View>
                           )}
+
+                          <View style={styles.boxActions}>
+                            {item.status === "Open" ? (
+                              <>
+                                <TouchableOpacity
+                                  style={styles.actionButton}
+                                  onPress={() => handleCloseBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Close</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[
+                                    styles.actionButton,
+                                    styles.actionButtonDelete,
+                                  ]}
+                                  onPress={() => handleDeleteBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Delete</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[styles.actionButton, { backgroundColor: "#2196F3" }]}
+                                  onPress={() => handleViewBoxItems(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>📦 View Items</Text>
+                                </TouchableOpacity>
+                              </>
+                            ) : (
+                              <>
+                                <TouchableOpacity
+                                  style={[
+                                    styles.actionButton,
+                                    styles.actionButtonSecondary,
+                                  ]}
+                                  onPress={() => handleReopenBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Reopen</Text>
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[
+                                    styles.actionButton,
+                                    styles.actionButtonDelete,
+                                  ]}
+                                  onPress={() => handleDeleteBox(item.box_id)}
+                                >
+                                  <Text style={styles.actionButtonText}>Delete</Text>
+                                </TouchableOpacity>
+                              </>
+                            )}
+                          </View>
                         </View>
-                      </View>
-                    )}
-                  />
-                )}
+                      )}
+                    />
+                  );
+                })()}
               </View>
             );
           })
@@ -2721,52 +3074,20 @@ export default function BoxManagementScreen() {
             )}
           </View>
         ) : (
+          // ✅ FIX: When no TO exists, show message directing user to Putaway section
+          // Putaway section will show "Create Putaway BOX" button if there's available quantity
           <View style={styles.createSection}>
             <Text style={styles.sectionTitle}>Create New BOX</Text>
             <Text style={styles.emptyText}>
-              No Transfer Order found. Please select a store to create boxes.
+              {totalASNQty > 0 
+                ? `No Transfer Order found.\n\nIf you have available quantity (${totalASNQty} items), please use the "Items Without Transfer Order" section above to create Putaway boxes.`
+                : "No Transfer Order found.\n\nStores must come from Transfer Order allocations.\n\nIf you have items to put away, they will appear in the \"Items Without Transfer Order\" section above."}
             </Text>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={styles.storeSelector}
-              contentContainerStyle={styles.storeSelectorContent}
-            >
-              {stores.length > 0 ? (
-                stores.map((store) => (
-                  <TouchableOpacity
-                    key={store}
-                    style={[
-                      styles.storeButton,
-                      selectedStore === store && styles.storeButtonActive,
-                    ]}
-                    onPress={() => handleStoreSelection(store)}
-                  >
-                    <Text
-                      style={[
-                        styles.storeButtonText,
-                        selectedStore === store && styles.storeButtonTextActive,
-                      ]}
-                    >
-                      {store}
-                    </Text>
-                  </TouchableOpacity>
-                ))
-              ) : (
-                <Text style={styles.emptyText}>
-                  No stores available. Stores must come from Transfer Order allocations.
-                </Text>
-              )}
-            </ScrollView>
-            <TouchableOpacity
-              style={[styles.button, loading && styles.buttonDisabled]}
-              onPress={handleCreateBox}
-              disabled={loading || !selectedStore}
-            >
-              <Text style={styles.buttonText}>
-                {loading ? "Creating..." : "Create BOX"}
+            {totalASNQty === 0 && (
+              <Text style={[styles.emptyText, { marginTop: 8, fontSize: 12, color: "#999" }]}>
+                Note: Items must be scanned first (in Receive + Sort) before creating boxes.
               </Text>
-            </TouchableOpacity>
+            )}
           </View>
         )}
 

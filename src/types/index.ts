@@ -134,12 +134,14 @@ export interface TransferIn {
   to_warehouse: string;
   transfer_date: string;
   expected_arrival_date?: string;
-  status: "Draft" | "Submitted" | "In Transit" | "Received" | "Completed" | "Cancelled";
+  status: "Draft" | "Submitted" | "In Transit" | "Receiving" | "Received" | "Completed" | "Cancelled";
   items: Array<{
     item_code: string;
     qty: number;
     received_qty?: number;
     carton_id?: string;
+    status?: "Pending" | "Picking" | "Received"; // Item-level status
+    line_id?: string | number; // Optional line identifier
   }>;
   prepared_by: string;
   received_by?: string;

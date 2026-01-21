@@ -14,7 +14,10 @@
     ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.printechs.wmsmobile"
+      "bundleIdentifier": "com.printechs.wmsmobile",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -28,7 +31,11 @@
         "WRITE_EXTERNAL_STORAGE"
       ],
       "usesCleartextTraffic": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "f7c4d127-553d-4eb3-bcd5-59f1b4a65788"
+      }
     }
   }
 }
-

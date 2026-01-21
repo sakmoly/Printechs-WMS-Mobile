@@ -62,21 +62,85 @@ export default function TransferInDetailScreen() {
     }
   };
 
-  const handleStartReceiving = () => {
+  const handleStartReceiving = async () => {
     if (!transferIn) return;
     
-    if (transferIn.status !== "Submitted" && transferIn.status !== "In Transit") {
+    // ✅ Allow receiving for: Submitted, In Transit, or Receiving (resume partial receive)
+    // After backend fix, status will be "Receiving" when partial receive started
+    if (transferIn.status !== "Submitted" && transferIn.status !== "In Transit" && transferIn.status !== "Receiving") {
       Alert.alert(
         "Cannot Start Receiving",
-        `Transfer In ${transferIn.title} is ${transferIn.status}. Only 'Submitted' or 'In Transit' Transfer Ins can be received.`
+        `Transfer In ${transferIn.title} is ${transferIn.status}. Only 'Submitted', 'In Transit', or 'Receiving' Transfer Ins can be received.`
       );
       return;
     }
 
-    // Navigate to Transfer In Receiving Screen
-    (navigation as any).navigate("TransferInReceiving", {
-      transferInTitle: transferIn.title,
-    });
+    try {
+      // ✅ Check if there's an existing receiving session
+      const { transferInReceivingSessionService } = await import("../services/transfer-in-receiving-session.service");
+      const { getSettings } = await import("../services/settings.service");
+      
+      let session = await transferInReceivingSessionService.loadSession(transferIn.title);
+      const settings = await getSettings();
+      
+      // Generate transaction number
+      const transactionNo = `TXN-${transferIn.title}-${Date.now()}`;
+      
+      if (!session) {
+        // ✅ Create new session
+        const sessionId = `TI-REC-${Date.now()}`;
+        session = {
+          session_id: sessionId,
+          transfer_in_no: transferIn.title,
+          transaction_no: transactionNo,
+          active_carton_id: null,
+          status: "Draft",
+          started_by: settings.user_id || settings.user_code || "USER",
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          scanned_total: 0,
+        };
+        await transferInReceivingSessionService.saveSession(session);
+      } else if (session.status === "Completed") {
+        // ✅ If session is completed, create a new session
+        const sessionId = `TI-REC-${Date.now()}`;
+        session = {
+          session_id: sessionId,
+          transfer_in_no: transferIn.title,
+          transaction_no: transactionNo,
+          active_carton_id: null,
+          status: "Draft",
+          started_by: settings.user_id || settings.user_code || "USER",
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          scanned_total: 0,
+        };
+        await transferInReceivingSessionService.saveSession(session);
+      } else {
+        // ✅ Resume existing session - update status to "In Progress" if it's "Draft"
+        if (session.status === "Draft") {
+          session.status = "In Progress";
+          session.updated_at = new Date().toISOString();
+          await transferInReceivingSessionService.saveSession(session);
+        }
+        console.log(`✅ Resuming receiving session: ${session.session_id}, carton: ${session.active_carton_id || 'none'}`);
+      }
+
+      // ✅ Always navigate to carton scan screen first
+      // This allows user to:
+      // - Generate a new carton ID
+      // - Scan a carton ID
+      // - Change carton if needed
+      // The carton screen will restore existing carton ID if available
+      (navigation as any).navigate("TransferInReceivingScanCarton", {
+        transferInNo: transferIn.title,
+        sessionId: session.session_id,
+        transactionNo: session.transaction_no || transactionNo,
+      });
+    } catch (error: any) {
+      console.error("❌ Error starting receiving:", error);
+      Alert.alert("Error", `Failed to start receiving: ${error.message}`);
+    }
   };
 
   const handleCreatePutawayTask = async () => {
@@ -144,18 +208,51 @@ export default function TransferInDetailScreen() {
     }
   };
 
-  const renderItem = ({ item }: { item: { item_code: string; qty: number; received_qty?: number; carton_id?: string } }) => {
+  const getItemStatusColor = (status?: string, receivedQty: number = 0, qty: number = 0): string => {
+    // Use backend status if available, otherwise calculate from received_qty
+    if (status) {
+      switch (status) {
+        case "Pending":
+          return "#9E9E9E";
+        case "Picking":
+          return "#FF9800";
+        case "Received":
+          return "#4CAF50";
+        default:
+          return "#9E9E9E";
+      }
+    }
+    // Fallback: calculate status from received_qty
+    if (receivedQty === 0) return "#9E9E9E"; // Pending
+    if (receivedQty >= qty) return "#4CAF50"; // Received
+    return "#FF9800"; // Picking
+  };
+
+  const getItemStatusLabel = (status?: string, receivedQty: number = 0, qty: number = 0): string => {
+    // Use backend status if available, otherwise calculate from received_qty
+    if (status) {
+      return status;
+    }
+    // Fallback: calculate status from received_qty
+    if (receivedQty === 0) return "Pending";
+    if (receivedQty >= qty) return "Received";
+    return "Picking";
+  };
+
+  const renderItem = ({ item }: { item: { item_code: string; qty: number; received_qty?: number; carton_id?: string; status?: "Pending" | "Picking" | "Received" } }) => {
     const receivedQty = item.received_qty || 0;
     const remainingQty = item.qty - receivedQty;
     const progress = item.qty > 0 ? (receivedQty / item.qty) * 100 : 0;
+    const itemStatus = getItemStatusLabel(item.status, receivedQty, item.qty);
+    const statusColor = getItemStatusColor(item.status, receivedQty, item.qty);
 
     return (
       <View style={styles.itemCard}>
         <View style={styles.itemHeader}>
           <Text style={styles.itemCode}>{item.item_code}</Text>
           <StatusBadge
-            status={remainingQty === 0 ? "Completed" : "In Progress"}
-            color={remainingQty === 0 ? "#4CAF50" : "#FF9800"}
+            status={itemStatus}
+            color={statusColor}
           />
         </View>
         <View style={styles.itemDetails}>
@@ -331,7 +428,7 @@ export default function TransferInDetailScreen() {
         />
       </View>
 
-      {(transferIn.status === "Submitted" || transferIn.status === "In Transit") && (
+      {(transferIn.status === "Submitted" || transferIn.status === "In Transit" || transferIn.status === "Receiving") && (
         <View style={styles.actionSection}>
           <TouchableOpacity
             style={styles.startButton}

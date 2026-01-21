@@ -86,9 +86,10 @@ export default function StartInboundScreen() {
           transferInsList = response.transfer_ins;
         }
       }
-      // Filter only Active Transfer Ins
+      // ✅ Filter Active Transfer Ins: Submitted, In Transit, or Receiving (partial receive)
+      // After backend fix, status will be "Receiving" when partial receive started
       const activeTransferIns = transferInsList.filter(
-        (ti) => ti.status === "Submitted" || ti.status === "In Transit"
+        (ti) => ti.status === "Submitted" || ti.status === "In Transit" || ti.status === "Receiving"
       );
       setTransferIns(activeTransferIns);
       console.log(

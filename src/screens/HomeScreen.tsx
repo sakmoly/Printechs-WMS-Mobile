@@ -142,6 +142,13 @@ export default function HomeScreen() {
           <Text style={styles.menuItemText}>Cycle Count</Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.menuItem, { borderLeftColor: "#607D8B" }]}
+          onPress={() => navigation.navigate("RelocationHome" as never)}
+        >
+          <Text style={styles.menuItemText}>Relocation / Bin Transfer</Text>
+          <Text style={styles.menuItemArrow}>→</Text>
+        </TouchableOpacity>
         {settings?.demo_mode === 1 && (
           <>
             <TouchableOpacity
