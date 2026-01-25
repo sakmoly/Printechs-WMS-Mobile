@@ -2442,25 +2442,12 @@ export const apiService = {
     }
   },
 
-  /**
-   * Complete Transfer In Receiving
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { completed_by: "sysadmin" }
-   * Note: Field is completed_by, NOT received_by
-   */
-  completeTransferInReceiving: async (title: string, completed_by?: string) => {
+  completeTransferInReceiving: async (title: string) => {
     // ✅ Preferred endpoint: POST /api/transfer-in/{title}/complete-receiving
     // This endpoint should set completed_at and status to "Received"
     try {
-      // Get user_id from settings if not provided
-      let userId = completed_by;
-      if (!userId) {
-        const settings = await getSettings();
-        userId = settings.user_id || settings.user_code || "sysadmin";
-      }
-      
       return await makeRequest(`/api/transfer-in/${title}/complete-receiving`, "POST", {
-        completed_by: userId, // ✅ CORRECT: completed_by (not received_by)
+        transfer_in: title,
       });
     } catch (error: any) {
       // Handle 404 gracefully - this endpoint may not exist yet
@@ -2632,53 +2619,59 @@ export const apiService = {
   
   /**
    * Complete full carton relocation - creates session and commits atomically
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { warehouse_id, user_id, from_bin, to_bin, from_carton, mode }
-   * Creates OUT from from_bin, IN to to_bin
+   * Used instead of: session/start -> session/:id/from -> session/:id/to -> session/:id/commit-full
    */
   completeRelocationFull: async (relocationData: {
     mode: "FULL_CARTON";
     warehouse_id: string;
-    user_id: string;
     from_bin: string;
+    from_carton: string;
     to_bin: string;
-    from_carton: string; // ✅ CORRECT: Use from_carton (not carton_id)
+    to_carton?: string; // Optional, defaults to from_carton
+    policy?: "BLIND" | "VERIFIED"; // Optional
+    user_id: string;
+    device_id?: string; // Optional
+    lines?: Array<{ item_code: string; qty: number }>; // Optional, for verified mode
   }) => {
     return makeRequest(`/api/relocation/complete-full`, "POST", {
+      mode: relocationData.mode,
       warehouse_id: relocationData.warehouse_id,
-      user_id: relocationData.user_id,
       from_bin: relocationData.from_bin,
-      to_bin: relocationData.to_bin,
       from_carton: relocationData.from_carton,
-      mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
+      to_bin: relocationData.to_bin,
+      to_carton: relocationData.to_carton || relocationData.from_carton,
+      policy: relocationData.policy || "BLIND",
+      user_id: relocationData.user_id,
+      device_id: relocationData.device_id || null,
+      lines: relocationData.lines || [],
     });
   },
 
   /**
-   * Complete partial relocation / carton merge - creates session and commits atomically
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { warehouse_id, user_id, from_carton, to_carton, from_bin, to_bin, mode, lines[] }
-   * Creates OUT old carton, IN new carton
+   * Complete partial relocation - creates session and commits atomically
+   * Used instead of: session/start -> session/:id/from -> session/:id/to -> session/:id/commit-partial
    */
   completeRelocationPartial: async (relocationData: {
     mode: "PARTIAL_ITEMS" | "CARTON_TO_CARTON";
     warehouse_id: string;
-    user_id: string;
     from_bin: string;
-    to_bin: string;
     from_carton: string;
-    to_carton: string;
-    lines: Array<{ item_code: string; qty: number }>; // ✅ CORRECT: Items in lines[] array
+    to_bin: string;
+    to_carton?: string; // Required for CARTON_TO_CARTON mode
+    lines: Array<{ item_code: string; qty: number }>; // Required
+    user_id: string;
+    device_id?: string; // Optional
   }) => {
     return makeRequest(`/api/relocation/complete-partial`, "POST", {
+      mode: relocationData.mode,
       warehouse_id: relocationData.warehouse_id,
-      user_id: relocationData.user_id,
-      from_carton: relocationData.from_carton,
-      to_carton: relocationData.to_carton,
       from_bin: relocationData.from_bin,
+      from_carton: relocationData.from_carton,
       to_bin: relocationData.to_bin,
-      mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
-      lines: relocationData.lines, // ✅ CORRECT: Items in lines[] array
+      to_carton: relocationData.to_carton || null,
+      lines: relocationData.lines,
+      user_id: relocationData.user_id,
+      device_id: relocationData.device_id || null,
     });
   },
 
@@ -2778,22 +2771,16 @@ export const apiService = {
     }
   },
 
-  /**
-   * Pick items for Material Request
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { user_id, items: [{ item_code, picked_qty, source_bin, carton_id }] }
-   * Must create OUT history, source_bin must be correct
-   */
   pickMaterialRequestItems: async (
     title: string,
     items: Array<{
       item_code: string;
-      picked_qty: number;    // ✅ CORRECT: picked_qty (not qty)
-      source_bin: string;    // ✅ CORRECT: source_bin (not bin_location)
-      carton_id?: string;    // Optional carton_id for carton-level inventory
+      picked_qty: number;
+      source_bin: string;
+      carton_id?: string; // ✅ NEW: Optional carton_id for carton-level inventory
     }>,
     warehouse?: string,
-    user_id?: string
+    user_id?: string // ✅ NEW: Optional user_id for created_by field
   ) => {
     // Get user_id from settings if not provided
     let userId = user_id;
@@ -2802,16 +2789,20 @@ export const apiService = {
       userId = settings.user_id || settings.user_code || "";
     }
 
-    // ✅ CORRECT: Build request body per actual backend API specification
     const requestBody: any = {
-      user_id: userId,
-      items: items.map(item => ({
-        item_code: item.item_code,
-        picked_qty: item.picked_qty,   // ✅ CORRECT: picked_qty (not qty)
-        source_bin: item.source_bin,   // ✅ CORRECT: source_bin (not bin_location)
-        carton_id: item.carton_id,
-      })),
+      items,
     };
+
+    // Add warehouse if provided
+    if (warehouse) {
+      requestBody.warehouse = warehouse;
+    }
+
+    // ✅ CRITICAL: Add user_id/created_by for backend (required for normalizedCreatedBy)
+    if (userId) {
+      requestBody.user_id = userId;
+      requestBody.created_by = userId; // Backend might use either field
+    }
 
     console.warn(
       `📦 Calling pick-items API for Material Request: ${title}`,
@@ -2996,7 +2987,7 @@ export const apiService = {
             }
           }
           
-          // ✅ CORRECT: Use pick-items API with correct field names
+          // Use existing pick-items API
           // Note: source_bin should be provided by the caller
           // If not provided, this will fail validation on backend
           return await apiService.pickMaterialRequestItems(
@@ -3004,7 +2995,7 @@ export const apiService = {
             [
               {
                 item_code: barcode,
-                picked_qty: 1, // ✅ CORRECT: picked_qty (not qty)
+                picked_qty: 1,
                 source_bin: "", // ⚠️ WARNING: source_bin is required - should be provided by caller
                 carton_id: cartonId,
               },
@@ -3041,14 +3032,15 @@ export const apiService = {
         // Extract material request title from session ID
         const mrTitle = sessionId.split("-").slice(0, -1).join("-").replace("PK-", "");
         if (mrTitle) {
-          // ✅ CORRECT: Use pick-items API with correct field names
+          // Calculate difference - this is a simplified approach
+          // In a real scenario, you'd need to know the current qty
           return await apiService.pickMaterialRequestItems(
             mrTitle,
             [
               {
                 item_code: lineId, // Assuming lineId is item_code
-                picked_qty: qty, // ✅ CORRECT: picked_qty (not qty)
-                source_bin: "", // ⚠️ WARNING: source_bin is required
+                picked_qty: qty,
+                source_bin: "",
               },
             ]
           );
@@ -3352,11 +3344,10 @@ export const apiService = {
     items?: Array<{
       item_code: string;
       qty: number;
-      carton_id?: string; // ✅ CORRECT: carton_id for carton-level inventory
-      box_id?: string;    // ✅ CORRECT: box_id per backend spec
+      carton_id?: string; // ✅ NEW: Optional carton_id for carton-level inventory
       location_id?: string;
-      source_bin?: string;  // Optional: backend may ignore
-      target_bin?: string;  // Optional: backend may ignore
+      source_bin?: string;
+      target_bin?: string;
       completed?: boolean;
     }>;
   }) => {

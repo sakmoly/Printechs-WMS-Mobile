@@ -1273,11 +1273,14 @@ export default function PutAwayScreen() {
           if (putawaySourceType === "TransferIn") {
             let transferInTasksResponse: any = null;
             try {
-              // ✅ PERMANENT FIX: Always fetch ALL tasks and filter client-side
-              // This avoids issues with backend filters not working correctly
-              console.warn(`📤 PutAwayScreen: Fetching ALL putaway tasks (will filter for Transfer In client-side)`);
-              transferInTasksResponse = await apiService.getPutawayTasks({});
-              // Note: We'll filter for Transfer In tasks after parsing the response
+              console.warn(`📤 PutAwayScreen: Requesting Transfer In putaway tasks with filters:`, {
+                status: "Draft,Open,In Progress",
+                source_type: "TransferIn",
+              });
+              transferInTasksResponse = await apiService.getPutawayTasks({
+                status: "Draft,Open,In Progress", // ✅ Includes Open status for Transfer In putaway tasks
+                source_type: "TransferIn",
+              });
               
               // ✅ DEBUG: Log full response to verify structure
               console.warn(`📥 PutAwayScreen: Received Transfer In putaway tasks response:`, {
@@ -1484,50 +1487,21 @@ export default function PutAwayScreen() {
               });
             }
             
-            // ✅ PERMANENT FIX: Filter for Transfer In tasks from ALL tasks response
-            // Since we're fetching ALL tasks, we need to filter client-side
-            console.warn(`📦 PutAwayScreen: Got ${tiTasksList.length} total tasks, filtering for Transfer In...`);
-            
-            const allFetchedTasks = [...tiTasksList]; // Keep original for logging
-            
-            // Filter for Transfer In tasks that are not completed/closed
-            tiTasksList = tiTasksList.filter((t: any) => {
-              const taskStatus = (t.status || "").toUpperCase();
-              const isCompleted = taskStatus === "COMPLETED";
-              const isClosed = taskStatus === "CLOSED";
-              
-              // Exclude completed/closed
-              if (isCompleted || isClosed) {
-                return false;
-              }
-              
-              // Check if it's a Transfer In task
-              const isTransferInSource = t.source_type === "TransferIn";
-              const hasTransferIn = !!t.transfer_in;
-              const hasNoAsn = !t.asn_no && !t.advance_shipping_notice;
-              
-              // ✅ IMPORTANT: Include tasks with transfer_in OR source_type TransferIn
-              return isTransferInSource || hasTransferIn || (hasTransferIn && hasNoAsn);
-            });
-            
-            console.warn(`📦 PutAwayScreen: Filtered ${tiTasksList.length} Transfer In tasks from ${allFetchedTasks.length} total`);
-            
+            // Convert Transfer In putaway tasks to TransferCarton format
+            console.warn(`📦 PutAwayScreen: Processing ${tiTasksList.length} Transfer In task(s) from response`);
             if (tiTasksList.length === 0) {
-              console.warn(`⚠️ PutAwayScreen: No Transfer In tasks found after filtering!`);
-              console.warn(`   All tasks from API:`, allFetchedTasks.map((t: any) => ({
-                title: t.title || t.putaway_task || t.id,
-                status: t.status,
-                source_type: t.source_type,
-                transfer_in: t.transfer_in,
-                asn_no: t.asn_no,
-              })));
+              console.warn(`⚠️ PutAwayScreen: No Transfer In tasks found in response!`);
+              console.warn(`   Response structure:`, {
+                isArray: Array.isArray(transferInTasksResponse),
+                hasOk: !!transferInTasksResponse?.ok,
+                hasData: !!transferInTasksResponse?.data,
+                hasTasks: !!transferInTasksResponse?.tasks,
+                responseType: typeof transferInTasksResponse,
+                responseKeys: transferInTasksResponse ? Object.keys(transferInTasksResponse) : [],
+                responsePreview: transferInTasksResponse ? JSON.stringify(transferInTasksResponse).substring(0, 500) : 'null',
+              });
             } else {
-              console.warn(`📦 PutAwayScreen: Transfer In tasks:`, tiTasksList.map((t: any) => ({
-                title: t.title || t.putaway_task,
-                status: t.status,
-                source_type: t.source_type,
-                transfer_in: t.transfer_in,
-              })));
+              console.warn(`📦 PutAwayScreen: Full Transfer In tasks list:`, JSON.stringify(tiTasksList, null, 2));
             }
             
             // ✅ CRITICAL: Only process if we have tasks in the list
@@ -1602,17 +1576,19 @@ export default function PutAwayScreen() {
                 continue;
               }
               
-              // ✅ PERMANENT FIX: Accept ANY status that is not completed/closed
-              // Backend may use different status values (Draft, Open, Active, Pending, In Progress, etc.)
-              // Instead of whitelisting specific statuses, just exclude completed/closed
-              console.warn(`✅ PutAwayScreen: Task ${taskId} has status "${task.status}" - proceeding (not completed/closed)`);
+              const isDraft = taskStatus === "DRAFT";
+              const isOpen = taskStatus === "OPEN"; // ✅ Include Open status
+              const isInProgress = taskStatus === "IN PROGRESS" || taskStatus === "INPROGRESS";
               
-              // Note: We already filtered out completed/closed above, so any task reaching here is valid
+              if (!isDraft && !isOpen && !isInProgress) {
+                console.warn(`⚠️ PutAwayScreen: Skipped Transfer In putaway task ${taskId} - status is "${task.status}" (expected "Draft", "Open", or "In Progress")`);
+                continue;
+              }
               
-              // ✅ Try to get carton_id from various sources if not already set
-              // Note: Backend list response may not include carton_id - we'll try multiple sources
-              // If all fail, we'll use task ID as fallback identifier
-              if (!cartonId) {
+              // ✅ CRITICAL: Validate that carton_id exists and is in correct format (CTN-TI-*)
+              // Do NOT use TI-PUT-* format (putaway task title) as fallback
+              // ✅ Note: Backend list response may not include items array - try to get carton_id from local database
+              if (!cartonId || !cartonId.startsWith("CTN-TI-")) {
                 // ✅ Try one more time to get carton_id from items array (if backend includes it in list response)
                 if (task.items && Array.isArray(task.items) && task.items.length > 0) {
                   // Check all items for carton_id
@@ -1628,7 +1604,7 @@ export default function PutAwayScreen() {
                 
                 // ✅ FALLBACK: If carton_id still not found, try to get it from local database (scanned_items)
                 // Backend list response may not include items, so we get carton_id from local data
-                if (!cartonId && transferIn) {
+                if ((!cartonId || !cartonId.startsWith("CTN-TI-")) && transferIn) {
                   try {
                     const db = await getDatabase();
                     if (db) {
@@ -1653,8 +1629,8 @@ export default function PutAwayScreen() {
                 }
               }
               
-              // ✅ If still no carton_id, try to fetch full task details
-              if (!cartonId) {
+              // ✅ Final check: If still no valid carton_id, try to fetch full task details
+              if (!cartonId || !cartonId.startsWith("CTN-TI-")) {
                 // ✅ FALLBACK: Try to fetch full task details to get carton_id
                 // Note: This endpoint might not exist (404), so we handle it gracefully
                 console.warn(`⚠️ PutAwayScreen: Transfer In putaway task ${taskId} missing carton_id in list response, fetching full task details...`);
@@ -1692,8 +1668,8 @@ export default function PutAwayScreen() {
                   }
                 }
                 
-                // ✅ If still no carton_id, try one more time from local database
-                if (!cartonId) {
+                // ✅ Final validation: If still no valid carton_id, try one more time from local database
+                if (!cartonId || !cartonId.startsWith("CTN-TI-")) {
                   // ✅ Last resort: Query local database for any carton_id associated with this transfer_in
                   if (transferIn) {
                     try {
@@ -1720,37 +1696,25 @@ export default function PutAwayScreen() {
                     }
                   }
                   
-                  // ✅ PERMANENT FIX: If carton_id is not found, use task ID or box_id as fallback
-                  // Don't skip the task - allow it to be displayed with task ID as identifier
-                  // The carton_id can be fetched later when the user selects the task
-                  if (!cartonId) {
-                    // Try to use box_id from task if available
-                    const taskBoxId = task.box_id || (task as any).box_id;
-                    if (taskBoxId) {
-                      cartonId = taskBoxId;
-                      console.warn(`✅ PutAwayScreen: Using box_id as carton_id: ${cartonId}`);
-                    } else {
-                      // Use task ID as fallback identifier (will be resolved when task is selected)
-                      cartonId = taskId;
-                      console.warn(`⚠️ PutAwayScreen: Transfer In putaway task ${taskId} has no carton_id - using task ID as fallback identifier`);
-                      console.warn(`   💡 Carton ID will be resolved when task is selected for putaway`);
-                    }
+                  // ✅ If still no carton_id after all attempts, skip this task
+                  // Carton_id is required for Transfer In putaway tasks
+                  if (!cartonId || !cartonId.startsWith("CTN-TI-")) {
+                    console.warn(`⚠️ PutAwayScreen: Transfer In putaway task ${taskId} missing valid carton_id (CTN-TI-* format) after all attempts`);
+                    console.warn(`   Task carton_id: ${cartonId || 'null'}`);
+                    console.warn(`   Task ID: ${taskId}`);
+                    console.warn(`   Transfer In: ${transferIn}`);
+                    console.warn(`   ⚠️ Skipping this task - carton_id is required for Transfer In putaway`);
+                    console.warn(`   💡 Tip: Ensure items have been scanned to a carton (CTN-TI-*) during receiving`);
+                    continue; // Skip tasks without valid carton_id
                   }
                 }
               }
               
-              // ✅ FINAL FALLBACK: If cartonId is still null/undefined, use taskId as identifier
-              // This ensures the task is always displayed, even if backend doesn't return carton_id
-              if (!cartonId) {
-                cartonId = task.box_id || taskId;
-                console.warn(`⚠️ PutAwayScreen: Final fallback - using ${cartonId} as identifier for task ${taskId}`);
-              }
-              
               console.warn(`✅ PutAwayScreen: Processing Transfer In putaway task ${taskId} with carton_id: ${cartonId}`);
               
-              // ✅ For Transfer In, use carton_id as identifier
-              // Fallback to task ID if carton_id is not available
-              const identifier = cartonId || taskId; // ✅ GUARANTEED: Always has a value
+              // ✅ For Transfer In, carton_id = box_id (CTN-TI-... format)
+              // Use carton_id as identifier (NOT task ID)
+              const identifier = cartonId; // ✅ Always use carton_id (CTN-TI-*), never use task ID (TI-PUT-*)
               
               const tcObj: TransferCarton = {
                 tc_id: identifier, // ✅ Use carton_id (CTN-TI-*) as box_id for Transfer In putaway
@@ -2166,94 +2130,6 @@ export default function PutAwayScreen() {
       setLoading(false);
     }
   }, [activeASN, loadRemainingItems, putawaySourceType]);
-
-  // ============================================================================
-  // ✅ SIMPLE TRANSFER IN LOADER - Guaranteed to work
-  // ============================================================================
-  const loadTransferInTasks = useCallback(async () => {
-    console.warn("🔄 PutAwayScreen: [SIMPLE] Loading Transfer In putaway tasks...");
-    setLoading(true);
-    
-    try {
-      const settings = await getSettings();
-      if (!settings.api_url || settings.demo_mode === 1) {
-        console.warn("⚠️ No API configured or demo mode - skipping Transfer In load");
-        setSealedTCs([]);
-        setLoading(false);
-        return;
-      }
-      
-      // ✅ STEP 1: Fetch ALL putaway tasks from backend (no filters)
-      console.warn("📤 [SIMPLE] Fetching ALL putaway tasks...");
-      const response = await apiService.getPutawayTasks({});
-      
-      // ✅ STEP 2: Parse response
-      let allTasks: any[] = [];
-      if (Array.isArray(response)) {
-        allTasks = response;
-      } else if (response?.data && Array.isArray(response.data)) {
-        allTasks = response.data;
-      } else if (response?.tasks && Array.isArray(response.tasks)) {
-        allTasks = response.tasks;
-      }
-      
-      console.warn(`📥 [SIMPLE] Got ${allTasks.length} total tasks from API`);
-      console.warn(`📥 [SIMPLE] All tasks:`, allTasks.map((t: any) => ({
-        title: t.title || t.putaway_task || t.id,
-        status: t.status,
-        source_type: t.source_type,
-        transfer_in: t.transfer_in,
-        box_id: t.box_id,
-      })));
-      
-      // ✅ STEP 3: Filter for Transfer In tasks (not completed/closed)
-      const transferInTasks = allTasks.filter((t: any) => {
-        const status = (t.status || "").toUpperCase();
-        if (status === "COMPLETED" || status === "CLOSED") {
-          return false;
-        }
-        // Include if source_type is TransferIn OR has transfer_in field
-        return t.source_type === "TransferIn" || !!t.transfer_in;
-      });
-      
-      console.warn(`📦 [SIMPLE] Filtered ${transferInTasks.length} Transfer In tasks`);
-      
-      // ✅ STEP 4: Convert to TransferCarton format
-      const putawayItems: TransferCarton[] = transferInTasks.map((task: any) => {
-        const taskId = task.title || task.putaway_task || task.id || task.task_id;
-        const cartonId = task.box_id || task.carton_id || taskId;
-        
-        return {
-          tc_id: cartonId,
-          asn_no: task.transfer_in || null,
-          to_no: null,
-          store: task.warehouse || null,
-          status: task.status || "Open",
-          updated_on: task.updated_on || task.created_on || new Date().toISOString(),
-          // Extended properties
-          putaway_task: taskId,
-          putaway_task_status: task.status,
-          source_type: "TransferIn",
-          transfer_in: task.transfer_in,
-          warehouse: task.warehouse,
-          carton_id: cartonId,
-        } as TransferCarton & { [key: string]: any };
-      });
-      
-      console.warn(`✅ [SIMPLE] Created ${putawayItems.length} putaway items for display`);
-      if (putawayItems.length > 0) {
-        console.warn(`✅ [SIMPLE] First item:`, putawayItems[0]);
-      }
-      
-      setSealedTCs(putawayItems);
-      
-    } catch (error: any) {
-      console.error("❌ [SIMPLE] Error loading Transfer In tasks:", error.message);
-      setSealedTCs([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
 
   // Load remaining items (items in warehouse boxes that haven't been packed into TCs yet)
   // Enhanced to use dataService.getRemainingItems for full details (shipped_qty, allocated_qty, remaining_qty)
@@ -2742,7 +2618,7 @@ export default function PutAwayScreen() {
               // ✅ FIX: Use scanned carton_id if available, otherwise use line's carton_id
               carton_id: selectedCartonOrItem || line.carton_id || line.cartonId || null,
               location_id: locationId || line.location_id || line.locationId,
-              source_bin: "STAGING-01",
+              source_bin: "DOCK-01",
               target_bin: locationId || line.target_bin || line.targetBin,
               completed: true,
             };
@@ -2925,7 +2801,7 @@ export default function PutAwayScreen() {
               item_code,
               qty: Number(totalQty.toFixed(2)),
               location_id: locationId,
-              source_bin: "STAGING-01",
+              source_bin: "DOCK-01",
               target_bin: locationId,
               completed: true,
             };
@@ -2991,7 +2867,7 @@ export default function PutAwayScreen() {
               item_code: item.item_code,
               qty: Number((item.scanned_qty || 0).toFixed(2)),
               location_id: locationId,
-              source_bin: "STAGING-01",
+              source_bin: "DOCK-01",
               target_bin: locationId,
               completed: true,
             };
@@ -3307,15 +3183,9 @@ export default function PutAwayScreen() {
   // Also load on initial mount and when filter changes
   useEffect(() => {
     if (workflowState === "PUTAWAY_LIST") {
-      // ✅ PERMANENT FIX: Use simple loader for Transfer In
-      if (putawaySourceType === "TransferIn") {
-        console.warn("🔄 PutAwayScreen: Transfer In tab - using simple loader");
-        loadTransferInTasks();
-      } else {
-        loadSealedTCs();
-      }
+      loadSealedTCs();
     }
-  }, [loadSealedTCs, loadTransferInTasks, workflowState, putawaySourceType]);
+  }, [loadSealedTCs, workflowState, putawaySourceType]);
 
   // Step 11: Handle TC selection (double tap or scan)
   const handleTCSelection = async (tcId: string) => {
@@ -4721,7 +4591,7 @@ export default function PutAwayScreen() {
             qty: Number(line.qty || line.quantity || 0),
             carton_id: line.carton_id || line.cartonId || null,
             location_id: selectedLocationId || selectedRack || selectedBin || undefined,
-            source_bin: "STAGING-01",
+            source_bin: "DOCK-01",
             target_bin: selectedBin || selectedRack || undefined,
             completed: true,
           };
@@ -4808,7 +4678,7 @@ export default function PutAwayScreen() {
                 const item: any = {
                   item_code,
                   qty: Number(box.qty.toFixed(2)), // Quantity for this specific box
-                  source_bin: "STAGING-01", // Default source bin (can be enhanced to get from settings or event)
+                  source_bin: "DOCK-01", // Default source bin (can be enhanced to get from settings or event)
                   // location_id removed - will be sent at header level instead
                   target_bin: selectedBin || selectedRack || undefined, // Backward compatibility: also send target_bin
                   completed: true,
@@ -4907,7 +4777,7 @@ export default function PutAwayScreen() {
                 const itemObj: any = {
                   item_code: item.item_code,
                   qty: Number((item.scanned_qty || 0).toFixed(2)),
-                  source_bin: "STAGING-01",
+                  source_bin: "DOCK-01",
                   // location_id removed - will be sent at header level instead
                   target_bin: selectedBin || selectedRack || undefined, // Backward compatibility: also send target_bin
                   completed: true,
@@ -4948,7 +4818,7 @@ export default function PutAwayScreen() {
                         qty: Number(line.qty || line.quantity || 0),
                         carton_id: line.carton_id || line.cartonId || null,
                         location_id: selectedLocationId || selectedRack || selectedBin || undefined,
-                        source_bin: "STAGING-01",
+                        source_bin: "DOCK-01",
                         target_bin: selectedBin || selectedRack || undefined,
                         completed: true,
                       };
@@ -4995,7 +4865,7 @@ export default function PutAwayScreen() {
                           qty: Number(line.qty || line.quantity || 0),
                           carton_id: line.carton_id || line.cartonId || null,
                           location_id: selectedLocationId || selectedRack || selectedBin || undefined,
-                          source_bin: "STAGING-01",
+                          source_bin: "DOCK-01",
                           target_bin: selectedBin || selectedRack || undefined,
                           completed: true,
                         };
@@ -5517,7 +5387,7 @@ export default function PutAwayScreen() {
                 ]}
                 onPress={() => {
                   setPutawaySourceType("TransferIn");
-                  loadTransferInTasks(); // ✅ Use simple loader for Transfer In
+                  loadSealedTCs();
                 }}
               >
                 <Text

@@ -491,25 +491,29 @@ export default function RelocationExecuteScreen() {
           qty: item.move_qty,
         }));
 
-      // ✅ CORRECT: Per actual backend API specification
+      // ✅ NEW APPROACH: Call complete endpoint with ALL relocation data
       // Session is created atomically when Complete is clicked (not before)
       let commitSuccess = false;
       let createdSessionId: string | null = null;
       
       try {
         const userId = settings.user_id || settings.user_code || "USER";
+        const deviceId = settings.device_id || undefined;
         const warehouseId = relocationData.warehouseId || (settings as any).warehouse || (settings as any).warehouse_id || "DEFAULT";
 
         if (relocationData.mode === "FULL_CARTON") {
-          // ✅ CORRECT: Full Carton Move
-          // Payload: { warehouse_id, user_id, from_bin, to_bin, from_carton, mode }
+          // ✅ Call new complete-full endpoint with ALL data
           const response = await apiService.completeRelocationFull({
-            mode: "FULL_CARTON", // ✅ CORRECT: mode is REQUIRED
+            mode: "FULL_CARTON",
             warehouse_id: warehouseId,
-            user_id: userId,
             from_bin: relocationData.fromBin!,
+            from_carton: relocationData.fromCarton!,
             to_bin: relocationData.toBin!,
-            from_carton: relocationData.fromCarton!, // ✅ CORRECT: from_carton (not carton_id)
+            to_carton: relocationData.toCarton || relocationData.fromCarton!,
+            policy: policy,
+            user_id: userId,
+            device_id: deviceId,
+            lines: lines, // Optional, for verified mode
           });
           
           // Session ID is now created and returned in response
@@ -518,28 +522,24 @@ export default function RelocationExecuteScreen() {
           
           console.log(`✅ Relocation completed: session_id=${createdSessionId}, mode=FULL_CARTON`);
         } else if (relocationData.mode === "PARTIAL_ITEMS" || relocationData.mode === "CARTON_TO_CARTON") {
-          // ✅ CORRECT: Partial Move / Carton Merge
-          // Payload: { warehouse_id, user_id, from_carton, to_carton, from_bin, to_bin, mode, lines[] }
-          
-          if (lines.length === 0) {
-            throw new Error("No items selected for relocation");
-          }
-          
-          // ✅ CORRECT: Send all items in lines[] array (not per-item calls)
+          // ✅ Call new complete-partial endpoint with ALL data
           const response = await apiService.completeRelocationPartial({
-            mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
+            mode: relocationData.mode,
             warehouse_id: warehouseId,
-            user_id: userId,
             from_bin: relocationData.fromBin!,
-            to_bin: relocationData.toBin!,
             from_carton: relocationData.fromCarton!,
+            to_bin: relocationData.toBin!,
             to_carton: relocationData.toCarton || relocationData.fromCarton!,
-            lines: lines, // ✅ CORRECT: Items in lines[] array
+            lines: lines, // Required for partial moves
+            user_id: userId,
+            device_id: deviceId,
           });
           
+          // Session ID is now created and returned in response
           createdSessionId = response.session_id || response.data?.session_id || null;
           commitSuccess = true;
-          console.log(`✅ Relocation completed: session_id=${createdSessionId}, mode=${relocationData.mode}, items=${lines.length}`);
+          
+          console.log(`✅ Relocation completed: session_id=${createdSessionId}, mode=${relocationData.mode}`);
         } else {
           throw new Error(`Invalid relocation mode: ${relocationData.mode}`);
         }

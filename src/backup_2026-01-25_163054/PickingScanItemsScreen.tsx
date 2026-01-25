@@ -409,20 +409,19 @@ export default function PickingScanItemsScreen() {
       const online = await isDeviceOnline();
       if (online) {
         try {
-          // ✅ ALIGNED: Per WMS_MOBILE_END_TO_END_ALIGNMENT_GUIDE.md Section 6
-          // Payload: { user_id, items: [{ item_code, qty, bin_location, carton_id }] }
+          // ✅ Use pick-items API directly to ensure source_bin is included for stock reduction
           const settings = await getSettings();
           await apiService.pickMaterialRequestItems(
             materialRequestTitle,
             [
               {
                 item_code: matchingItem.item_code,
-                picked_qty: 1, // ✅ CORRECT: picked_qty (not qty)
-                source_bin: binLocation, // ✅ CORRECT: source_bin (not bin_location)
-                carton_id: cartonId || undefined,
+                picked_qty: 1, // Increment by 1 for each scan
+                source_bin: binLocation, // ✅ REQUIRED for stock reduction
+                carton_id: cartonId || undefined, // ✅ REQUIRED for carton-level inventory
               },
             ],
-            materialRequest?.from_warehouse || undefined,
+            materialRequest?.from_warehouse || undefined, // ✅ warehouse from Material Request
             settings.user_id || settings.user_code // ✅ user_id for created_by
           );
           console.log(`✅ Item scanned and stock updated: ${normalizedBarcode} from bin ${binLocation}`);
@@ -651,7 +650,7 @@ export default function PickingScanItemsScreen() {
         // Don't block - allow edit to proceed if validation API is unavailable
       }
 
-      // ✅ ALIGNED: Per WMS_MOBILE_END_TO_END_ALIGNMENT_GUIDE.md Section 6
+      // Update backend using pick-items API (more reliable than updateLineQty)
       const online = await isDeviceOnline();
       if (online) {
         try {
@@ -662,12 +661,12 @@ export default function PickingScanItemsScreen() {
             [
               {
                 item_code: editModal.item.item_code,
-                picked_qty: qtyDifference, // ✅ CORRECT: picked_qty (not qty)
-                source_bin: binLocation, // ✅ CORRECT: source_bin (not bin_location)
-                carton_id: cartonId || undefined,
+                picked_qty: qtyDifference, // Send difference (positive for increase, negative for decrease)
+                source_bin: binLocation, // ✅ REQUIRED for stock reduction
+                carton_id: cartonId || undefined, // ✅ REQUIRED for carton-level inventory
               },
             ],
-            materialRequest?.from_warehouse || undefined,
+            materialRequest?.from_warehouse || undefined, // ✅ warehouse from Material Request
             settings.user_id || settings.user_code // ✅ user_id for created_by
           );
           
