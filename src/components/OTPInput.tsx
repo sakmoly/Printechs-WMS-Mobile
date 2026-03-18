@@ -15,6 +15,7 @@ interface OTPInputProps {
   disabled?: boolean;
   error?: string;
   showSubmitButton?: boolean;
+  hideHeader?: boolean; // When true, parent provides title (avoids duplicate headers)
   receivedOTP?: string; // For autofill from email
   displayOTP?: string; // OTP to display above keyboard
 }
@@ -26,6 +27,7 @@ export const OTPInput: React.FC<OTPInputProps> = ({
   disabled = false,
   error,
   showSubmitButton = true,
+  hideHeader = false,
   receivedOTP,
   displayOTP,
 }) => {
@@ -159,10 +161,14 @@ export const OTPInput: React.FC<OTPInputProps> = ({
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Enter OTP</Text>
-      <Text style={styles.subtitle}>
-        We've sent a 6-digit code to your email
-      </Text>
+      {!hideHeader && (
+        <>
+          <Text style={styles.title}>Enter OTP</Text>
+          <Text style={styles.subtitle}>
+            We've sent a 6-digit code to your email
+          </Text>
+        </>
+      )}
 
       {receivedOTP && (
         <Text style={styles.autofillText}>
@@ -265,7 +271,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 20,
     paddingVertical: 10,
-    marginBottom: 20,
+    marginBottom: 12,
   },
   title: {
     fontSize: 24,

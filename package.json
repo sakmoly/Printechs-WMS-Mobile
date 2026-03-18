@@ -4,9 +4,12 @@
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start",
+    "start:clear": "expo start -c",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "build:ios:clean": "eas build --platform ios",
+    "web": "expo start --web",
+    "screenshots": "node capture-screens.js"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.2",

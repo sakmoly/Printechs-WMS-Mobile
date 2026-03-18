@@ -15,7 +15,7 @@ import {
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
-import { useAuthStore } from "../../src/store/auth";
+import { useAuthStore, DEMO_SERVER_URL } from "../../src/store/auth";
 import { Ionicons } from "@expo/vector-icons";
 import { ServerConfig } from "../../src/components/ServerConfig";
 import { OTPInput } from "../../src/components/OTPInput";
@@ -137,11 +137,23 @@ export default function LoginScreen() {
     }
   };
 
+  /** Dev-only test code; never valid on the server - avoid 417 and noisy logs */
+  const DEV_TEST_OTP = "408057";
+
   const handleOTPSubmit = async (enteredOtp: string) => {
     console.log("🔐 OTP Submit called with:", enteredOtp);
 
     if (enteredOtp.length !== 6) {
       setError("Please enter a valid 6-digit OTP");
+      return;
+    }
+
+    if (__DEV__ && enteredOtp === DEV_TEST_OTP) {
+      setError("Use the code from your email to log in.");
+      Alert.alert(
+        "Test code",
+        "408057 is for UI testing only and does not work on the server. Use the 6-digit code from your email to log in."
+      );
       return;
     }
 
@@ -174,17 +186,19 @@ export default function LoginScreen() {
         }
       } else {
         console.log("❌ OTP exchange failed:", result.error);
-        setError(result.error || "Invalid OTP");
-
-        // Show specific error message based on the error
-        let alertMessage = result.error || "Invalid OTP";
-        if (result.error?.includes("expired")) {
-          alertMessage = "OTP has expired. Please request a new one.";
-        } else if (result.error?.includes("Invalid")) {
-          alertMessage = "Invalid OTP. Please check the code and try again.";
+        const isExpired = result.error?.toLowerCase().includes("expired");
+        setError(
+          isExpired
+            ? "Code expired. Tap “Resend OTP” to get a new code."
+            : result.error || "Invalid OTP"
+        );
+        if (!isExpired) {
+          const alertMessage =
+            result.error?.includes("Invalid") || result.error?.includes("invalid")
+              ? "Invalid OTP. Please check the code and try again."
+              : result.error || "Invalid OTP";
+          Alert.alert("OTP Error", alertMessage);
         }
-
-        Alert.alert("OTP Error", alertMessage);
       }
     } catch (error) {
       console.error("❌ OTP submit error:", error);
@@ -196,19 +210,18 @@ export default function LoginScreen() {
   };
 
   const handleResendOTP = async () => {
+    setError(""); // Clear expired/invalid message so user can try new code
     setIsLoading(true);
-    setError("");
 
     try {
       const result = await oauthApi.requestOTP(email, "email");
 
       if (result.success) {
-        // Clear any previous OTP - will be set when received from email
         setDisplayedOTP("");
         setReceivedOTP("");
         Alert.alert(
           "OTP Resent",
-          "A new 6-digit code has been sent to your email. Please check your email and copy the OTP."
+          "A new 6-digit code has been sent to your email. Enter it below (expires in 5 minutes)."
         );
       } else {
         setError(result.error || "Failed to resend OTP");
@@ -285,7 +298,10 @@ export default function LoginScreen() {
   };
 
   const getServerDisplay = () => {
-    return serverConfig.serverUrl || "No server configured";
+    if (!serverConfig.serverUrl) return "No server configured";
+    return serverConfig.serverUrl === DEMO_SERVER_URL
+      ? "Demo server (Printechs)"
+      : serverConfig.serverUrl;
   };
 
   return (
@@ -300,18 +316,24 @@ export default function LoginScreen() {
         style={styles.keyboardView}
       >
         <View style={styles.content}>
-          {/* Logo/Title */}
-          <View style={styles.header}>
-            <View style={styles.logoContainer}>
-              <Ionicons name="business" size={60} color="#ffffff" />
+          <ScrollView
+            style={styles.scrollView}
+            contentContainerStyle={styles.scrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            {/* Logo/Title */}
+            <View style={styles.header}>
+              <View style={styles.logoContainer}>
+                <Ionicons name="business" size={60} color="#ffffff" />
+              </View>
+              <Text style={styles.title}>ERPNext Mobile</Text>
+              <Text style={styles.subtitle}>Analytics & Approvals</Text>
             </View>
-            <Text style={styles.title}>ERPNext Mobile</Text>
-            <Text style={styles.subtitle}>Analytics & Approvals</Text>
-          </View>
 
-          {/* Login Form */}
-          <View style={styles.formContainer}>
-            <View style={styles.card}>
+            {/* Login Form */}
+            <View style={styles.formContainer}>
+              <View style={styles.card}>
               {currentStep === "email" ? (
                 <>
                   <Text style={styles.welcomeText}>Welcome Back</Text>
@@ -368,43 +390,24 @@ export default function LoginScreen() {
                     We've sent a 6-digit code to {email}
                   </Text>
 
-                  {/* Display OTP for easy access - Only show when received from email */}
+                  {/* Optional: show received OTP for tap-to-fill */}
                   {receivedOTP && (
-                    <View style={styles.otpDisplayContainer}>
-                      <Text style={styles.otpDisplayLabel}>Your OTP Code:</Text>
-                      <TouchableOpacity
-                        style={styles.otpDisplayButton}
-                        onPress={handleOTPClick}
-                        disabled={isLoading}
-                      >
-                        <Text style={styles.otpDisplayText}>{receivedOTP}</Text>
-                        <Ionicons
-                          name="copy-outline"
-                          size={20}
-                          color="#007AFF"
-                        />
-                      </TouchableOpacity>
-                      <Text style={styles.otpDisplayHint}>
-                        Tap the code above to auto-fill
-                      </Text>
-                    </View>
+                    <TouchableOpacity
+                      style={styles.otpTapToFill}
+                      onPress={handleOTPClick}
+                      disabled={isLoading}
+                    >
+                      <Text style={styles.otpDisplayText}>{receivedOTP}</Text>
+                      <Text style={styles.otpDisplayHint}> · Tap to fill</Text>
+                    </TouchableOpacity>
                   )}
 
-                  {/* Simple instructions */}
+                  {/* Single compact instruction + clipboard */}
                   <View style={styles.otpInstructionsContainer}>
                     <Text style={styles.otpInstructionsText}>
-                      📧 Check your email for the 6-digit OTP code
+                      Code expires in 5 minutes
+                      {isMonitoringClipboard ? " · Monitoring clipboard…" : ""}
                     </Text>
-                    <Text style={styles.otpInstructionsSubtext}>
-                      The code expires in 5 minutes
-                    </Text>
-
-                    {isMonitoringClipboard && (
-                      <Text style={styles.monitoringText}>
-                        🔍 Monitoring clipboard for OTP...
-                      </Text>
-                    )}
-
                     <TouchableOpacity
                       style={styles.refreshButton}
                       onPress={async () => {
@@ -412,39 +415,26 @@ export default function LoginScreen() {
                           const clipboardContent = await Clipboard.getString();
                           const otpMatch = clipboardContent.match(/\b\d{6}\b/);
                           if (otpMatch) {
-                            const detectedOTP = otpMatch[0];
-                            setReceivedOTP(detectedOTP);
-                            Alert.alert(
-                              "OTP Found",
-                              `OTP ${detectedOTP} found in clipboard!`
-                            );
+                            setReceivedOTP(otpMatch[0]);
+                            Alert.alert("OTP Found", "Paste the code in the fields below.");
                           } else {
                             Alert.alert(
                               "No OTP Found",
-                              "No 6-digit OTP found in clipboard. Please copy the OTP from your email first."
+                              "Copy the 6-digit code from your email first."
                             );
                           }
-                        } catch (error) {
-                          Alert.alert(
-                            "Error",
-                            "Could not check clipboard. Please try again."
-                          );
+                        } catch (_) {
+                          Alert.alert("Error", "Could not check clipboard.");
                         }
                       }}
                       disabled={isLoading}
                     >
-                      <Ionicons
-                        name="refresh-outline"
-                        size={16}
-                        color="#007AFF"
-                      />
-                      <Text style={styles.refreshButtonText}>
-                        Check Clipboard
-                      </Text>
+                      <Ionicons name="copy-outline" size={16} color="#007AFF" />
+                      <Text style={styles.refreshButtonText}>Check Clipboard</Text>
                     </TouchableOpacity>
                   </View>
 
-                  {/* OTP Input */}
+                  {/* OTP Input - no duplicate header */}
                   <OTPInput
                     length={6}
                     onComplete={handleOTPSubmit}
@@ -453,23 +443,23 @@ export default function LoginScreen() {
                     error={error}
                     receivedOTP={receivedOTP}
                     displayOTP={receivedOTP}
+                    hideHeader
                   />
 
-                  {/* Test OTP Button (for debugging) */}
-                  <TouchableOpacity
-                    style={styles.testButton}
-                    onPress={() => {
-                      const testOTP = "408057";
-                      setReceivedOTP(testOTP);
-                    }}
-                    disabled={isLoading}
-                  >
-                    <Text style={styles.testButtonText}>
-                      Test Auto-fill OTP (408057)
-                    </Text>
-                  </TouchableOpacity>
+                  {/* Test OTP - dev only (fake code causes "Invalid OTP" in production) */}
+                  {__DEV__ && (
+                    <TouchableOpacity
+                      style={styles.testButton}
+                      onPress={() => setReceivedOTP("408057")}
+                      disabled={isLoading}
+                    >
+                      <Text style={styles.testButtonText}>
+                        [Dev] Test Auto-fill OTP
+                      </Text>
+                    </TouchableOpacity>
+                  )}
 
-                  {/* Back to Email Button */}
+                  {/* Back to Email */}
                   <TouchableOpacity
                     style={styles.backButton}
                     onPress={handleBackToEmail}
@@ -508,11 +498,14 @@ export default function LoginScreen() {
                   </Text>
                 </View>
               )}
+              </View>
             </View>
-          </View>
+          </ScrollView>
 
-          {/* Footer */}
-          <Text style={styles.footer}>Powered by Printechs</Text>
+          {/* Footer - always at bottom, never overlaps content */}
+          <View style={styles.footerWrap}>
+            <Text style={styles.footer}>Powered by Printechs</Text>
+          </View>
         </View>
       </KeyboardAvoidingView>
 
@@ -551,8 +544,14 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
-    justifyContent: "space-between",
     padding: 24,
+  },
+  scrollView: {
+    flex: 1,
+  },
+  scrollContent: {
+    flexGrow: 1,
+    paddingBottom: 32,
   },
   header: {
     alignItems: "center",
@@ -638,6 +637,14 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginBottom: 8,
   },
+  otpTapToFill: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "center",
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
   otpDisplayButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -669,18 +676,18 @@ const styles = StyleSheet.create({
   },
   otpInstructionsContainer: {
     backgroundColor: "#f0f8ff",
-    padding: 16,
-    borderRadius: 12,
-    marginBottom: 24,
+    padding: 12,
+    borderRadius: 10,
+    marginBottom: 16,
     borderLeftWidth: 4,
     borderLeftColor: "#007AFF",
   },
   otpInstructionsText: {
-    fontSize: 14,
+    fontSize: 13,
     color: "#007AFF",
     fontWeight: "600",
     textAlign: "center",
-    marginBottom: 4,
+    marginBottom: 8,
   },
   otpInstructionsSubtext: {
     fontSize: 12,
@@ -812,11 +819,14 @@ const styles = StyleSheet.create({
     color: "#9ca3af",
     textAlign: "center",
   },
+  footerWrap: {
+    paddingVertical: 16,
+    paddingBottom: Platform.OS === "ios" ? 28 : 16,
+  },
   footer: {
     textAlign: "center",
     color: "rgba(255, 255, 255, 0.8)",
     fontSize: 14,
-    marginBottom: 20,
   },
   modalContainer: {
     flex: 1,

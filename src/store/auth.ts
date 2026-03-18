@@ -2,6 +2,10 @@ import { create } from "zustand";
 import { authApi, type LoginCredentials } from "../api/auth";
 import { oauthApi } from "../api/oauth";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { storage } from "../api/storage";
+
+/** Default server used when none is configured (e.g. first launch, App Store review). */
+export const DEMO_SERVER_URL = "https://printechs.com";
 
 export interface ServerConfig {
   serverUrl: string;
@@ -139,6 +143,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
     try {
       await AsyncStorage.setItem("serverConfig", JSON.stringify(newConfig));
+      await storage.setItem("serverConfig", JSON.stringify(newConfig));
     } catch (error) {
       console.error("Failed to save server config:", error);
     }
@@ -150,9 +155,29 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       if (savedConfig) {
         const config = JSON.parse(savedConfig);
         set({ serverConfig: config });
+        try {
+          await storage.setItem("serverConfig", savedConfig);
+        } catch (_) {}
+      } else {
+        set({
+          serverConfig: {
+            serverUrl: DEMO_SERVER_URL,
+            hostname: "",
+            port: 0,
+            isHttps: true,
+          },
+        });
       }
     } catch (error) {
       console.error("Failed to load server config:", error);
+      set({
+        serverConfig: {
+          serverUrl: DEMO_SERVER_URL,
+          hostname: "",
+          port: 0,
+          isHttps: true,
+        },
+      });
     }
   },
 }));
