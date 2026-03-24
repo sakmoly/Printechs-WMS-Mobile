@@ -12,6 +12,7 @@ import {
   ScrollView,
   Clipboard,
   Linking,
+  Image,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { router } from "expo-router";
@@ -322,10 +323,14 @@ export default function LoginScreen() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
-            {/* Logo/Title */}
+            {/* Logo/Title - uses app icon (replace assets/icon.png with Printechs logo) */}
             <View style={styles.header}>
               <View style={styles.logoContainer}>
-                <Ionicons name="business" size={60} color="#ffffff" />
+                <Image
+                  source={require("../../assets/icon.png")}
+                  style={styles.logoImage}
+                  resizeMode="contain"
+                />
               </View>
               <Text style={styles.title}>ERPNext Mobile</Text>
               <Text style={styles.subtitle}>Analytics & Approvals</Text>
@@ -565,6 +570,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     marginBottom: 20,
+    overflow: "hidden",
+  },
+  logoImage: {
+    width: 80,
+    height: 80,
   },
   title: {
     fontSize: 32,

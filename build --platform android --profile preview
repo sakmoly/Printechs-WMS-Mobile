@@ -1,0 +1,68 @@
+[33mcommit bdb7de2221d70da0045af79d101291477e45e702[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m)[m
+Author: User <user@example.com>
+Date:   Thu Oct 23 16:58:49 2025 +0300
+
+    Initial commit for APK build
+
+D	403_ERROR_SUPPRESSION_FIX.md
+D	API_SETUP_GUIDE.md
+D	App.tsx
+D	BACKUP_RECOVERY_GUIDE.md
+D	CHART_ADDITIONS_SUMMARY.md
+D	CHART_TROUBLESHOOTING.md
+D	DASHBOARD_403_FIX.md
+D	DASHBOARD_CHANGES_SUMMARY.md
+D	DASHBOARD_NAVIGATION_SOLUTIONS.md
+D	DASHBOARD_REDESIGN.md
+D	ERPNext_API_Implementation.py
+D	EXPO_SERVICE_SETUP.md
+D	HOME_SCREEN_IMAGE_TROUBLESHOOTING.md
+D	HTTP_403_FIX_GUIDE.md
+D	HTTP_ERROR_FIX_GUIDE.md
+D	KPI_DETAILS_SCREEN_IMPLEMENTED.md
+D	KPI_NAVIGATION_FIX.md
+D	MONTHLY_SALES_TREND_INTEGRATION.md
+D	OPTIMIZED_API_GUIDE.md
+D	QUICK_403_FIX.md
+D	RELOAD_REQUIRED.md
+D	Sample_API_Responses.json
+D	TABBED_DASHBOARD_IMPLEMENTATION.md
+D	TERRITORY_CHART_INTEGRATION.md
+D	USER_PROFILE_IMAGE_GUIDE.md
+M	app/(auth)/login.tsx
+M	app/(tabs)/approvals.tsx
+D	app/(tabs)/dashboard-optimized.tsx
+M	app/(tabs)/employees.tsx
+M	app/(tabs)/index.tsx
+D	app/chart-test.tsx
+D	app/debug-http.tsx
+D	app/division-test.tsx
+M	app/employee-profile/[id].tsx
+A	app/sales-dashboard.tsx
+M	app/user-profile.tsx
+M	package.json
+M	src/api/http.ts
+M	src/api/mock.ts
+A	src/api/oauth.ts
+M	src/api/optimized-apis.ts
+M	src/api/storage.ts
+D	src/components/ColorfulBarChart.tsx
+D	src/components/DivisionPieChartDemo.tsx
+M	src/components/GaugeChart.tsx
+D	src/components/KpiCard.tsx.backup
+D	src/components/MonthlySalesTrendDemo.tsx
+A	src/components/OTPInput.tsx
+D	src/components/SalesChart.tsx
+D	src/components/TerritoryBarChartDemo.tsx
+M	src/components/TerritoryPieChart.tsx
+M	src/components/TopBrandsChart.tsx
+M	src/components/TopCustomersChart.tsx
+M	src/components/dashboard-tabs/OverviewTab.tsx
+M	src/components/dashboard-tabs/PerformanceTab.tsx
+M	src/components/dashboard-tabs/TrendsTab.tsx
+M	src/config/env.ts
+M	src/hooks/useOptimizedApis.ts
+M	src/hooks/useSalesDashboard.ts
+M	src/store/auth.ts
+D	src/utils/debugHttp.ts
+M	start-expo.bat

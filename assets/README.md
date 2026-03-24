@@ -4,14 +4,21 @@
 
 Place your app icons and splash screens here:
 
-- `icon.png` - App icon (1024x1024 px)
-- `splash.png` - Splash screen (1284x2778 px)
-- `adaptive-icon.png` - Android adaptive icon (1024x1024 px)
-- `favicon.png` - Web favicon (48x48 px)
+- **`icon.png`** – App icon (1024×1024 px). Used as:
+  - Home screen / App Store icon
+  - Login screen logo (top of the screen)
+  - Profile avatar fallback when server image is missing
+- `splash.png` – Splash screen (1284×2778 px)
+- `adaptive-icon.png` – Android adaptive icon (1024×1024 px)
+- `favicon.png` – Web favicon (48×48 px)
 
-## Temporary Placeholders
+## Why the Printechs icon might not show
 
-For now, the app will use Expo's default icons.
+If you previously had a Printechs icon and it no longer appears:
+
+1. **Replace `icon.png`** in this folder with your Printechs logo/icon (1024×1024 px).  
+   The repo may only contain a tiny placeholder PNG; overwrite it with your real asset.
+2. The **login screen** and **profile fallback** both use `icon.png`. Once you restore the correct file, they will show the Printechs icon again.
 
 To customize:
 
