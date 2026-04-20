@@ -14,6 +14,10 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { apiService } from "../services/api.service";
 import { BarcodeScanner } from "../components/BarcodeScanner";
+import {
+  clearScannerTimer,
+  onScannerTextChange,
+} from "../utils/hardwareScannerInput";
 
 export default function MaterialRequestScanLocationScreen() {
   const navigation = useNavigation();
@@ -31,6 +35,8 @@ export default function MaterialRequestScanLocationScreen() {
   
   const binLocationInputRef = useRef<TextInput>(null);
   const cartonIdInputRef = useRef<TextInput>(null);
+  const binScanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cartonScanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showBinScanner, setShowBinScanner] = useState(false);
   const [showCartonScanner, setShowCartonScanner] = useState(false);
 
@@ -331,15 +337,41 @@ export default function MaterialRequestScanLocationScreen() {
   };
 
   const handleBinLocationSubmit = () => {
+    clearScannerTimer(binScanTimerRef);
     if (binLocation.trim()) {
       validateBinLocation(binLocation.trim());
     }
   };
 
   const handleCartonIdSubmit = () => {
+    clearScannerTimer(cartonScanTimerRef);
     if (cartonId.trim()) {
       validateCartonId(cartonId.trim());
     }
+  };
+
+  const handleBinLocationTextChange = (text: string) => {
+    onScannerTextChange(
+      text,
+      (d) => {
+        const u = d.toUpperCase();
+        setBinLocation(u);
+        if (!u.trim()) {
+          setBinInfo(null);
+        }
+      },
+      binScanTimerRef,
+      (cleaned) => validateBinLocation(cleaned.trim())
+    );
+  };
+
+  const handleCartonIdTextChange = (text: string) => {
+    onScannerTextChange(
+      text,
+      setCartonId,
+      cartonScanTimerRef,
+      (cleaned) => void validateCartonId(cleaned.trim())
+    );
   };
 
   const handleBinScan = (barcode: string) => {
@@ -379,14 +411,7 @@ export default function MaterialRequestScanLocationScreen() {
               ref={binLocationInputRef}
               style={styles.input}
               value={binLocation}
-              onChangeText={(text) => {
-                setBinLocation(text.toUpperCase());
-                if (text) {
-                  validateBinLocation(text.toUpperCase());
-                } else {
-                  setBinInfo(null);
-                }
-              }}
+              onChangeText={handleBinLocationTextChange}
               placeholder="Scan or enter bin code"
               autoCapitalize="characters"
               autoFocus={true}
@@ -466,7 +491,7 @@ export default function MaterialRequestScanLocationScreen() {
             ref={cartonIdInputRef}
             style={styles.cartonInput}
             value={cartonId}
-            onChangeText={setCartonId}
+            onChangeText={handleCartonIdTextChange}
             placeholder="Scan or enter carton ID"
             autoCapitalize="characters"
             autoFocus={true}

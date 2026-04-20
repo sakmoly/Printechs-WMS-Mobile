@@ -13,14 +13,26 @@ import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { saveSettings, getSettings } from "../services/settings.service";
+import type { ItemMasterSyncMode } from "../types";
 import { apiService } from "../services/api.service";
 import { syncUsers } from "../services/user-sync.service";
 import { clearAllCacheData, clearDemoData } from "../services/data-cleanup.service";
-import { syncMasterDataFromDesktop } from "../services/master-data-sync.service";
+import {
+  syncMasterDataFromDesktop,
+  type MasterSyncProgress,
+} from "../services/master-data-sync.service";
+import { syncEvents } from "../services/event-queue.service";
+import { syncAllUnsyncedSessions } from "../services/session-sync.service";
+import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
+import {
+  pickAndRestoreDatabase,
+  saveDatabaseBackupToPickedFolder,
+  shareDatabaseBackup,
+} from "../services/database-backup.service";
 
 export default function SettingsScreen() {
   const navigation = useNavigation();
-  const { refreshSettings } = useApp();
+  const { refreshSettings, refreshPendingEvents, activeASN, activeSession } = useApp();
   const [apiUrl, setApiUrl] = useState("");
   const [deviceId, setDeviceId] = useState("");
   const [userId, setUserId] = useState("");
@@ -29,6 +41,20 @@ export default function SettingsScreen() {
   // Demo mode removed from UI - always set to 0 in database
   const [testingConnection, setTestingConnection] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [syncingFull, setSyncingFull] = useState(false);
+  const [fullSyncStatusLine, setFullSyncStatusLine] = useState("");
+  const [userSyncStatusLine, setUserSyncStatusLine] = useState("");
+  const [itemMasterSyncMode, setItemMasterSyncMode] =
+    useState<ItemMasterSyncMode>("full");
+  const [itemMasterPageSize, setItemMasterPageSize] = useState("5000");
+  const [itemMasterWatermarkPreview, setItemMasterWatermarkPreview] =
+    useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupFolderBusy, setBackupFolderBusy] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+
+  const formatMasterProgress = (p: MasterSyncProgress) =>
+    `${p.phase} (${p.step}/${p.totalSteps})${p.detail ? ` — ${p.detail}` : ""}`;
 
   useEffect(() => {
     loadSettings();
@@ -60,6 +86,16 @@ export default function SettingsScreen() {
       setUserCode(settings.user_code || "");
       setPassword(settings.password || "");
       // Demo mode is always disabled (removed from UI)
+
+      const mode = (settings.item_master_sync_mode || "full").toString().toLowerCase();
+      setItemMasterSyncMode(mode === "incremental" ? "incremental" : "full");
+      const pgs = (settings as any).item_master_page_size;
+      setItemMasterPageSize(
+        pgs != null && pgs !== "" ? String(pgs) : "5000"
+      );
+      setItemMasterWatermarkPreview(
+        (settings as any).item_master_modified_watermark || null
+      );
       
       console.log("✅ Settings loaded into UI state");
     } catch (error: any) {
@@ -152,6 +188,12 @@ export default function SettingsScreen() {
         demo_mode: 0, // Always 0 (demo mode disabled)
       });
 
+      const pageSizeNum = parseInt(itemMasterPageSize.trim(), 10);
+      const safePageSize =
+        Number.isFinite(pageSizeNum) && pageSizeNum >= 500 && pageSizeNum <= 20000
+          ? pageSizeNum
+          : 5000;
+
       await saveSettings({
         api_url: trimmedApiUrl.length > 0 ? trimmedApiUrl : null,
         device_id: deviceId.trim().length > 0 ? deviceId.trim() : null,
@@ -159,6 +201,8 @@ export default function SettingsScreen() {
         user_code: userCode.trim().length > 0 ? userCode.trim() : null,
         password: password && password.length > 0 ? password : null,
         demo_mode: 0, // Always set to 0 (demo mode disabled)
+        item_master_sync_mode: itemMasterSyncMode,
+        item_master_page_size: safePageSize,
       });
 
       // Verify the save - wait a moment for database write to complete
@@ -260,6 +304,7 @@ export default function SettingsScreen() {
     }
 
     setSyncing(true);
+    setUserSyncStatusLine("Signing in…");
     try {
       // Try to authenticate first
       try {
@@ -273,12 +318,14 @@ export default function SettingsScreen() {
           }\n\nPlease check your User Code and Password in Settings.`
         );
         setSyncing(false);
+        setUserSyncStatusLine("");
         return;
       }
 
       // Note: Demo data is not used in production - only real data from desktop API
 
       // If authentication succeeds, proceed with sync
+      setUserSyncStatusLine("Downloading users from server…");
       const result = await syncUsers();
 
       if (result.synced > 0 || result.failed === 0) {
@@ -313,7 +360,66 @@ export default function SettingsScreen() {
         Alert.alert("Sync Error", errorMessage);
       }
     } finally {
+      setUserSyncStatusLine("");
       setSyncing(false);
+    }
+  };
+
+  /** Full sync: master data + sessions + events + resend receive lines (same as Sync Center). */
+  const handleSyncNow = async () => {
+    if (!apiUrl?.trim()) {
+      Alert.alert("Error", "Please configure and save API URL first.");
+      return;
+    }
+    setSyncingFull(true);
+    setFullSyncStatusLine("Master data: starting…");
+    try {
+      const masterResult = await syncMasterDataFromDesktop({
+        onProgress: (p) => {
+          setFullSyncStatusLine(`Master data: ${formatMasterProgress(p)}`);
+        },
+      });
+      await new Promise((r) => setTimeout(r, 100));
+      setFullSyncStatusLine("Sessions: uploading…");
+      try {
+        await syncAllUnsyncedSessions();
+      } catch (_) {}
+      await new Promise((r) => setTimeout(r, 100));
+      setFullSyncStatusLine("Events: uploading…");
+      const result = await syncEvents();
+      await refreshPendingEvents?.();
+      let receiveMsg = "";
+      // Use context first; if missing, use stored settings so resend works from Settings too
+      const asn = activeASN ?? (await getSettings()).active_asn;
+      const session = activeSession ?? (await getSettings()).active_session;
+      if (asn && session) {
+        setFullSyncStatusLine("Receive data: syncing with backend…");
+        try {
+          const resend = await resendReceiveLinesToBackend(asn, session);
+          if (resend.linesSent > 0) {
+            const itemSummary = resend.byItem
+              ? "\nItems sent: " + Object.entries(resend.byItem).map(([code, qty]) => `${code} (${qty})`).join(", ")
+              : "";
+            receiveMsg = `\n\nReceive data resent to backend:\nSession: ${resend.sessionSent}\n${resend.linesSent} line(s) from ${resend.cartonsSent} carton(s).${itemSummary}\n\nIf desktop Recvd Qty still shows 0, the backend must save and sum these by (session, item_code).`;
+          } else {
+            receiveMsg = `\n\nNo receive lines to resend for session ${session} (no scanned items in DB for this session).`;
+          }
+        } catch (e: any) {
+          receiveMsg = `\n\nReceive data resend failed: ${e?.message || "unknown"}.`;
+        }
+      } else {
+        receiveMsg = "\n\nNo active ASN/session stored – receive data was not resent. Start an inbound and scan items, or use Receive + Sort → Sync receive data.";
+      }
+      setFullSyncStatusLine("");
+      Alert.alert(
+        "Sync Complete",
+        `Master data synced.\nEvents: ${result.synced} synced, ${result.failed} failed.${receiveMsg}`
+      );
+    } catch (error: any) {
+      setFullSyncStatusLine("");
+      Alert.alert("Sync Error", error?.message || "Failed to sync.");
+    } finally {
+      setSyncingFull(false);
     }
   };
 
@@ -372,6 +478,85 @@ export default function SettingsScreen() {
               autoCapitalize="none"
             />
 
+            <Text style={styles.label}>Item master sync</Text>
+            <Text style={styles.helpText}>
+              Full: clears local items then downloads all pages. Incremental: only
+              rows changed since the watermark (requires API modified_since).
+            </Text>
+            <View style={styles.itemMasterModeRow}>
+              <TouchableOpacity
+                style={[
+                  styles.modeChip,
+                  itemMasterSyncMode === "full" && styles.modeChipSelected,
+                ]}
+                onPress={() => setItemMasterSyncMode("full")}
+              >
+                <Text
+                  style={[
+                    styles.modeChipText,
+                    itemMasterSyncMode === "full" && styles.modeChipTextSelected,
+                  ]}
+                >
+                  Full
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.modeChip,
+                  itemMasterSyncMode === "incremental" && styles.modeChipSelected,
+                ]}
+                onPress={() => setItemMasterSyncMode("incremental")}
+              >
+                <Text
+                  style={[
+                    styles.modeChipText,
+                    itemMasterSyncMode === "incremental" &&
+                      styles.modeChipTextSelected,
+                  ]}
+                >
+                  Incremental
+                </Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.label}>Item master page size (per request)</Text>
+            <TextInput
+              style={styles.input}
+              value={itemMasterPageSize}
+              onChangeText={setItemMasterPageSize}
+              placeholder="5000"
+              keyboardType="number-pad"
+            />
+            <Text style={styles.helpText}>
+              Range 500–20000. Smaller pages use less memory; larger pages mean fewer
+              HTTP calls.
+            </Text>
+            {itemMasterWatermarkPreview ? (
+              <Text style={styles.watermarkHint} numberOfLines={2}>
+                Incremental watermark: {itemMasterWatermarkPreview}
+              </Text>
+            ) : (
+              <Text style={styles.watermarkHint}>Incremental watermark: (none)</Text>
+            )}
+            <TouchableOpacity
+              style={styles.clearWatermarkButton}
+              onPress={async () => {
+                try {
+                  await saveSettings({ item_master_modified_watermark: null });
+                  setItemMasterWatermarkPreview(null);
+                  Alert.alert(
+                    "Watermark cleared",
+                    "Next incremental sync will load changes from the server baseline (no modified_since filter until a new sync completes)."
+                  );
+                } catch (e: any) {
+                  Alert.alert("Error", e?.message || "Failed to clear");
+                }
+              }}
+            >
+              <Text style={styles.clearWatermarkText}>
+                Clear incremental watermark
+              </Text>
+            </TouchableOpacity>
+
         <TouchableOpacity
           style={[styles.button, testingConnection && styles.buttonDisabled]}
           onPress={handleSave}
@@ -388,24 +573,175 @@ export default function SettingsScreen() {
         </TouchableOpacity>
 
         {apiUrl && (
-          <TouchableOpacity
-            style={[styles.syncButton, syncing && styles.buttonDisabled]}
-            onPress={handleSync}
-            disabled={syncing}
-          >
-            {syncing ? (
-              <View style={styles.buttonLoading}>
-                <ActivityIndicator color="#fff" size="small" />
-                <Text style={styles.buttonText}>Syncing Users...</Text>
-              </View>
-            ) : (
-              <Text style={styles.buttonText}>🔄 Sync Users</Text>
-            )}
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity
+              style={[styles.syncButton, syncing && styles.buttonDisabled]}
+              onPress={handleSync}
+              disabled={syncing}
+            >
+              {syncing ? (
+                <View style={styles.buttonLoading}>
+                  <ActivityIndicator color="#fff" size="small" />
+                  <Text style={styles.buttonText}>Syncing Users...</Text>
+                </View>
+              ) : (
+                <Text style={styles.buttonText}>🔄 Sync Users</Text>
+              )}
+            </TouchableOpacity>
+            {userSyncStatusLine ? (
+              <Text style={styles.userSyncStatusText}>{userSyncStatusLine}</Text>
+            ) : null}
+            <TouchableOpacity
+              style={[styles.syncNowButton, (syncingFull || syncing) && styles.buttonDisabled]}
+              onPress={handleSyncNow}
+              disabled={syncingFull || syncing}
+            >
+              {syncingFull ? (
+                <View style={styles.buttonLoading}>
+                  <ActivityIndicator color="#fff" size="small" />
+                  <Text style={styles.buttonText}>Syncing...</Text>
+                </View>
+              ) : (
+                <Text style={styles.buttonText}>🔄 Sync Now (Master + Events + Receive Data)</Text>
+              )}
+            </TouchableOpacity>
+            {fullSyncStatusLine ? (
+              <Text style={styles.fullSyncStatusText}>{fullSyncStatusLine}</Text>
+            ) : null}
+          </>
         )}
 
         <View style={styles.dangerZone}>
           <Text style={styles.dangerZoneTitle}>⚠️ Data Management</Text>
+
+          <TouchableOpacity
+            style={[styles.backupButton, backupBusy && styles.buttonDisabled]}
+            onPress={async () => {
+              if (backupBusy) return;
+              setBackupBusy(true);
+              try {
+                const result = await shareDatabaseBackup();
+                Alert.alert(
+                  "Backup ready — share sheet",
+                  `Created: ${result.filename}\n\nPick Gmail, Drive, etc. if you want to send or upload it.\n\nTip: “Files by Google” with “Download” here often only opens the Downloads folder — it does not save the file. To save on the phone, use “Save backup to folder…” below instead.`,
+                  [{ text: "OK" }]
+                );
+              } catch (error: any) {
+                Alert.alert(
+                  "Backup failed",
+                  error?.message ?? "Could not create backup."
+                );
+              } finally {
+                setBackupBusy(false);
+              }
+            }}
+            disabled={backupBusy}
+          >
+            {backupBusy ? (
+              <View style={styles.buttonLoading}>
+                <ActivityIndicator color="#2E7D32" size="small" />
+                <Text style={styles.backupButtonText}>Creating backup…</Text>
+              </View>
+            ) : (
+              <Text style={styles.backupButtonText}>
+                💾 Backup Full Database
+              </Text>
+            )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.backupFolderButton,
+              backupFolderBusy && styles.buttonDisabled,
+            ]}
+            onPress={async () => {
+              if (backupFolderBusy) return;
+              setBackupFolderBusy(true);
+              try {
+                const result = await saveDatabaseBackupToPickedFolder();
+                if (!result) return;
+                Alert.alert(
+                  "Saved",
+                  `Backup written as:\n${result.filename}\n\nOpen your Files app and browse to the folder you chose (e.g. Downloads on Android).`,
+                  [{ text: "OK" }]
+                );
+              } catch (error: any) {
+                Alert.alert(
+                  "Save failed",
+                  error?.message ?? "Could not save backup to that folder."
+                );
+              } finally {
+                setBackupFolderBusy(false);
+              }
+            }}
+            disabled={backupFolderBusy}
+          >
+            {backupFolderBusy ? (
+              <View style={styles.buttonLoading}>
+                <ActivityIndicator color="#1565C0" size="small" />
+                <Text style={styles.backupFolderButtonText}>Saving…</Text>
+              </View>
+            ) : (
+              <Text style={styles.backupFolderButtonText}>
+                📁 Save backup to folder…
+              </Text>
+            )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.restoreButton, restoreBusy && styles.buttonDisabled]}
+            onPress={() => {
+              if (restoreBusy) return;
+              Alert.alert(
+                "Restore database",
+                "This replaces ALL local data with the chosen backup file, including API URL, device ID, sessions, cache, and queue.\n\nStop scanning or syncing first. This cannot be undone.\n\nContinue?",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Choose backup file…",
+                    style: "destructive",
+                    onPress: async () => {
+                      setRestoreBusy(true);
+                      try {
+                        const restored = await pickAndRestoreDatabase();
+                        if (!restored) {
+                          setRestoreBusy(false);
+                          return;
+                        }
+                        await refreshSettings();
+                        await refreshPendingEvents();
+                        Alert.alert(
+                          "Restore complete",
+                          "The database was restored from the backup. Verify API URL and credentials, then sync if needed.",
+                          [{ text: "OK" }]
+                        );
+                      } catch (error: any) {
+                        Alert.alert(
+                          "Restore failed",
+                          error?.message ?? "Could not restore backup."
+                        );
+                      } finally {
+                        setRestoreBusy(false);
+                      }
+                    },
+                  },
+                ]
+              );
+            }}
+            disabled={restoreBusy}
+          >
+            {restoreBusy ? (
+              <View style={styles.buttonLoading}>
+                <ActivityIndicator color="#E65100" size="small" />
+                <Text style={styles.restoreButtonText}>Restoring…</Text>
+              </View>
+            ) : (
+              <Text style={styles.restoreButtonText}>
+                📂 Restore From Backup
+              </Text>
+            )}
+          </TouchableOpacity>
+
           <TouchableOpacity
             style={styles.dangerButton}
             onPress={() => {
@@ -584,6 +920,71 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginTop: 8,
   },
+  userSyncStatusText: {
+    fontSize: 14,
+    color: "#333",
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  syncNowButton: {
+    backgroundColor: "#2196F3",
+    padding: 18,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  fullSyncStatusText: {
+    fontSize: 14,
+    color: "#333",
+    marginTop: 10,
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  helpText: {
+    fontSize: 13,
+    color: "#666",
+    marginBottom: 10,
+    lineHeight: 18,
+  },
+  itemMasterModeRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginBottom: 14,
+    flexWrap: "wrap",
+  },
+  modeChip: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#ccc",
+    backgroundColor: "#f5f5f5",
+  },
+  modeChipSelected: {
+    borderColor: "#007AFF",
+    backgroundColor: "#E3F2FD",
+  },
+  modeChipText: {
+    fontSize: 15,
+    color: "#333",
+  },
+  modeChipTextSelected: {
+    color: "#007AFF",
+    fontWeight: "600",
+  },
+  watermarkHint: {
+    fontSize: 12,
+    color: "#666",
+    marginBottom: 8,
+  },
+  clearWatermarkButton: {
+    marginBottom: 16,
+  },
+  clearWatermarkText: {
+    fontSize: 14,
+    color: "#C62828",
+    fontWeight: "600",
+  },
   buttonText: {
     color: "#fff",
     fontSize: 18,
@@ -612,6 +1013,48 @@ const styles = StyleSheet.create({
     color: "#F44336",
     marginBottom: 12,
     textAlign: "center",
+  },
+  backupButton: {
+    backgroundColor: "#E8F5E9",
+    borderWidth: 2,
+    borderColor: "#4CAF50",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  backupButtonText: {
+    color: "#2E7D32",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
+  backupFolderButton: {
+    backgroundColor: "#E3F2FD",
+    borderWidth: 2,
+    borderColor: "#1976D2",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  backupFolderButtonText: {
+    color: "#1565C0",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
+  restoreButton: {
+    backgroundColor: "#FFF3E0",
+    borderWidth: 2,
+    borderColor: "#FF9800",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  restoreButtonText: {
+    color: "#E65100",
+    fontSize: 16,
+    fontWeight: "bold",
   },
   dangerButton: {
     backgroundColor: "#F44336",

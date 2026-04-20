@@ -1568,14 +1568,13 @@ export default function PutAwayScreen() {
               }
               
               // ✅ CRITICAL: If carton_id still not found, try to get it from task items
-              // Backend returns carton_id in items array: items[0].carton_id = "CTN-TI-..."
+              // Backend returns carton_id in items: CTN-TI-* (Transfer In) or CTN-* (existing box e.g. CTN-A1-...)
               if (!cartonId && task.items && Array.isArray(task.items) && task.items.length > 0) {
-                // Check all items for carton_id (all items should have same carton_id)
                 for (const item of task.items) {
                   const itemCartonId = item.carton_id || (item as any).carton_ID || (item as any).carton_id;
-                  if (itemCartonId && itemCartonId.startsWith("CTN-TI-")) {
+                  if (itemCartonId && (itemCartonId.startsWith("CTN-") || itemCartonId.startsWith("BOX-") || itemCartonId.startsWith("PAW-"))) {
                     cartonId = itemCartonId;
-                    console.warn(`✅ PutAwayScreen: Found carton_id from task.items array: ${cartonId}`);
+                    console.warn(`✅ PutAwayScreen: Found carton_id from task.items: ${cartonId}`);
                     break;
                   }
                 }
@@ -1618,33 +1617,29 @@ export default function PutAwayScreen() {
                   // Check all items for carton_id
                   for (const item of task.items) {
                     const itemCartonId = item.carton_id || (item as any).carton_ID || (item as any).carton_id;
-                    if (itemCartonId && itemCartonId.startsWith("CTN-TI-")) {
+                    if (itemCartonId && (itemCartonId.startsWith("CTN-") || itemCartonId.startsWith("BOX-") || itemCartonId.startsWith("PAW-"))) {
                       cartonId = itemCartonId;
-                      console.warn(`✅ PutAwayScreen: Found carton_id from task.items array: ${cartonId}`);
+                      console.warn(`✅ PutAwayScreen: Found carton_id from task.items: ${cartonId}`);
                       break;
                     }
                   }
                 }
                 
-                // ✅ FALLBACK: If carton_id still not found, try to get it from local database (scanned_items)
-                // Backend list response may not include items, so we get carton_id from local data
                 if (!cartonId && transferIn) {
                   try {
                     const db = await getDatabase();
                     if (db) {
-                      // Get carton_id from scanned_items for this transfer_in
                       const cartonFromDB = await db.getFirstAsync<{ box_id: string }>(
                         `SELECT DISTINCT box_id 
                          FROM scanned_items 
                          WHERE transfer_in = ? 
-                           AND box_id LIKE 'CTN-TI-%'
+                           AND (box_id LIKE 'CTN-%' OR box_id LIKE 'BOX-%' OR box_id LIKE 'PAW-%')
                          LIMIT 1`,
                         [transferIn]
                       );
-                      
-                      if (cartonFromDB && cartonFromDB.box_id && cartonFromDB.box_id.startsWith("CTN-TI-")) {
+                      if (cartonFromDB && cartonFromDB.box_id) {
                         cartonId = cartonFromDB.box_id;
-                        console.warn(`✅ PutAwayScreen: Found carton_id from local database (scanned_items): ${cartonId} for transfer_in: ${transferIn}`);
+                        console.warn(`✅ PutAwayScreen: Found carton_id from local DB (scanned_items): ${cartonId} for transfer_in: ${transferIn}`);
                       }
                     }
                   } catch (dbError: any) {
@@ -1670,15 +1665,14 @@ export default function PutAwayScreen() {
                   
                   // ✅ Handle response format: { ok: true, data: { items: [...] } }
                   const taskItems = fullTaskData?.items || fullTaskData?.lines || [];
-                  // Try to get carton_id from task items
                   if (!fullTaskCartonId && Array.isArray(taskItems) && taskItems.length > 0) {
                     const firstItem = taskItems[0];
                     const itemCartonId = firstItem.carton_id || (firstItem as any).carton_id || null;
-                    if (itemCartonId && itemCartonId.startsWith("CTN-TI-")) {
+                    if (itemCartonId && (itemCartonId.startsWith("CTN-") || itemCartonId.startsWith("BOX-") || itemCartonId.startsWith("PAW-"))) {
                       cartonId = itemCartonId;
                       console.warn(`✅ PutAwayScreen: Found carton_id from full task items: ${cartonId}`);
                     }
-                  } else if (fullTaskCartonId && fullTaskCartonId.startsWith("CTN-TI-")) {
+                  } else if (fullTaskCartonId && (fullTaskCartonId.startsWith("CTN-") || fullTaskCartonId.startsWith("BOX-") || fullTaskCartonId.startsWith("PAW-"))) {
                     cartonId = fullTaskCartonId;
                     console.warn(`✅ PutAwayScreen: Found carton_id from full task: ${cartonId}`);
                   }
@@ -1704,15 +1698,15 @@ export default function PutAwayScreen() {
                           `SELECT DISTINCT box_id 
                            FROM scanned_items 
                            WHERE transfer_in = ? 
-                             AND box_id LIKE 'CTN-TI-%'
+                             AND (box_id LIKE 'CTN-%' OR box_id LIKE 'BOX-%' OR box_id LIKE 'PAW-%')
                            ORDER BY event_time DESC
                            LIMIT 1`,
                           [transferIn]
                         );
                         
-                        if (cartonFromDB && cartonFromDB.box_id && cartonFromDB.box_id.startsWith("CTN-TI-")) {
+                        if (cartonFromDB && cartonFromDB.box_id) {
                           cartonId = cartonFromDB.box_id;
-                          console.warn(`✅ PutAwayScreen: Found carton_id from local database (last resort): ${cartonId} for transfer_in: ${transferIn}`);
+                          console.warn(`✅ PutAwayScreen: Found carton_id from local DB (last resort): ${cartonId} for transfer_in: ${transferIn}`);
                         }
                       }
                     } catch (dbError: any) {
@@ -3887,12 +3881,9 @@ export default function PutAwayScreen() {
         let cartonIdToSend: string | null = null;
         
         if (isTransferIn) {
-          // ✅ Transfer In Putaway: Use box_id (carton_id format: CTN-TI-...)
-          // For Transfer In, box_id = carton_id (CTN-TI-... format)
-          // ⚠️ CRITICAL: Do NOT use TI-PUT-* format (putaway task title) - backend rejects it
-          
-          // ✅ CRITICAL: Get box_id from carton_id in selectedTCObj (not from selectedTC which might be putaway task title)
-          // Priority: carton_id from selectedTCObj > box_id from selectedTCObj > selectedTC (only if it's CTN-TI-*)
+          // ✅ Transfer In Putaway: box_id can be CTN-TI-* (new carton) or CTN-* (existing box e.g. CTN-A1-...)
+          // Do NOT use TI-PUT-* / PUT-* (task ID) - backend expects carton/box ID
+          // Priority: carton_id from selectedTCObj > box_id from selectedTCObj > selectedTC (if valid CTN-* / BOX-* / PAW-*)
           boxIdToSend = (selectedTCObj as any).carton_id || (selectedTCObj as any).box_id;
           
           // ✅ DEBUG: Log what we found
@@ -3905,61 +3896,53 @@ export default function PutAwayScreen() {
             boxIdToSend_before_check: boxIdToSend,
           });
           
-          // ✅ If carton_id not in selectedTCObj, try to get it from selectedTC (but validate format)
+          // ✅ If carton_id not in selectedTCObj, try to get it from selectedTC (validate format)
           if (!boxIdToSend && selectedTC) {
-            if (selectedTC.startsWith("CTN-TI-")) {
-              // ✅ selectedTC is already in correct format (should be the case if carton_id was set correctly)
+            if (selectedTC.startsWith("CTN-")) {
+              // ✅ Any CTN-* is valid: CTN-TI-* (Transfer In carton) or CTN-A1-* / CTN-* (existing store/ASN carton linked to Transfer In)
               boxIdToSend = selectedTC;
-              console.warn(`✅ Using selectedTC as box_id (CTN-TI-* format): ${boxIdToSend}`);
+              console.warn(`✅ Using selectedTC as box_id (CTN-* format): ${boxIdToSend}`);
             } else if (selectedTC.startsWith("TI-PUT-") || selectedTC.startsWith("PUT-")) {
-              // ❌ selectedTC is putaway task title (TI-PUT-* or PUT-*) - reject it
-              // This should not happen if carton_id was set correctly when loading tasks
-              console.error(`❌ CRITICAL: selectedTC is in TI-PUT-* format: ${selectedTC}`);
-              console.error(`   This means carton_id was not set correctly when loading the putaway task.`);
-              console.error(`   selectedTCObj.carton_id: ${(selectedTCObj as any).carton_id || 'null'}`);
+              // ❌ selectedTC is putaway task title - reject (backend needs carton/box ID, not task ID)
+              console.error(`❌ CRITICAL: selectedTC is task ID (TI-PUT-* / PUT-*): ${selectedTC}`);
               throw new Error(
-                "TI-PUT-* format is no longer used. For Transfer In Putaway, box_id should be the carton_id (CTN-TI-* format).\n\n" +
-                "The putaway task is missing a valid carton_id. Please ensure the carton was created during receiving with a CTN-TI-* format ID.\n\n" +
-                "If this error persists, the putaway task may need to be recreated with the correct carton_id."
+                "Task ID (TI-PUT-* / PUT-*) cannot be used as box_id.\n\n" +
+                "For Transfer In Putaway, box_id must be a carton ID (CTN-* format), e.g. CTN-TI-* or an existing warehouse carton (CTN-A1-...).\n\n" +
+                "Ensure the putaway task has a valid carton_id, or use 'Use existing box' during receiving to link an existing carton."
               );
             } else {
-              // Unknown format - reject it
-              console.error(`❌ CRITICAL: selectedTC is in unknown format: ${selectedTC}`);
-              throw new Error(
-                `Invalid box_id format: "${selectedTC}". For Transfer In Putaway, box_id must be the carton_id (CTN-TI-* format).`
-              );
+              // Allow other box-like formats (e.g. BOX-*, PAW-*) if backend supports them for Transfer In
+              boxIdToSend = selectedTC;
+              console.warn(`✅ Using selectedTC as box_id: ${boxIdToSend}`);
             }
           }
           
-          // ✅ Validate that we have a valid box_id
           if (!boxIdToSend || boxIdToSend.trim() === '') {
             console.error(`❌ CRITICAL: No box_id found for Transfer In putaway`);
-            console.error(`   selectedTC: ${selectedTC}`);
-            console.error(`   selectedTCObj.carton_id: ${(selectedTCObj as any).carton_id || 'null'}`);
-            console.error(`   selectedTCObj.box_id: ${(selectedTCObj as any).box_id || 'null'}`);
-            throw new Error("Box ID (carton_id) is required for Transfer In putaway. Please ensure the putaway task has a valid carton_id (CTN-TI-* format).");
+            throw new Error("Box ID (carton_id) is required for Transfer In putaway. Please ensure the putaway task has a valid carton_id (CTN-* or box format).");
           }
           
-          // ✅ Validate format: Must be CTN-TI-* (not TI-PUT-*)
+          // ✅ Reject task IDs only (TI-PUT-*, PUT-*). Allow any CTN-* (CTN-TI-*, CTN-A1-*, etc.) and other box formats.
           if (boxIdToSend.startsWith("TI-PUT-") || boxIdToSend.startsWith("PUT-")) {
-            console.error(`❌ CRITICAL: boxIdToSend is in TI-PUT-* format: ${boxIdToSend}`);
+            console.error(`❌ CRITICAL: boxIdToSend is task ID format: ${boxIdToSend}`);
             throw new Error(
-              "Invalid box_id format: TI-PUT-* format is no longer used.\n\n" +
-              "For Transfer In Putaway, box_id must be the carton_id (CTN-TI-* format).\n\n" +
-              "The carton ID is generated when you validate the carton during receiving.\n\n" +
-              "Please use the carton ID (CTN-TI-*) instead of the putaway task title (TI-PUT-*)."
+              "box_id cannot be a task ID (TI-PUT-* / PUT-*). Use the carton/box ID (e.g. CTN-TI-* or CTN-A1-...) instead."
             );
           }
           
-          // ✅ Final validation: Must start with CTN-TI-
-          if (!boxIdToSend.startsWith("CTN-TI-")) {
-            console.error(`❌ CRITICAL: boxIdToSend is not in CTN-TI-* format: ${boxIdToSend}`);
+          // ✅ Accept any CTN-* (Transfer In carton or existing warehouse/store carton) and BOX-*/PAW-*
+          const isValidBoxFormat =
+            boxIdToSend.startsWith("CTN-") ||
+            boxIdToSend.startsWith("BOX-") ||
+            boxIdToSend.startsWith("PAW-");
+          if (!isValidBoxFormat) {
+            console.error(`❌ CRITICAL: boxIdToSend is not a valid carton/box format: ${boxIdToSend}`);
             throw new Error(
-              `Invalid box_id format: "${boxIdToSend}". For Transfer In Putaway, box_id must be the carton_id (CTN-TI-* format).`
+              `Invalid box_id format: "${boxIdToSend}". Use a carton ID (CTN-*) or box ID (BOX-*, PAW-*).`
             );
           }
           
-          console.warn(`✅ Transfer In Putaway - Using box_id: ${boxIdToSend} (CTN-TI-* format)`);
+          console.warn(`✅ Transfer In Putaway - Using box_id: ${boxIdToSend}`);
           
           // ✅ Clean carton_id - remove item code if appended
           if (selectedCartonOrItem) {

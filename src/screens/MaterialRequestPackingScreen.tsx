@@ -30,6 +30,10 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { MaterialRequest } from "../types";
 import { resolveItemFromBarcode } from "../services/item-master.service";
+import {
+  clearScannerTimer,
+  onScannerTextChange,
+} from "../utils/hardwareScannerInput";
 
 type ScanWorkflowState =
   | "SCAN_LOCATION"
@@ -116,6 +120,9 @@ export default function MaterialRequestPackingScreen() {
   const binLocationInputRef = useRef<TextInput>(null);
   const cartonIdInputRef = useRef<TextInput>(null);
   const barcodeInputRef = useRef<TextInput>(null);
+  const binLocationScanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cartonIdScanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualBarcodeScanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showBinScanner, setShowBinScanner] = useState(false);
   const [showCartonScanner, setShowCartonScanner] = useState(false);
   const [showItemScanner, setShowItemScanner] = useState(false);
@@ -2437,13 +2444,31 @@ export default function MaterialRequestPackingScreen() {
     }
   };
 
-  // ✅ NEW: Handle Carton ID Input Change
+  // ✅ NEW: Handle Carton ID Input Change (wedge scanners: CR/LF or idle commit)
   const handleCartonIdInputChange = (text: string) => {
-    setCartonIdInput(text);
+    onScannerTextChange(
+      text,
+      setCartonIdInput,
+      cartonIdScanTimerRef,
+      (cleaned) => void handleCartonIdScan(cleaned.trim())
+    );
+  };
+
+  const handleBinLocationInputChange = (text: string) => {
+    onScannerTextChange(
+      text,
+      (d) => setBinLocationInput(d.toUpperCase()),
+      binLocationScanTimerRef,
+      (cleaned) => {
+        const t = cleaned.trim();
+        if (t) void handleBinLocationScan(t);
+      }
+    );
   };
 
   // ✅ NEW: Handle Carton ID Submit
   const handleCartonIdSubmit = async () => {
+    clearScannerTimer(cartonIdScanTimerRef);
     if (cartonIdInput.trim()) {
       await handleCartonIdScan(cartonIdInput.trim());
     }
@@ -3617,6 +3642,15 @@ export default function MaterialRequestPackingScreen() {
     }
   };
 
+  const handleManualBarcodeChange = (text: string) => {
+    onScannerTextChange(
+      text,
+      setManualBarcode,
+      manualBarcodeScanTimerRef,
+      (cleaned) => void handleItemScan(cleaned)
+    );
+  };
+
   // Edit scanned item quantity
   const handleEditQty = (index: number) => {
     const item = scannedItems[index];
@@ -4457,12 +4491,13 @@ export default function MaterialRequestPackingScreen() {
                   ref={binLocationInputRef}
                   style={styles.cartonIdInput}
                   value={binLocationInput}
-                  onChangeText={setBinLocationInput}
+                  onChangeText={handleBinLocationInputChange}
                   placeholder="Scan or enter bin location ID"
                   autoCapitalize="characters"
                   autoFocus={true}
                   showSoftInputOnFocus={false}
                   onSubmitEditing={() => {
+                    clearScannerTimer(binLocationScanTimerRef);
                     if (binLocationInput.trim()) {
                       handleBinLocationScan(binLocationInput.trim());
                     }
@@ -4557,7 +4592,7 @@ export default function MaterialRequestPackingScreen() {
                     ref={barcodeInputRef}
                     style={styles.manualInput}
                     value={manualBarcode}
-                    onChangeText={setManualBarcode}
+                    onChangeText={handleManualBarcodeChange}
                     placeholder="Scan or enter barcode"
                     autoCapitalize="characters"
                     autoFocus={true}
@@ -4565,6 +4600,7 @@ export default function MaterialRequestPackingScreen() {
                     showSoftInputOnFocus={false}
                     keyboardType="default"
                     onSubmitEditing={() => {
+                      clearScannerTimer(manualBarcodeScanTimerRef);
                       if (manualBarcode.trim()) {
                         handleItemScan(manualBarcode.trim());
                         setManualBarcode("");

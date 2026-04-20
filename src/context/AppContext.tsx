@@ -28,11 +28,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const s = await getSettings();
     setSettings(s);
     
-    // Preserve ASN format as stored (don't normalize)
-    // Normalization should only happen for database queries, not for display/storage
+    // Always use normalized ASN (e.g. ASN-0003) so API calls and display match backend
+    // Fixes 404 "ASN ASN-3 not found" when user scanned ASN-0003 but short form was stored
     if (s.active_asn) {
-      console.log(`📋 Loading activeASN from settings (preserving format): "${s.active_asn}"`);
-      setActiveASN(s.active_asn);
+      const canonical = normalizeASN(s.active_asn);
+      if (canonical !== s.active_asn) {
+        console.log(`📋 Correcting activeASN format: "${s.active_asn}" → "${canonical}"`);
+      }
+      setActiveASN(canonical);
     } else {
       setActiveASN(null);
     }
@@ -62,16 +65,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => clearInterval(interval);
   }, []);
 
-  // Wrapper for setActiveASN that preserves original format
+  // Wrapper for setActiveASN: always store canonical format (ASN-0003) so API never gets ASN-3
   const setActiveASNWrapper = (asn: string | null) => {
     if (asn) {
-      // Preserve original format (don't normalize)
-      // Normalization should only happen for database queries, not for display/storage
-      console.log(`📋 Setting activeASN (preserving format): "${asn}"`);
-      setActiveASN(asn);
-      // Save to settings with original format (async, don't wait)
+      const canonical = normalizeASN(asn);
+      console.log(`📋 Setting activeASN: "${asn}" → "${canonical}"`);
+      setActiveASN(canonical);
       import('../services/settings.service').then(({ saveSettings }) => {
-        saveSettings({ active_asn: asn }).catch(() => {});
+        saveSettings({ active_asn: canonical }).catch(() => {});
       });
     } else {
       setActiveASN(null);

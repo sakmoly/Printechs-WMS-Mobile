@@ -1,5 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { View, Text, TextInput, StyleSheet, TouchableOpacity } from 'react-native';
+import {
+  clearScannerTimer,
+  onScannerTextChange,
+} from '../utils/hardwareScannerInput';
 
 interface BarcodeScannerProps {
   onScan: (barcode: string) => void;
@@ -20,7 +24,7 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
 }) => {
   const [input, setInput] = useState('');
   const inputRef = useRef<TextInput>(null);
-  const autoSubmitTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auto-focus when component mounts or scanType changes
   useEffect(() => {
@@ -34,20 +38,14 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
   // Clear auto-submit timer when input changes or component unmounts
   useEffect(() => {
     return () => {
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-      }
+      clearScannerTimer(autoSubmitTimerRef);
     };
   }, []);
 
   const handleSubmit = () => {
     if (input.trim()) {
-      // Clear any pending auto-submit timer
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
-      
+      clearScannerTimer(autoSubmitTimerRef);
+
       onScan(input.trim());
       setInput('');
       // Refocus after submission
@@ -59,41 +57,30 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
 
   // Handle text input changes with auto-submit
   const handleTextChange = (text: string) => {
-    setInput(text);
-    
-    // Clear previous timer if exists
-    if (autoSubmitTimerRef.current) {
-      clearTimeout(autoSubmitTimerRef.current);
-      autoSubmitTimerRef.current = null;
-    }
-    
-    // If auto-submit is enabled and text is not empty, set a timer
-    // This handles scanners that don't send Enter key
-    if (autoSubmit && text.trim().length > 0) {
-      autoSubmitTimerRef.current = setTimeout(() => {
-        // Auto-submit after delay (scanner has finished)
-        const currentText = text.trim();
-        if (currentText.length > 0) {
-          onScan(currentText);
-          setInput('');
-          // Refocus after submission
-          setTimeout(() => {
-            inputRef.current?.focus();
-          }, 100);
-        }
-      }, autoSubmitDelay);
-    }
+    const commit = (barcode: string) => {
+      const trimmed = barcode.trim();
+      if (!trimmed) return;
+      onScan(trimmed);
+      setInput('');
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
+    };
+
+    onScannerTextChange(
+      text,
+      setInput,
+      autoSubmitTimerRef,
+      commit,
+      { delayMs: autoSubmitDelay, autoIdleSubmit: autoSubmit }
+    );
   };
 
   // Handle hardware scanner input (auto-submit on Enter)
   // Hardware scanners typically send Enter/Return after barcode
   const handleKeyPress = (e: any) => {
     if (e.nativeEvent.key === 'Enter' || e.nativeEvent.key === 'Return') {
-      // Clear auto-submit timer when Enter is pressed
-      if (autoSubmitTimerRef.current) {
-        clearTimeout(autoSubmitTimerRef.current);
-        autoSubmitTimerRef.current = null;
-      }
+      clearScannerTimer(autoSubmitTimerRef);
       handleSubmit();
     }
   };
@@ -118,11 +105,7 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
           placeholder={placeholder}
           placeholderTextColor={isBoxScan ? '#9E9E9E' : '#999'}
           onSubmitEditing={() => {
-            // Clear auto-submit timer when Enter is pressed via onSubmitEditing
-            if (autoSubmitTimerRef.current) {
-              clearTimeout(autoSubmitTimerRef.current);
-              autoSubmitTimerRef.current = null;
-            }
+            clearScannerTimer(autoSubmitTimerRef);
             handleSubmit();
           }}
           onKeyPress={handleKeyPress}

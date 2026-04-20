@@ -3,6 +3,7 @@ import { apiService } from "./api.service";
 import { getSettings } from "./settings.service";
 import { normalizeASN } from "../utils/asn";
 import { generateUUID } from "../utils/uuid";
+import { syncItemMasterPaged } from "./item-master-sync.service";
 
 interface MasterDataSyncResult {
   items: { synced: number; failed: number };
@@ -17,6 +18,20 @@ interface MasterDataSyncResult {
   stockLedger: { synced: number; failed: number };
   itemBarcodeMap: { synced: number; failed: number };
 }
+
+/** Number of major phases in syncMasterDataFromDesktop (for UI progress). */
+export const MASTER_SYNC_TOTAL_STEPS = 12;
+
+export type MasterSyncProgress = {
+  step: number;
+  totalSteps: number;
+  phase: string;
+  detail?: string;
+};
+
+export type MasterDataSyncOptions = {
+  onProgress?: (progress: MasterSyncProgress) => void;
+};
 
 // Helper function to extract array from nested response formats
 const extractArrayFromResponse = (response: any, logPrefix: string): any[] => {
@@ -58,8 +73,34 @@ const extractArrayFromResponse = (response: any, logPrefix: string): any[] => {
   return [];
 };
 
-export const syncMasterDataFromDesktop =
-  async (): Promise<MasterDataSyncResult> => {
+/** Collapse duplicate bin rows (same location_id / bin_code). Last row wins — typical when pagination returns overlapping pages. */
+function dedupeBinMasterByLocationKey(bins: any[]): {
+  unique: any[];
+  duplicatesDropped: number;
+} {
+  const byKey = new Map<string, any>();
+  const withoutKey: any[] = [];
+  let duplicatesDropped = 0;
+
+  for (const bin of bins) {
+    const key = String(bin.location_id || bin.bin_code || "").trim();
+    if (!key) {
+      withoutKey.push(bin);
+      continue;
+    }
+    if (byKey.has(key)) duplicatesDropped++;
+    byKey.set(key, bin);
+  }
+
+  return {
+    unique: [...Array.from(byKey.values()), ...withoutKey],
+    duplicatesDropped,
+  };
+}
+
+export const syncMasterDataFromDesktop = async (
+  options?: MasterDataSyncOptions
+): Promise<MasterDataSyncResult> => {
     const settings = await getSettings();
 
     // Check if in demo mode
@@ -89,58 +130,32 @@ export const syncMasterDataFromDesktop =
     const db = await getDatabase();
     if (!db) throw new Error("Database not initialized");
 
+    const onProgress = options?.onProgress;
+    const report = (step: number, phase: string, detail?: string) => {
+      if (!onProgress) return;
+      try {
+        onProgress({
+          step,
+          totalSteps: MASTER_SYNC_TOTAL_STEPS,
+          phase,
+          detail,
+        });
+      } catch {
+        /* listener must not break sync */
+      }
+    };
+
     // Note: Demo data is not used in production - only real data from desktop API
 
     try {
-      // 1. Sync Item Master
+      // 1. Sync Item Master (paged API + bulk local insert)
       try {
-        const response = await apiService.pullItemMaster();
-        const items = extractArrayFromResponse(response, "📦 Items");
-
-        for (let i = 0; i < items.length; i++) {
-          const item = items[i];
-          try {
-            // ✅ Add retry logic for database statement finalization errors
-            let retries = 3;
-            let success = false;
-            while (retries > 0 && !success) {
-              try {
-                await db.runAsync(
-                  `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) 
-                   VALUES (?, ?, ?, ?)`,
-                  [
-                    item.item_code,
-                    item.barcode,
-                    item.item_name || null,
-                    item.updated_on || new Date().toISOString(),
-                  ]
-                );
-                result.items.synced++;
-                success = true;
-              } catch (dbError: any) {
-                const errorMsg = dbError.message || dbError.toString() || "";
-                // Check if it's a finalizeAsync error - retry after a short delay
-                if (errorMsg.includes("finalizeAsync") || errorMsg.includes("NativeStatement")) {
-                  retries--;
-                  if (retries > 0) {
-                    // Wait a bit longer on each retry to allow statement to be finalized
-                    await new Promise((resolve) => setTimeout(resolve, 50 * (4 - retries)));
-                    continue;
-                  }
-                }
-                throw dbError; // Re-throw if not a finalizeAsync error or retries exhausted
-              }
-            }
-
-            // Yield to UI thread every 50 items
-            if ((i + 1) % 50 === 0) {
-              await new Promise((resolve) => setTimeout(resolve, 10));
-            }
-          } catch (error: any) {
-            console.error(`Failed to sync item ${item.item_code}:`, error);
-            result.items.failed++;
-          }
-        }
+        report(1, "Items", "Downloading from server…");
+        const itemRes = await syncItemMasterPaged(db, {
+          onProgress: (detail) => report(1, "Items", detail),
+        });
+        result.items.synced = itemRes.synced;
+        result.items.failed = itemRes.failed;
       } catch (error: any) {
         const errorMsg = error.message || error.toString() || "Unknown error";
         // 404 or 500 means endpoint not implemented or has issues - this is optional, just log a warning
@@ -169,8 +184,16 @@ export const syncMasterDataFromDesktop =
 
       // 2. Sync ASN Data
       try {
+        report(2, "ASNs", "Downloading from server…");
         const response = await apiService.pullASNData();
         const asns = extractArrayFromResponse(response, "📋 ASNs");
+        report(
+          2,
+          "ASNs",
+          asns.length
+            ? `Processing ${asns.length.toLocaleString()} ASNs…`
+            : "No ASNs in response"
+        );
 
         console.log(`📋 ASN Sync: Received ${asns.length} ASNs from API`);
         if (asns.length > 0) {
@@ -683,6 +706,16 @@ export const syncMasterDataFromDesktop =
             if ((asnIndex + 1) % 10 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 50));
             }
+            if (
+              (asnIndex + 1) % 4 === 0 ||
+              asnIndex === asns.length - 1
+            ) {
+              report(
+                2,
+                "ASNs",
+                `${asnIndex + 1} / ${asns.length}`
+              );
+            }
           } catch (error: any) {
             console.error(`Failed to sync ASN ${asn.asn_no}:`, error);
             result.asns.failed++;
@@ -699,10 +732,16 @@ export const syncMasterDataFromDesktop =
 
       // 3. Sync Transfer Orders
       try {
+        report(3, "Transfer orders", "Downloading…");
         const response = await apiService.pullTransferOrders();
         const transferOrders = extractArrayFromResponse(
           response,
           "📄 Transfer Orders"
+        );
+        report(
+          3,
+          "Transfer orders",
+          `${transferOrders.length.toLocaleString()} order(s)…`
         );
 
         let totalAllocations = 0;
@@ -748,6 +787,16 @@ export const syncMasterDataFromDesktop =
                 if ((allocIndex + 1) % 50 === 0) {
                   await new Promise((resolve) => setTimeout(resolve, 10));
                 }
+                if (
+                  result.transferOrders.synced > 0 &&
+                  result.transferOrders.synced % 250 === 0
+                ) {
+                  report(
+                    3,
+                    "Transfer orders",
+                    `${result.transferOrders.synced.toLocaleString()} rows saved…`
+                  );
+                }
               } catch (error: any) {
                 console.error(
                   `Failed to sync transfer order allocation ${toNo}:`,
@@ -785,8 +834,16 @@ export const syncMasterDataFromDesktop =
 
       // 4. Sync Boxes
       try {
+        report(4, "Boxes", "Downloading…");
         const response = await apiService.pullBoxes();
         const boxes = extractArrayFromResponse(response, "📦 Boxes");
+        report(
+          4,
+          "Boxes",
+          boxes.length
+            ? `Saving ${boxes.length.toLocaleString()} boxes…`
+            : "No boxes in response"
+        );
 
         for (let boxIndex = 0; boxIndex < boxes.length; boxIndex++) {
           const box = boxes[boxIndex];
@@ -815,6 +872,12 @@ export const syncMasterDataFromDesktop =
             if ((boxIndex + 1) % 50 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
             }
+            if (
+              (boxIndex + 1) % 300 === 0 ||
+              boxIndex === boxes.length - 1
+            ) {
+              report(4, "Boxes", `${boxIndex + 1} / ${boxes.length}`);
+            }
           } catch (error: any) {
             console.error(`Failed to sync box ${box.box_id}:`, error);
             result.boxes.failed++;
@@ -836,10 +899,18 @@ export const syncMasterDataFromDesktop =
 
       // 5. Sync Transfer Cartons
       try {
+        report(5, "Transfer cartons", "Downloading…");
         const response = await apiService.pullTransferCartons();
         const transferCartons = extractArrayFromResponse(
           response,
           "📦 Transfer Cartons"
+        );
+        report(
+          5,
+          "Transfer cartons",
+          transferCartons.length
+            ? `Saving ${transferCartons.length.toLocaleString()}…`
+            : "No transfer cartons in response"
         );
 
         for (let tcIndex = 0; tcIndex < transferCartons.length; tcIndex++) {
@@ -866,6 +937,12 @@ export const syncMasterDataFromDesktop =
             // Yield to UI thread every 50 transfer cartons
             if ((tcIndex + 1) % 50 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            if (
+              (tcIndex + 1) % 200 === 0 ||
+              tcIndex === transferCartons.length - 1
+            ) {
+              report(5, "Transfer cartons", `${tcIndex + 1} / ${transferCartons.length}`);
             }
           } catch (error: any) {
             console.error(`Failed to sync transfer carton ${tc.tc_id}:`, error);
@@ -900,8 +977,16 @@ export const syncMasterDataFromDesktop =
 
       // 6. Sync Warehouse Racks
       try {
+        report(6, "Warehouse racks", "Downloading…");
         const response = await apiService.pullWarehouseRacks();
         const racks = extractArrayFromResponse(response, "🏢 Warehouse Racks");
+        report(
+          6,
+          "Warehouse racks",
+          racks.length
+            ? `Saving ${racks.length.toLocaleString()} racks…`
+            : "No racks in response"
+        );
 
         for (let rackIndex = 0; rackIndex < racks.length; rackIndex++) {
           const rack = racks[rackIndex];
@@ -924,6 +1009,12 @@ export const syncMasterDataFromDesktop =
             // Yield to UI thread every 50 racks
             if ((rackIndex + 1) % 50 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            if (
+              (rackIndex + 1) % 200 === 0 ||
+              rackIndex === racks.length - 1
+            ) {
+              report(6, "Warehouse racks", `${rackIndex + 1} / ${racks.length}`);
             }
           } catch (error: any) {
             console.error(`Failed to sync rack ${rack.rack_id}:`, error);
@@ -950,11 +1041,17 @@ export const syncMasterDataFromDesktop =
       // Backend endpoint: GET /api/master/warehouses
       // Expected to return data from tabwarehouse table
       try {
+        report(7, "Warehouses", "Downloading…");
         console.log("🔄 Syncing warehouses from tabwarehouse (endpoint: /api/master/warehouses)...");
         const response = await apiService.pullWarehouses();
         const warehouses = extractArrayFromResponse(response, "🏭 Warehouses from tabwarehouse");
 
         console.log(`📦 Processing ${warehouses.length} warehouses from tabwarehouse...`);
+        report(
+          7,
+          "Warehouses",
+          `${warehouses.length.toLocaleString()} warehouse(s)…`
+        );
         for (let whIndex = 0; whIndex < warehouses.length; whIndex++) {
           const warehouse = warehouses[whIndex];
           try {
@@ -994,6 +1091,12 @@ export const syncMasterDataFromDesktop =
             if ((whIndex + 1) % 20 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
             }
+            if (
+              (whIndex + 1) % 50 === 0 ||
+              whIndex === warehouses.length - 1
+            ) {
+              report(7, "Warehouses", `${whIndex + 1} / ${warehouses.length}`);
+            }
           } catch (error: any) {
             console.error(
               `Failed to sync warehouse ${warehouse.warehouse_id}:`,
@@ -1022,10 +1125,16 @@ export const syncMasterDataFromDesktop =
 
       // 7.5. Sync Warehouses and Stores (with warehouse_type)
       try {
+        report(8, "Warehouses & stores", "Downloading…");
         const response = await apiService.getWarehousesAndStores();
         const warehousesStores = extractArrayFromResponse(
           response,
           "🏪 Warehouses & Stores"
+        );
+        report(
+          8,
+          "Warehouses & stores",
+          `${warehousesStores.length.toLocaleString()} row(s)…`
         );
 
         for (let wsIndex = 0; wsIndex < warehousesStores.length; wsIndex++) {
@@ -1050,6 +1159,16 @@ export const syncMasterDataFromDesktop =
             if ((wsIndex + 1) % 20 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
             }
+            if (
+              (wsIndex + 1) % 80 === 0 ||
+              wsIndex === warehousesStores.length - 1
+            ) {
+              report(
+                8,
+                "Warehouses & stores",
+                `${wsIndex + 1} / ${warehousesStores.length}`
+              );
+            }
           } catch (error: any) {
             console.error(`Failed to sync warehouse/store ${ws.code}:`, error);
             result.warehouses.failed++;
@@ -1073,8 +1192,16 @@ export const syncMasterDataFromDesktop =
 
       // 8. Sync Locations
       try {
+        report(9, "Locations", "Downloading…");
         const response = await apiService.pullLocations();
         const locations = extractArrayFromResponse(response, "📍 Locations");
+        report(
+          9,
+          "Locations",
+          locations.length
+            ? `Saving ${locations.length.toLocaleString()} locations…`
+            : "No locations in response"
+        );
 
         for (let locIndex = 0; locIndex < locations.length; locIndex++) {
           const location = locations[locIndex];
@@ -1127,6 +1254,12 @@ export const syncMasterDataFromDesktop =
             if ((locIndex + 1) % 50 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
             }
+            if (
+              (locIndex + 1) % 400 === 0 ||
+              locIndex === locations.length - 1
+            ) {
+              report(9, "Locations", `${locIndex + 1} / ${locations.length}`);
+            }
           } catch (error: any) {
             console.error(
               `Failed to sync location ${location.location_id}:`,
@@ -1153,6 +1286,7 @@ export const syncMasterDataFromDesktop =
 
       // 9. Sync Bin Master (for Cycle Count)
       try {
+        report(10, "Bin master", "Fetching from server…");
         console.log("🔄 Starting Bin Master sync...");
         
         let allBins: any[] = [];
@@ -1246,41 +1380,32 @@ export const syncMasterDataFromDesktop =
           }
         }
         
-        const bins = allBins;
-        console.log(`📊 Total bins collected: ${bins.length}`);
+        const rawBinCount = allBins.length;
+        const { unique: bins, duplicatesDropped } =
+          dedupeBinMasterByLocationKey(allBins);
+        console.log(
+          `📊 Total bin rows from API: ${rawBinCount} → ${bins.length} unique location_id/bin_code (dropped ${duplicatesDropped} duplicate row(s))`
+        );
+
+        if (duplicatesDropped > 0) {
+          console.warn(
+            `⚠️ Bin Master API returned duplicate rows for the same location (e.g. overlapping pagination). Kept the last occurrence per location.`
+          );
+        }
 
         if (bins.length === 0) {
           console.warn("⚠️ No bins found in API response");
-        } else if (bins.length === 10) {
+        } else if (bins.length === 10 && rawBinCount <= 10) {
           console.warn(`⚠️ Only 10 bins found - this might be incomplete. Backend might have a default limit.`);
         }
 
-        // Track location_id values to detect duplicates before insertion
-        // We use location_id as the PRIMARY KEY (bin_id), not the backend's bin_id field
-        const locationIdSet = new Set<string>();
-        const duplicateLocationIds: string[] = [];
-        
-        // First pass: identify duplicate location_ids (which will be used as bin_id)
-        for (const bin of bins) {
-          const locationId = bin.location_id || bin.bin_code;
-          
-          if (!locationId || locationId.trim() === "") {
-            continue; // Skip bins without location_id
-          }
-          
-          if (locationIdSet.has(locationId)) {
-            duplicateLocationIds.push(locationId);
-            console.warn(`⚠️ Duplicate location_id detected in API response: "${locationId}" (this will be used as bin_id)`);
-          } else {
-            locationIdSet.add(locationId);
-          }
-        }
-        
-        if (duplicateLocationIds.length > 0) {
-          console.error(`❌ Found ${duplicateLocationIds.length} duplicate location_id(s) in API response. This will cause overwrites!`);
-        } else {
-          console.log(`✅ No duplicate location_ids found - all bins will have unique PRIMARY KEYs`);
-        }
+        report(
+          10,
+          "Bin master",
+          bins.length
+            ? `Saving ${bins.length.toLocaleString()} bins…`
+            : "No bins in response"
+        );
 
         for (let binIndex = 0; binIndex < bins.length; binIndex++) {
           const bin = bins[binIndex];
@@ -1427,6 +1552,12 @@ export const syncMasterDataFromDesktop =
             if ((binIndex + 1) % 10 === 0) {
               console.log(`📦 Bin Master sync progress: ${binIndex + 1}/${bins.length} bins processed, ${result.binMaster.synced} synced, ${result.binMaster.failed} failed`);
             }
+            if (
+              (binIndex + 1) % 200 === 0 ||
+              binIndex === bins.length - 1
+            ) {
+              report(10, "Bin master", `${binIndex + 1} / ${bins.length}`);
+            }
           } catch (error: any) {
             console.error(`❌ Failed to sync bin location_id="${bin.location_id || bin.bin_code}":`, error);
             console.error(`❌ Error details:`, {
@@ -1474,8 +1605,16 @@ export const syncMasterDataFromDesktop =
 
       // 10. Sync Stock Ledger (for Cycle Count expected quantities)
       try {
+        report(11, "Stock ledger", "Downloading…");
         const response = await apiService.pullStockLedger();
         const stockEntries = extractArrayFromResponse(response, "📊 Stock Ledger");
+        report(
+          11,
+          "Stock ledger",
+          stockEntries.length
+            ? `Saving ${stockEntries.length.toLocaleString()} rows…`
+            : "No stock rows in response"
+        );
 
         for (let stockIndex = 0; stockIndex < stockEntries.length; stockIndex++) {
           const stock = stockEntries[stockIndex];
@@ -1498,6 +1637,12 @@ export const syncMasterDataFromDesktop =
             // Yield to UI thread every 100 stock entries
             if ((stockIndex + 1) % 100 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            if (
+              (stockIndex + 1) % 500 === 0 ||
+              stockIndex === stockEntries.length - 1
+            ) {
+              report(11, "Stock ledger", `${stockIndex + 1} / ${stockEntries.length}`);
             }
           } catch (error: any) {
             console.error(`Failed to sync stock entry ${stock.item_code}:`, error);
@@ -1522,8 +1667,16 @@ export const syncMasterDataFromDesktop =
 
       // 11. Sync Item Barcode Map (for Cycle Count barcode scanning)
       try {
+        report(12, "Item barcode map", "Downloading…");
         const response = await apiService.pullItemBarcodeMap();
         const barcodeMappings = extractArrayFromResponse(response, "🏷️ Item Barcode Map");
+        report(
+          12,
+          "Item barcode map",
+          barcodeMappings.length
+            ? `Saving ${barcodeMappings.length.toLocaleString()} mappings…`
+            : "No barcode mappings in response"
+        );
 
         for (let mapIndex = 0; mapIndex < barcodeMappings.length; mapIndex++) {
           const mapping = barcodeMappings[mapIndex];
@@ -1546,6 +1699,16 @@ export const syncMasterDataFromDesktop =
             // Yield to UI thread every 100 mappings
             if ((mapIndex + 1) % 100 === 0) {
               await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            if (
+              (mapIndex + 1) % 400 === 0 ||
+              mapIndex === barcodeMappings.length - 1
+            ) {
+              report(
+                12,
+                "Item barcode map",
+                `${mapIndex + 1} / ${barcodeMappings.length}`
+              );
             }
           } catch (error: any) {
             console.error(`Failed to sync barcode mapping ${mapping.barcode}:`, error);

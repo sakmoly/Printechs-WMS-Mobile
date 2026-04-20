@@ -121,6 +121,64 @@ export async function runSchemaMigrations(db: SQLite.SQLiteDatabase) {
       }
     }
 
+    const hasItemMasterSyncMode = settingsColumns.some(
+      (col) => col.name === "item_master_sync_mode"
+    );
+    const hasItemMasterPageSize = settingsColumns.some(
+      (col) => col.name === "item_master_page_size"
+    );
+    const hasItemMasterWatermark = settingsColumns.some(
+      (col) => col.name === "item_master_modified_watermark"
+    );
+
+    if (!hasItemMasterSyncMode) {
+      console.log("📝 Adding item_master_sync_mode column to settings...");
+      try {
+        await db.execAsync(
+          "ALTER TABLE settings ADD COLUMN item_master_sync_mode TEXT DEFAULT 'full'"
+        );
+        console.log("✅ Added item_master_sync_mode column");
+      } catch (error: any) {
+        if (error?.message?.includes("duplicate column")) {
+          console.log("ℹ️ item_master_sync_mode column already exists");
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    if (!hasItemMasterPageSize) {
+      console.log("📝 Adding item_master_page_size column to settings...");
+      try {
+        await db.execAsync(
+          "ALTER TABLE settings ADD COLUMN item_master_page_size INTEGER DEFAULT 5000"
+        );
+        console.log("✅ Added item_master_page_size column");
+      } catch (error: any) {
+        if (error?.message?.includes("duplicate column")) {
+          console.log("ℹ️ item_master_page_size column already exists");
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    if (!hasItemMasterWatermark) {
+      console.log("📝 Adding item_master_modified_watermark column to settings...");
+      try {
+        await db.execAsync(
+          "ALTER TABLE settings ADD COLUMN item_master_modified_watermark TEXT"
+        );
+        console.log("✅ Added item_master_modified_watermark column");
+      } catch (error: any) {
+        if (error?.message?.includes("duplicate column")) {
+          console.log("ℹ️ item_master_modified_watermark column already exists");
+        } else {
+          throw error;
+        }
+      }
+    }
+
     // Check if event_queue table exists and has material_request column
     const eventQueueColumns = await db.getAllAsync<{ name: string }>(
       "PRAGMA table_info(event_queue)"

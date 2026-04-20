@@ -138,8 +138,9 @@ export const recreateDatabase = async (backupFirst: boolean = false): Promise<vo
         await freshDb.runAsync(
           `INSERT INTO settings (
             api_url, device_id, user_id, user_code, password, demo_mode, 
-            active_asn, active_session, auth_token, auth_token_expires
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            active_asn, active_session, auth_token, auth_token_expires,
+            item_master_sync_mode, item_master_page_size, item_master_modified_watermark
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             settingsBackup.api_url || null,
             settingsBackup.device_id || null,
@@ -151,6 +152,9 @@ export const recreateDatabase = async (backupFirst: boolean = false): Promise<vo
             settingsBackup.active_session || null,
             settingsBackup.auth_token || null,
             settingsBackup.auth_token_expires || null,
+            settingsBackup.item_master_sync_mode || "full",
+            settingsBackup.item_master_page_size ?? 5000,
+            settingsBackup.item_master_modified_watermark || null,
           ]
         );
         console.log("✅ Settings restored successfully!");

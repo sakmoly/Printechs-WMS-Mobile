@@ -6,7 +6,6 @@ import {
   StyleSheet,
   ScrollView,
   Alert,
-  TextInput,
   ActivityIndicator,
 } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
@@ -16,6 +15,10 @@ import { generateUUID } from "../utils/uuid";
 import { syncCycleCountSessions } from "../services/cycle-count-sync.service";
 import { apiService } from "../services/api.service";
 import { isDeviceOnline } from "../utils/network-check";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function CycleCountScanBinScreen() {
   const navigation = useNavigation();
@@ -27,7 +30,7 @@ export default function CycleCountScanBinScreen() {
   const [loading, setLoading] = useState(false);
   const [binInfo, setBinInfo] = useState<any>(null);
   const [isBlindCount, setIsBlindCount] = useState(false);
-  const binCodeInputRef = useRef<TextInput>(null);
+  const binCodeInputRef = useRef<BarcodeInputHandle>(null);
 
   // If task was pre-created with a bin code, auto-validate it
   useEffect(() => {
@@ -47,8 +50,8 @@ export default function CycleCountScanBinScreen() {
     }, 100);
   };
 
-  const validateBin = async (bin: string) => {
-    if (!bin) return;
+  const validateBin = async (bin: string): Promise<boolean> => {
+    if (!bin) return false;
 
     setLoading(true);
     try {
@@ -85,7 +88,7 @@ export default function CycleCountScanBinScreen() {
         );
         setBinInfo(null);
         setLoading(false);
-        return;
+        return false;
       }
       
       // Check for the specific bin
@@ -111,7 +114,7 @@ export default function CycleCountScanBinScreen() {
         );
         setBinInfo(null);
         setLoading(false);
-        return;
+        return false;
       }
 
       console.log(`✅ Found bin in local database:`, {
@@ -125,10 +128,13 @@ export default function CycleCountScanBinScreen() {
         level: binData.level,
       });
       setBinInfo(binData);
+      setBinCode(binData.bin_code || binData.bin_id || bin);
+      return true;
     } catch (error: any) {
       console.error("Error validating bin:", error);
       Alert.alert("Error", `Failed to validate bin: ${error.message}`);
       setBinInfo(null);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -362,34 +368,23 @@ export default function CycleCountScanBinScreen() {
       <View style={styles.inputSection}>
         <Text style={styles.inputLabel}>Bin Code</Text>
         <View style={styles.inputRow}>
-          <TextInput
+          <BarcodeInput
             ref={binCodeInputRef}
-            style={styles.input}
-            value={binCode}
-            onChangeText={(text) => {
-              setBinCode(text.toUpperCase());
-              if (text) {
-                validateBin(text.toUpperCase());
-              } else {
-                setBinInfo(null);
-              }
-            }}
+            autoFocus
             placeholder="Scan or enter bin code"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={() => {
-              // When Enter is pressed, validate the bin
-              if (binCode.trim()) {
-                validateBin(binCode.trim().toUpperCase());
-              }
-            }}
+            onBarcodeScanned={async (raw) =>
+              validateBin(raw.trim().toUpperCase())
+            }
+            containerStyle={styles.barcodeInputWrap}
+            inputStyle={styles.input}
           />
           <TouchableOpacity
             style={styles.scanButton}
             onPress={handleScanButton}
+            accessibilityLabel="Scan with camera"
           >
-            <Text style={styles.scanButtonText}>📷 Scan</Text>
+            <Text style={styles.scanButtonText}>📷</Text>
+            <Text style={styles.scanButtonLabel}>Scan</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -495,7 +490,13 @@ const styles = StyleSheet.create({
   },
   inputRow: {
     flexDirection: "row",
-    gap: 12,
+    alignItems: "stretch",
+    gap: 8,
+  },
+  /** Lets the barcode row shrink correctly so flex:1 fills space beside the Scan chip. */
+  barcodeInputWrap: {
+    flex: 1,
+    minWidth: 0,
   },
   input: {
     flex: 1,
@@ -506,18 +507,30 @@ const styles = StyleSheet.create({
     padding: 16,
     fontSize: 18,
     fontWeight: "600",
+    minWidth: 0,
   },
   scanButton: {
     backgroundColor: "#2196F3",
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     borderRadius: 8,
     justifyContent: "center",
+    alignItems: "center",
+    alignSelf: "stretch",
+    flexShrink: 0,
+    width: 56,
+    minHeight: 60,
   },
   scanButtonText: {
     color: "#FFF",
     fontSize: 16,
+    lineHeight: 18,
+  },
+  scanButtonLabel: {
+    color: "#FFF",
+    fontSize: 11,
     fontWeight: "600",
+    marginTop: 2,
   },
   loadingContainer: {
     padding: 40,

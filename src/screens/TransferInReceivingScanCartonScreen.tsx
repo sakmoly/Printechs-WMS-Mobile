@@ -4,11 +4,11 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  TextInput,
   ActivityIndicator,
   Alert,
   ScrollView,
   Share,
+  Switch,
 } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { PickingTheme } from "../theme/picking-theme";
@@ -16,6 +16,10 @@ import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
 import { transferInReceivingSessionService, TransferInReceivingSession } from "../services/transfer-in-receiving-session.service";
 import { getSettings } from "../services/settings.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function TransferInReceivingScanCartonScreen() {
   const navigation = useNavigation();
@@ -27,9 +31,10 @@ export default function TransferInReceivingScanCartonScreen() {
 
   const [cartonId, setCartonId] = useState("");
   const [boxId, setBoxId] = useState<string | null>(null); // Store box_id created when generating carton
+  const [useExistingBox, setUseExistingBox] = useState(false); // When ON, send create_carton_if_missing: true
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
-  const cartonInputRef = useRef<TextInput>(null);
+  const cartonInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -56,12 +61,6 @@ export default function TransferInReceivingScanCartonScreen() {
       cartonInputRef.current?.focus();
     }, 300);
   }, [transferInNo]);
-
-  // Handle carton input change (for handheld scanner)
-  const handleCartonInputChange = (text: string) => {
-    console.log(`📝 Carton input changed: "${text}"`);
-    setCartonId(text);
-  };
 
   // Generate carton ID and create BOX automatically
   const handleGenerateCartonId = async () => {
@@ -221,28 +220,47 @@ export default function TransferInReceivingScanCartonScreen() {
 
   // ✅ NEW: Navigate to next screen after carton is scanned
   // Validate carton from tabsortbox backend (similar to ASN validating from asn_carton_map)
-  const handleContinue = async () => {
-    console.log(`➡️ Continue button pressed with carton ID: "${cartonId}"`);
+  const handleContinue = async (
+    overrideCartonId?: string
+  ): Promise<boolean> => {
+    const source = overrideCartonId !== undefined ? overrideCartonId : cartonId;
+    console.log(`➡️ Continue button pressed with carton ID: "${source}"`);
     
-    if (!cartonId || !cartonId.trim()) {
+    const trimmedCartonId = source?.trim() || "";
+    if (!trimmedCartonId) {
       Alert.alert("Error", "Please enter or generate a carton ID first");
-      return;
+      return false;
+    }
+    
+    // ✅ PERMANENT FIX: Check if user entered a Putaway box ID (PAW-*) instead of Transfer In carton
+    // Putaway boxes are not valid for Transfer In receiving - they need CTN-TI-* format
+    if (trimmedCartonId.toUpperCase().startsWith("PAW-")) {
+      Alert.alert(
+        "Invalid Carton ID",
+        `The entered ID "${trimmedCartonId}" is a Putaway box (PAW-*), not a Transfer In carton.\n\n` +
+        `For Transfer In receiving, please:\n` +
+        `• Generate a new carton ID using the "Generate Carton ID" button, OR\n` +
+        `• Scan/enter a valid Transfer In carton ID (format: CTN-TI-*)\n\n` +
+        `Putaway boxes (PAW-*) are created during ASN receiving and cannot be used for Transfer In.`
+      );
+      return false;
     }
     
     if (!transferInNo) {
       Alert.alert("Error", "Transfer In number is missing. Cannot continue.");
-      return;
+      return false;
     }
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
-    const normalizedCarton = cartonId.trim().toUpperCase();
+    const normalizedCarton = trimmedCartonId.toUpperCase();
+    setCartonId(normalizedCarton);
 
     setLoading(true);
     try {
@@ -255,12 +273,25 @@ export default function TransferInReceivingScanCartonScreen() {
         // Use boxId from state (created during generation) or pass carton ID if boxId not available
         // Backend expects BOX ID in carton_id field when validating
         const boxIdToValidate = boxId || normalizedCarton; // Fallback to carton ID if boxId not available
-        const validationResponse = await apiService.validateTransferInCarton(transferInNo, boxIdToValidate);
+        const validationResponse = await apiService.validateTransferInCarton(transferInNo, boxIdToValidate, {
+          create_carton_if_missing: useExistingBox || undefined,
+        });
         
         if (validationResponse?.ok === false || validationResponse?.validated === false) {
           const errorCode = validationResponse?.error?.code;
           const errorMessage = validationResponse?.error?.message || "Carton validation failed";
           
+          if (errorCode === "BOX_NOT_FOUND") {
+            Alert.alert(
+              "Box Not Found",
+              useExistingBox
+                ? errorMessage + "\n\nPlease check the inputs and try again."
+                : "Box not found in this Transfer In. To use a box that's already in the warehouse, turn on 'Use existing box' and scan again.",
+              [{ text: "OK", style: "cancel" }]
+            );
+            setLoading(false);
+            return false;
+          }
           if (errorCode === "CARTON_NOT_FOUND") {
             Alert.alert(
               "Carton Not Found",
@@ -270,12 +301,11 @@ export default function TransferInReceivingScanCartonScreen() {
               [{ text: "OK", style: "cancel" }]
             );
             setLoading(false);
-            return;
-          } else {
-            Alert.alert("Validation Error", errorMessage);
-            setLoading(false);
-            return;
+            return false;
           }
+          Alert.alert("Validation Error", errorMessage);
+          setLoading(false);
+          return false;
         }
         
         // ✅ Extract box_id from validation response (backend returns it)
@@ -300,7 +330,7 @@ export default function TransferInReceivingScanCartonScreen() {
           // Other validation errors - show error and stop
           Alert.alert("Validation Error", validationError?.message || "Failed to validate carton from tabsortbox");
           setLoading(false);
-          return;
+          return false;
         }
       }
 
@@ -346,10 +376,12 @@ export default function TransferInReceivingScanCartonScreen() {
       } else {
         console.warn(`⚠️ No box_id available to pass to Scan Items screen. Putaway may require manual box selection.`);
       }
+      return true;
     } catch (error: any) {
       setLoading(false);
       console.error("❌ Error scanning carton:", error);
       Alert.alert("Error", `Failed to scan carton: ${error.message}`);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -387,17 +419,32 @@ export default function TransferInReceivingScanCartonScreen() {
           </View>
         </View>
         <View style={styles.cartonInputRow}>
-          <TextInput
+          <BarcodeInput
             ref={cartonInputRef}
-            style={styles.cartonInput}
-            value={cartonId}
-            onChangeText={handleCartonInputChange}
+            autoFocus
             placeholder="Scan or enter carton ID"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={handleContinue}
+            onBarcodeScanned={async (raw) =>
+              handleContinue(raw.trim().toUpperCase())
+            }
+            containerStyle={{ flex: 1 }}
+            inputStyle={styles.cartonInput}
           />
+        </View>
+
+        {/* Use existing box – link warehouse box to this Transfer In if not already linked */}
+        <View style={styles.useExistingBoxCard}>
+          <View style={styles.useExistingBoxRow}>
+            <Text style={styles.useExistingBoxLabel}>Use existing box</Text>
+            <Switch
+              value={useExistingBox}
+              onValueChange={setUseExistingBox}
+              trackColor={{ false: PickingTheme.colors.borderLight, true: PickingTheme.colors.buttonBlue || "#2196F3" }}
+              thumbColor="#FFF"
+            />
+          </View>
+          <Text style={styles.useExistingBoxHint}>
+            When on, scanning a box that exists in the system but isn't linked to this Transfer In will link it and allow putaway.
+          </Text>
         </View>
 
         {/* Generate & Print Buttons */}
@@ -433,7 +480,9 @@ export default function TransferInReceivingScanCartonScreen() {
         {cartonId.trim() && !loading && (
           <TouchableOpacity
             style={styles.continueButton}
-            onPress={handleContinue}
+            onPress={() => {
+              void handleContinue();
+            }}
             disabled={loading}
           >
             <Text style={styles.continueButtonText}>Continue to Item Scanning</Text>
@@ -643,5 +692,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 20,
     opacity: 0.95,
+  },
+  useExistingBoxCard: {
+    backgroundColor: "rgba(255,255,255,0.15)",
+    borderRadius: PickingTheme.borderRadius.medium,
+    padding: PickingTheme.spacing.md,
+    marginTop: PickingTheme.spacing.md,
+  },
+  useExistingBoxRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  useExistingBoxLabel: {
+    ...PickingTheme.typography.body,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "600",
+    flex: 1,
+  },
+  useExistingBoxHint: {
+    ...PickingTheme.typography.caption,
+    color: PickingTheme.colors.textWhite,
+    opacity: 0.9,
+    marginTop: 4,
+    fontSize: 12,
   },
 });

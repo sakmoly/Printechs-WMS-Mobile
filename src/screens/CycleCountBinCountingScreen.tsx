@@ -28,6 +28,10 @@ import { generateUUID } from "../utils/uuid";
 import { syncCycleCountSession } from "../services/cycle-count-sync.service";
 import { isDeviceOnline } from "../utils/network-check";
 import { resolveItemFromBarcode } from "../services/item-master.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 interface CountLine {
   line_id: string;
@@ -75,12 +79,11 @@ export default function CycleCountBinCountingScreen() {
   const [saving, setSaving] = useState(false);
   const [editingLineId, setEditingLineId] = useState<string | null>(null);
   const [editQty, setEditQty] = useState("");
-  const [manualBarcode, setManualBarcode] = useState("");
   const [taskTitle, setTaskTitle] = useState<string | null>(null);
   const [cartonId, setCartonId] = useState<string | null>(null); // ✅ NEW: Carton ID will be scanned in this screen
   const [cartonIdInput, setCartonIdInput] = useState(""); // ✅ NEW: Input field for carton ID
   const [showCartonScanner, setShowCartonScanner] = useState(false); // ✅ NEW: Scanner modal for carton ID
-  const cartonIdInputRef = useRef<TextInput>(null); // ✅ NEW: Ref for carton ID input
+  const cartonIdInputRef = useRef<BarcodeInputHandle>(null); // ✅ NEW: Ref for carton ID input
   const skipCartonRestoreRef = useRef<boolean>(false); // ✅ NEW: Flag to skip carton ID restoration when user explicitly clears it
 
   // ✅ IMPORTANT: Update cartonId when route params change (e.g., when screen is focused)
@@ -116,9 +119,7 @@ export default function CycleCountBinCountingScreen() {
     }
   }, [cartonId, sessionId]);
 
-  const lastScanTime = useRef<number>(0);
-  const barcodeInputRef = useRef<TextInput>(null);
-  const SCAN_DEBOUNCE_MS = 300;
+  const barcodeInputRef = useRef<BarcodeInputHandle | null>(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -975,51 +976,43 @@ export default function CycleCountBinCountingScreen() {
   };
 
   // ✅ NEW: Handle carton ID scan/input
-  const handleCartonIdScan = async (scannedCartonId: string) => {
+  const handleCartonIdScan = async (
+    scannedCartonId: string
+  ): Promise<boolean> => {
     const trimmedCartonId = scannedCartonId.trim().toUpperCase();
-    if (trimmedCartonId) {
-      console.log(`📦 Carton ID scanned: ${trimmedCartonId}`);
-      setCartonId(trimmedCartonId);
-      setCartonIdInput("");
-      setShowCartonScanner(false);
-
-      // ✅ NEW: Start the task immediately after carton ID validation (before scanning items)
-      // This ensures the task status is "Started/In Progress" before any items are counted
-      // Only starts if task is in "Draft" status - if already "In Progress", skips starting
-      if (taskTitle) {
-        await ensureTaskStarted(taskTitle);
-      } else {
-        console.log(
-          `ℹ️ No task title found - task will be started when backend task is created`
-        );
-      }
-
-      // ✅ NEW: Load expected items for this carton after carton ID is set
-      if (sessionId && binCode && !isBlindCount) {
-        console.log(
-          `🔄 Loading expected items for carton ${trimmedCartonId}...`
-        );
-        // Load session first to get items for this carton
-        await loadSessionWithCartonId(trimmedCartonId);
-        // Then load expected items from backend/stock ledger
-        await loadExpectedItems(taskTitle);
-      }
-
-      // Focus item barcode input after carton ID is set
-      setTimeout(() => {
-        barcodeInputRef.current?.focus();
-      }, 100);
+    if (!trimmedCartonId) {
+      return false;
     }
-  };
+    console.log(`📦 Carton ID scanned: ${trimmedCartonId}`);
+    setCartonId(trimmedCartonId);
+    setCartonIdInput("");
+    setShowCartonScanner(false);
 
-  const handleCartonIdInputChange = (text: string) => {
-    setCartonIdInput(text.toUpperCase());
-  };
-
-  const handleCartonIdSubmit = () => {
-    if (cartonIdInput.trim()) {
-      handleCartonIdScan(cartonIdInput);
+    // ✅ NEW: Start the task immediately after carton ID validation (before scanning items)
+    // This ensures the task status is "Started/In Progress" before any items are counted
+    // Only starts if task is in "Draft" status - if already "In Progress", skips starting
+    if (taskTitle) {
+      await ensureTaskStarted(taskTitle);
+    } else {
+      console.log(
+        `ℹ️ No task title found - task will be started when backend task is created`
+      );
     }
+
+    // ✅ NEW: Load expected items for this carton after carton ID is set
+    if (sessionId && binCode && !isBlindCount) {
+      console.log(`🔄 Loading expected items for carton ${trimmedCartonId}...`);
+      // Load session first to get items for this carton
+      await loadSessionWithCartonId(trimmedCartonId);
+      // Then load expected items from backend/stock ledger
+      await loadExpectedItems(taskTitle);
+    }
+
+    // Focus item barcode input after carton ID is set
+    setTimeout(() => {
+      barcodeInputRef.current?.focus();
+    }, 100);
+    return true;
   };
 
   const handleChangeCartonId = () => {
@@ -1066,7 +1059,7 @@ export default function CycleCountBinCountingScreen() {
     );
 
     // Set the generated carton ID (same as scanning)
-    handleCartonIdScan(generatedCartonId);
+    void handleCartonIdScan(generatedCartonId);
 
     Alert.alert(
       "Carton ID Generated",
@@ -1075,7 +1068,7 @@ export default function CycleCountBinCountingScreen() {
     );
   };
 
-  const handleItemScan = async (barcode: string) => {
+  const handleItemScan = async (barcode: string): Promise<boolean> => {
     // ✅ NEW: Require carton ID before scanning items
     if (!cartonId || cartonId.trim() === "") {
       Alert.alert(
@@ -1092,14 +1085,8 @@ export default function CycleCountBinCountingScreen() {
           },
         ]
       );
-      return;
+      return false;
     }
-
-    const now = Date.now();
-    if (now - lastScanTime.current < SCAN_DEBOUNCE_MS) {
-      return; // Debounce rapid scans
-    }
-    lastScanTime.current = now;
 
     setShowScanner(false);
 
@@ -1120,7 +1107,7 @@ export default function CycleCountBinCountingScreen() {
         setTimeout(() => {
           barcodeInputRef.current?.focus();
         }, 100);
-        return;
+        return false;
       }
 
       // Item found - get additional details from barcode_map if available
@@ -1172,11 +1159,7 @@ export default function CycleCountBinCountingScreen() {
       // Vibrate on success
       Vibration.vibrate(50);
 
-      // Clear input and refocus for next scan
-      setManualBarcode("");
-      setTimeout(() => {
-        barcodeInputRef.current?.focus();
-      }, 50);
+      return true;
     } catch (error: any) {
       console.error("Error processing scan:", error);
       Alert.alert("Error", `Failed to process scan: ${error.message}`);
@@ -1186,6 +1169,7 @@ export default function CycleCountBinCountingScreen() {
       setTimeout(() => {
         barcodeInputRef.current?.focus();
       }, 100);
+      return false;
     }
   };
 
@@ -1986,16 +1970,16 @@ export default function CycleCountBinCountingScreen() {
                 first.
               </Text>
               <View style={styles.cartonIdInputRow}>
-                <TextInput
+                <BarcodeInput
                   ref={cartonIdInputRef}
-                  style={styles.cartonIdInput}
-                  value={cartonIdInput}
-                  onChangeText={handleCartonIdInputChange}
+                  autoFocus
                   placeholder="Scan or enter carton ID"
-                  autoCapitalize="characters"
-                  autoFocus={true}
-                  showSoftInputOnFocus={false}
-                  onSubmitEditing={handleCartonIdSubmit}
+                  onChangeText={(t) => setCartonIdInput(t.toUpperCase())}
+                  onBarcodeScanned={(raw) =>
+                    handleCartonIdScan(raw.trim().toUpperCase())
+                  }
+                  containerStyle={{ flex: 1 }}
+                  inputStyle={styles.cartonIdInput}
                 />
                 <TouchableOpacity
                   style={styles.cartonIdScanButton}
@@ -2006,7 +1990,13 @@ export default function CycleCountBinCountingScreen() {
                 {cartonIdInput.trim() && (
                   <TouchableOpacity
                     style={styles.cartonIdSubmitButton}
-                    onPress={handleCartonIdSubmit}
+                    onPress={() => {
+                      const t =
+                        cartonIdInput.trim() ||
+                        cartonIdInputRef.current?.getLastText?.()?.trim() ||
+                        "";
+                      if (t) void handleCartonIdScan(t);
+                    }}
                   >
                     <Text style={styles.cartonIdSubmitButtonText}>✓</Text>
                   </TouchableOpacity>
@@ -2037,58 +2027,21 @@ export default function CycleCountBinCountingScreen() {
                 </Text>
               </TouchableOpacity>
 
-              {/* Manual Barcode Input */}
+              {/* Manual barcode: wedge + keyboard toggle (see BarcodeInput) */}
               <View style={styles.manualInputSection}>
                 <Text style={styles.manualInputLabel}>Scan Item Barcode</Text>
-                <View style={styles.manualInputRow}>
-                  <TextInput
-                    ref={barcodeInputRef}
-                    style={styles.manualInput}
-                    value={manualBarcode}
-                    onChangeText={setManualBarcode}
-                    placeholder="Scan or enter barcode"
-                    autoCapitalize="characters"
-                    autoFocus={true}
-                    blurOnSubmit={false}
-                    showSoftInputOnFocus={false}
-                    keyboardType="default"
-                    onSubmitEditing={() => {
-                      if (manualBarcode.trim()) {
-                        handleItemScan(manualBarcode.trim());
-                        setManualBarcode("");
-                        // Refocus immediately after submit
-                        setTimeout(() => {
-                          barcodeInputRef.current?.focus();
-                        }, 50);
-                      }
-                    }}
-                    returnKeyType="done"
-                    onBlur={() => {
-                      // Auto-refocus when input loses focus (unless editing quantity)
-                      if (!editingLineId) {
-                        setTimeout(() => {
-                          barcodeInputRef.current?.focus();
-                        }, 100);
-                      }
-                    }}
-                  />
-                  <TouchableOpacity
-                    style={styles.submitBarcodeButton}
-                    onPress={() => {
-                      if (manualBarcode.trim()) {
-                        handleItemScan(manualBarcode.trim());
-                        setManualBarcode("");
-                        // Refocus after submit
-                        setTimeout(() => {
-                          barcodeInputRef.current?.focus();
-                        }, 50);
-                      }
-                    }}
-                    disabled={!manualBarcode.trim()}
-                  >
-                    <Text style={styles.submitBarcodeButtonText}>Submit</Text>
-                  </TouchableOpacity>
-                </View>
+                <BarcodeInput
+                  ref={barcodeInputRef}
+                  autoFocus={!editingLineId}
+                  debounceMs={180}
+                  placeholder="Scan or enter barcode"
+                  onBarcodeScanned={handleItemScan}
+                  onError={(message, err) =>
+                    console.warn("BarcodeInput:", message, err)
+                  }
+                  disabled={!!editingLineId}
+                  inputStyle={styles.manualInput}
+                />
               </View>
             </View>
           )}
@@ -2195,7 +2148,7 @@ export default function CycleCountBinCountingScreen() {
                 </View>
                 <BarcodeScanner
                   onScan={(barcode) => {
-                    handleCartonIdScan(barcode);
+                    void handleCartonIdScan(barcode);
                     setShowCartonScanner(false);
                     setTimeout(() => {
                       cartonIdInputRef.current?.focus();

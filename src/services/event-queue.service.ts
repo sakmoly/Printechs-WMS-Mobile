@@ -5,6 +5,9 @@ import { apiService } from "./api.service";
 import { getSettings } from "./settings.service";
 import { dataService } from "./data.service";
 
+/** Track (asn_no, inbound_session) for which we already called completeInboundSession to avoid duplicate API calls */
+const inboundCompleteAttempted = new Set<string>();
+
 // Debounce sync to prevent rate limiting
 let syncTimeout: ReturnType<typeof setTimeout> | null = null;
 let isSyncing = false;
@@ -153,6 +156,79 @@ export const markEventFailed = async (
 const putawayTaskCreationAttempted = new Set<string>();
 
 /**
+ * When all cartons for an ASN are received, call POST /api/inbound/complete so the backend
+ * can update ASN status to "Completed" / "Received" (and carton/receiving status on desktop).
+ * This is called after successful sync so the Operations Console shows the correct status.
+ */
+const checkAndCompleteInboundSessionsAfterSync = async (syncedEvents: ScanEvent[]) => {
+  try {
+    const pairs = new Map<string, { asn_no: string; inbound_session: string }>();
+    for (const event of syncedEvents) {
+      if (event.asn_no && event.inbound_session && event.inbound_session.trim() !== "") {
+        const key = `${event.asn_no.toUpperCase().trim()}|${event.inbound_session.trim()}`;
+        if (!pairs.has(key)) {
+          pairs.set(key, { asn_no: event.asn_no, inbound_session: event.inbound_session });
+        }
+      }
+    }
+    const settings = await getSettings();
+    const user_id = settings.user_id || settings.user_code || "";
+    const device_id = settings.device_id || "";
+    for (const { asn_no, inbound_session } of pairs.values()) {
+      const key = `${asn_no.toUpperCase().trim()}|${inbound_session}`;
+      if (inboundCompleteAttempted.has(key)) continue;
+      try {
+        const allReceived = await dataService.areAllCartonsReceived(asn_no, inbound_session);
+        if (!allReceived) continue;
+        inboundCompleteAttempted.add(key);
+        await apiService.completeInboundSession({
+          inbound_session,
+          asn_no,
+          user_id,
+          device_id,
+        });
+        console.warn(`✅ Inbound session completed for ASN ${asn_no} (${inbound_session}) — backend can update ASN status to Completed`);
+      } catch (err: any) {
+        console.warn(`⚠️ Could not complete inbound session for ASN ${asn_no}:`, err?.message || err);
+        inboundCompleteAttempted.delete(key);
+      }
+    }
+  } catch (error: any) {
+    console.warn(`⚠️ Error in checkAndCompleteInboundSessionsAfterSync:`, error.message);
+  }
+};
+
+/**
+ * Try to complete inbound session for the active ASN/session from settings.
+ * Called when user taps Sync even if there are no events to sync, so we still tell the backend
+ * to set ASN status to Completed when all cartons are received.
+ */
+const tryCompleteInboundForActiveSession = async (): Promise<void> => {
+  try {
+    const settings = await getSettings();
+    const activeASN = settings.active_asn ?? "";
+    const activeSession = settings.active_session ?? "";
+    if (!activeASN.trim() || !activeSession.trim()) return;
+    const key = `${activeASN.toUpperCase().trim()}|${activeSession.trim()}`;
+    if (inboundCompleteAttempted.has(key)) return;
+    const allReceived = await dataService.areAllCartonsReceived(activeASN, activeSession);
+    if (!allReceived) return;
+    inboundCompleteAttempted.add(key);
+    const user_id = settings.user_id || settings.user_code || "";
+    const device_id = settings.device_id || "";
+    await apiService.completeInboundSession({
+      inbound_session: activeSession,
+      asn_no: activeASN,
+      user_id,
+      device_id,
+    });
+    console.warn(`✅ Inbound session completed for active ASN ${activeASN} (${activeSession}) — backend can update ASN status to Completed`);
+  } catch (err: any) {
+    console.warn(`⚠️ tryCompleteInboundForActiveSession:`, err?.message || err);
+  }
+};
+
+/**
  * Check if all cartons are completed for an ASN and create putaway task if needed
  * This is called after successful sync to ensure backend has all data
  */
@@ -290,6 +366,8 @@ export const syncEvents = async (): Promise<{
   const unsynced = await getUnsyncedEvents();
 
   if (unsynced.length === 0) {
+    // Still try to complete inbound for active session so desktop status updates (e.g. after several syncs)
+    await tryCompleteInboundForActiveSession();
     return { synced: 0, failed: 0 };
   }
 
@@ -835,6 +913,8 @@ export const syncEvents = async (): Promise<{
     // After successful sync, check if we should create putaway tasks for completed ASNs
     if (totalSyncedCount > 0) {
       await checkAndCreatePutawayTasksAfterSync(unsynced);
+      // When all cartons are received, call inbound/complete so backend can set ASN status to Completed
+      await checkAndCompleteInboundSessionsAfterSync(unsynced);
     }
 
     return { synced: totalSyncedCount, failed: totalFailedCount };

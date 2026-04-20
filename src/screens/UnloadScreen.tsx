@@ -101,42 +101,34 @@ export default function UnloadScreen() {
       console.warn(`⚠️ Could not get session data from local database:`, localError.message);
     }
     
-    // If not found locally, try backend API
-    if (sessionTotalCartons === 0) {
-      try {
-        const settings = await getSettings();
-        if (settings.api_url && settings.demo_mode !== 1) {
-          console.warn(`🌐 Loading session data from backend API for session: ${activeSession}`);
-          const backendSessions = await apiService.getInboundSessions();
-          
-          // Handle different response formats
-          let sessionsList: any[] = [];
-          if (Array.isArray(backendSessions)) {
-            sessionsList = backendSessions;
-          } else if (backendSessions?.data && Array.isArray(backendSessions.data)) {
-            sessionsList = backendSessions.data;
-          } else if (backendSessions?.sessions && Array.isArray(backendSessions.sessions)) {
-            sessionsList = backendSessions.sessions;
+    // Always try backend API for session (to get latest completed_cartons so we can show "received" when ASN already received)
+    try {
+      const settings = await getSettings();
+      if (settings.api_url && settings.demo_mode !== 1) {
+        const backendSessions = await apiService.getInboundSessions();
+        let sessionsList: any[] = [];
+        if (Array.isArray(backendSessions)) {
+          sessionsList = backendSessions;
+        } else if (backendSessions?.data && Array.isArray(backendSessions.data)) {
+          sessionsList = backendSessions.data;
+        } else if (backendSessions?.sessions && Array.isArray(backendSessions.sessions)) {
+          sessionsList = backendSessions.sessions;
+        }
+        const matchingSession = sessionsList.find((s: any) =>
+          (s.inbound_session || s.title) === activeSession
+        );
+        if (matchingSession) {
+          const backendTotal = matchingSession.total_cartons || matchingSession.totalCartons || 0;
+          const backendCompleted = matchingSession.completed_cartons || matchingSession.completedCartons || 0;
+          if (sessionTotalCartons === 0) {
+            sessionTotalCartons = backendTotal;
+            sessionCompletedCartons = backendCompleted;
+            console.warn(`✅ Session from backend:`, { session_id: activeSession, total_cartons: sessionTotalCartons, completed_cartons: sessionCompletedCartons });
           }
-          
-          // Find the session matching our activeSession
-          const matchingSession = sessionsList.find((s: any) => 
-            (s.inbound_session || s.title) === activeSession
-          );
-          
-          if (matchingSession) {
-            sessionTotalCartons = matchingSession.total_cartons || matchingSession.totalCartons || 0;
-            sessionCompletedCartons = matchingSession.completed_cartons || matchingSession.completedCartons || 0;
-            
-            console.warn(`✅ Found session data from backend API:`, {
-              session_id: activeSession,
-              total_cartons: sessionTotalCartons,
-              completed_cartons: sessionCompletedCartons,
-            });
-            
-            // Save to local database for future use
-            try {
-              const db = await getDatabase();
+          // Save/update session in local DB
+          try {
+            const db = await getDatabase();
+            if (db) {
               await db.runAsync(
                 `INSERT OR REPLACE INTO inbound_sessions 
                  (inbound_session, asn_no, status, total_cartons, completed_cartons, updated_on)
@@ -145,22 +137,17 @@ export default function UnloadScreen() {
                   activeSession,
                   normalizedASN,
                   matchingSession.status || "Receiving",
-                  sessionTotalCartons,
-                  sessionCompletedCartons,
+                  backendTotal || sessionTotalCartons,
+                  backendCompleted || sessionCompletedCartons,
                   new Date().toISOString(),
                 ]
               );
-              console.warn(`✅ Saved session data to local database`);
-            } catch (saveError: any) {
-              console.warn(`⚠️ Could not save session data to local database:`, saveError.message);
             }
-          } else {
-            console.warn(`⚠️ Session ${activeSession} not found in backend API response`);
-          }
+          } catch (_) {}
         }
-      } catch (backendError: any) {
-        console.warn(`⚠️ Could not load session data from backend API:`, backendError.message);
       }
+    } catch (backendError: any) {
+      console.warn(`⚠️ Could not load session data from backend API:`, backendError.message);
     }
 
     // Use session total_cartons if available and greater than 0, otherwise use carton map count
@@ -333,6 +320,68 @@ export default function UnloadScreen() {
     } catch (unloadLinesError: any) {
       // Not critical - continue with local statuses
       console.warn(`⚠️ Could not load unload lines from backend:`, unloadLinesError.message);
+    }
+
+    // Sync carton status FROM backend when desktop already marked cartons as Received
+    // (Desktop shows "Received" but mobile may still have Pending if receiving was done elsewhere)
+    try {
+      const asnRes = await apiService.getASN(activeASN);
+      const detailsList: any[] = asnRes?.details ?? asnRes?.data?.details ?? [];
+      const cartonsList: any[] = asnRes?.cartons ?? asnRes?.data?.cartons ?? [];
+      const cartonIdsMarkedReceived = new Set<string>();
+      for (const d of detailsList) {
+        const cid = d.carton_id ?? d.cartonId;
+        const st = (d.carton_status ?? d.receiving_status ?? d.status ?? "").toString().toLowerCase();
+        if (cid && (st === "received" || st === "unloaded")) cartonIdsMarkedReceived.add(cid);
+      }
+      for (const c of cartonsList) {
+        const cid = c.carton_id ?? c.cartonId;
+        const st = (c.carton_status ?? c.status ?? c.receiving_status ?? "").toString().toLowerCase();
+        if (cid && (st === "received" || st === "unloaded")) cartonIdsMarkedReceived.add(cid);
+      }
+      // If backend returns ASN-level status as Received, treat all cartons as received (desktop may not send per-carton status)
+      const asnStatus = (asnRes?.status ?? asnRes?.receiving_status ?? asnRes?.data?.status ?? asnRes?.data?.receiving_status ?? "").toString().toLowerCase();
+      if (asnStatus === "received" || asnStatus === "completed") {
+        for (const cid of allCartons) {
+          if (cid) cartonIdsMarkedReceived.add(cid);
+        }
+        console.warn(`✅ ASN-level status is "${asnStatus}" – marking all ${allCartons.length} carton(s) as Unloaded`);
+      }
+      if (cartonIdsMarkedReceived.size > 0) {
+        for (const cartonId of cartonIdsMarkedReceived) {
+          const existing = await dataService.getCartonStatus(activeASN, activeSession, cartonId);
+          if (!existing || existing.status === "Pending") {
+            await dataService.updateCartonStatus({
+              asn_no: activeASN,
+              inbound_session: activeSession,
+              carton_id: cartonId,
+              status: "Unloaded",
+              updated_on: new Date().toISOString(),
+            });
+            console.warn(`✅ Updated carton ${cartonId} to Unloaded from backend ASN status`);
+          }
+        }
+        console.warn(`✅ Synced ${cartonIdsMarkedReceived.size} carton(s) from backend ASN (Received → Unloaded on mobile)`);
+      }
+    } catch (e: any) {
+      console.warn(`⚠️ Could not sync carton status from backend ASN:`, e?.message);
+    }
+
+    // When backend says session is complete (all cartons received), mark all cartons as Unloaded on mobile
+    if (sessionCompletedCartons >= finalTotalCartons && finalTotalCartons > 0 && allCartons.length > 0) {
+      for (const cartonId of allCartons) {
+        const existing = await dataService.getCartonStatus(activeASN, activeSession, cartonId);
+        if (!existing || existing.status === "Pending") {
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: "Unloaded",
+            updated_on: new Date().toISOString(),
+          });
+        }
+      }
+      console.warn(`✅ Session complete on backend (${sessionCompletedCartons}/${finalTotalCartons}) – marked all ${allCartons.length} carton(s) as Unloaded`);
     }
 
     // Get carton statuses for this session

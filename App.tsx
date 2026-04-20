@@ -13,7 +13,11 @@ import {
 } from "react-native";
 import { AppProvider, useApp } from "./src/context/AppContext";
 import { getDatabase } from "./src/database/database";
-import { syncMasterDataFromDesktop } from "./src/services/master-data-sync.service";
+import {
+  syncMasterDataFromDesktop,
+  type MasterSyncProgress,
+} from "./src/services/master-data-sync.service";
+import { resendReceiveLinesToBackend } from "./src/services/receive-lines-resend.service";
 import { syncEvents } from "./src/services/event-queue.service";
 import { syncAllUnsyncedSessions } from "./src/services/session-sync.service";
 
@@ -66,9 +70,18 @@ import RelocationExecuteScreen from "./src/screens/RelocationExecuteScreen";
 const Stack = createStackNavigator();
 
 // Header Sync Button Component (must be inside AppProvider to access context)
+const formatHeaderSyncProgress = (p: MasterSyncProgress) =>
+  `${p.phase} (${p.step}/${p.totalSteps})${p.detail ? ` — ${p.detail}` : ""}`;
+
 const SyncHeaderButton = () => {
-  const { refreshPendingEvents, pendingEventsCount } = useApp();
+  const {
+    refreshPendingEvents,
+    pendingEventsCount,
+    activeASN,
+    activeSession,
+  } = useApp();
   const [syncing, setSyncing] = useState(false);
+  const [syncStatusLine, setSyncStatusLine] = useState("");
   const [isOnline, setIsOnline] = useState<boolean | null>(null); // null = checking
 
   // Check network status periodically
@@ -98,6 +111,7 @@ const SyncHeaderButton = () => {
     }
 
     setSyncing(true);
+    setSyncStatusLine("Starting…");
     try {
       // Update online status before sync
       try {
@@ -110,7 +124,12 @@ const SyncHeaderButton = () => {
 
       // First sync master data from desktop (includes all master data: items, ASNs, bins, stock ledger, etc.)
       try {
-        const masterResult = await syncMasterDataFromDesktop();
+        setSyncStatusLine("Master: starting…");
+        const masterResult = await syncMasterDataFromDesktop({
+          onProgress: (p) => {
+            setSyncStatusLine(`Master: ${formatHeaderSyncProgress(p)}`);
+          },
+        });
         console.warn("✅ Master data sync completed:", {
           items: masterResult.items.synced,
           asns: masterResult.asns.synced,
@@ -125,6 +144,7 @@ const SyncHeaderButton = () => {
         });
       } catch (error: any) {
         console.warn("⚠️ Master data sync error:", error.message);
+        setSyncStatusLine("Master: error (continuing)…");
         // Continue with event sync even if master sync fails
       }
 
@@ -132,6 +152,7 @@ const SyncHeaderButton = () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Sync sessions to backend
+      setSyncStatusLine("Sessions: uploading…");
       try {
         const sessionResult = await syncAllUnsyncedSessions();
         console.warn(
@@ -146,17 +167,30 @@ const SyncHeaderButton = () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Then sync events to desktop
+      setSyncStatusLine("Events: uploading…");
       const result = await syncEvents();
       await refreshPendingEvents();
 
+      if (activeASN && activeSession) {
+        setSyncStatusLine("Receive data: syncing…");
+        try {
+          await resendReceiveLinesToBackend(activeASN, activeSession);
+        } catch (e: any) {
+          console.warn("Receive lines resend:", e?.message);
+        }
+      }
+
+      setSyncStatusLine("");
       Alert.alert(
         "Sync Complete",
         `Events synced: ${result.synced}\nEvents failed: ${result.failed}\n\nMaster data and sessions have been synced.`
       );
     } catch (error: any) {
+      setSyncStatusLine("");
       Alert.alert("Sync Error", error.message || "Failed to sync data");
     } finally {
       setSyncing(false);
+      setSyncStatusLine("");
     }
   };
 
@@ -186,13 +220,11 @@ const SyncHeaderButton = () => {
       disabled={syncing}
     >
       {syncing ? (
-        <View style={syncButtonStyles.syncContent}>
-          <ActivityIndicator
-            size="small"
-            color="#fff"
-            style={{ marginRight: 6 }}
-          />
-          <Text style={syncButtonStyles.text}>Syncing...</Text>
+        <View style={syncButtonStyles.syncingWrap}>
+          <ActivityIndicator size="small" color="#fff" />
+          <Text style={syncButtonStyles.syncProgressText} numberOfLines={4}>
+            {syncStatusLine || "Syncing…"}
+          </Text>
         </View>
       ) : (
         <View style={syncButtonStyles.syncContent}>
@@ -234,6 +266,7 @@ const syncButtonStyles = StyleSheet.create({
     borderRadius: 8,
     marginRight: 10,
     minWidth: 90,
+    maxWidth: 280,
     borderWidth: 1,
     borderColor: "rgba(255, 255, 255, 0.2)",
     shadowColor: "#000",
@@ -249,6 +282,21 @@ const syncButtonStyles = StyleSheet.create({
     flexDirection: "column",
     alignItems: "center",
     justifyContent: "center",
+  },
+  syncingWrap: {
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    maxWidth: 260,
+    paddingVertical: 2,
+  },
+  syncProgressText: {
+    color: "#fff",
+    fontSize: 9,
+    fontWeight: "600",
+    textAlign: "center",
+    marginTop: 4,
+    lineHeight: 12,
   },
   statusRow: {
     flexDirection: "row",

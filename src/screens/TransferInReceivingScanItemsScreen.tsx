@@ -22,6 +22,10 @@ import { useScanGuard } from "../utils/useScanGuard";
 import { dataService } from "../services/data.service";
 import { getDatabase } from "../database/database";
 import { resolveItemFromBarcode } from "../services/item-master.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 interface ExpectedItem {
   line_id: string;
@@ -50,7 +54,7 @@ export default function TransferInReceivingScanItemsScreen() {
   const [expectedItems, setExpectedItems] = useState<ExpectedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
-  const [barcodeInput, setBarcodeInput] = useState("");
+  const [barcodeDraft, setBarcodeDraft] = useState("");
   const [cartonId, setCartonId] = useState<string | null>(initialCartonId || null);
   const [boxId, setBoxId] = useState<string | null>(initialBoxId || null); // Box ID created when carton was generated
   const [editModal, setEditModal] = useState<{
@@ -82,7 +86,7 @@ export default function TransferInReceivingScanItemsScreen() {
     setUiStatus(isCompleted ? "Received" : "Receiving");
   }, [isCompleted]);
 
-  const barcodeInputRef = useRef<TextInput>(null);
+  const barcodeInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
   const scanGuard = useScanGuard(350); // ✅ Prevent duplicate scan triggers
@@ -168,14 +172,34 @@ export default function TransferInReceivingScanItemsScreen() {
     }
   }, [transferInNo]);
 
-  // Auto-focus barcode input
+  // ✅ PERMANENT FIX: Auto-focus barcode input whenever screen is focused
   useFocusEffect(
     useCallback(() => {
+      const focusInput = () => {
+        if (cartonId && cartonId.trim() !== "" && !isCompleted) {
+          setTimeout(() => {
+            barcodeInputRef.current?.focus();
+          }, 200);
+        }
+      };
+      
+      focusInput();
+      
+      // Also focus when cartonId changes
+      return () => {
+        // Cleanup if needed
+      };
+    }, [cartonId, isCompleted])
+  );
+  
+  // ✅ PERMANENT FIX: Focus input when cartonId becomes available
+  useEffect(() => {
+    if (cartonId && cartonId.trim() !== "" && !isCompleted) {
       setTimeout(() => {
         barcodeInputRef.current?.focus();
-      }, 100);
-    }, [])
-  );
+      }, 300);
+    }
+  }, [cartonId, isCompleted]);
 
   // Check for dirty state (offline queue)
   useEffect(() => {
@@ -548,13 +572,22 @@ export default function TransferInReceivingScanItemsScreen() {
         return;
       }
 
+      // ✅ PERMANENT FIX: Use cartonId as boxId if boxId is not provided
+      // For Transfer In, box_id = carton_id (CTN-TI-*)
+      const finalBoxId = boxId || cartonId;
+      if (!finalBoxId) {
+        Alert.alert("Error", "Carton ID is required. Please go back and scan/generate a carton ID first.");
+        setLoading(false);
+        return;
+      }
+
       // Validate BOX exists and is active
       // ✅ Get box directly from database (box_cache may not have transfer_in column)
       let box: any = null;
       try {
         box = await db.getFirstAsync<any>(
           `SELECT * FROM box_cache WHERE box_id = ?`,
-          [boxId]
+          [finalBoxId]
         );
       } catch (error: any) {
         console.warn(`⚠️ Error loading box:`, error.message);
@@ -564,19 +597,88 @@ export default function TransferInReceivingScanItemsScreen() {
       if (!box) {
         const allBoxes = await db.getAllAsync<any>(
           `SELECT * FROM box_cache WHERE box_id LIKE ?`,
-          [`${boxId}%`]
+          [`${finalBoxId}%`]
         );
-        box = allBoxes.find((b) => b.box_id === boxId);
+        box = allBoxes.find((b) => b.box_id === finalBoxId);
       }
       
+      // ✅ PERMANENT FIX: Auto-create BOX if it doesn't exist
       if (!box) {
-        Alert.alert("BOX Not Found", `BOX "${boxId}" not found for Transfer In ${transferInNo}.\n\nPlease create a BOX first.`);
-        setLoading(false);
-        return;
+        console.log(`⚠️ BOX "${finalBoxId}" not found in local database. Attempting to create...`);
+        
+        try {
+          // Try to create BOX via backend API
+          const boxResponse = await apiService.createBox({
+            box_id: finalBoxId, // Use carton ID as box_id
+            asn_no: transferInNo, // Use Transfer In as ASN
+            store: "WH-MAIN", // Default warehouse store
+            purpose: "PUTAWAY",
+            user_id: settings.user_id || settings.user_code || "USER",
+            carton_id: cartonId,
+            to_no: "Putaway", // Set Transfer Order to "Putaway" for Transfer In putaway boxes
+          });
+          
+          // Extract box_id from response
+          const createdBoxId = 
+            boxResponse?.box_id ||
+            boxResponse?.data?.box_id ||
+            boxResponse?.data?.box?.box_id ||
+            finalBoxId;
+          
+          // Save to local database
+          const newBox = {
+            box_id: createdBoxId,
+            asn_no: transferInNo,
+            store: "WH-MAIN",
+            status: "Open",
+            purpose: "PUTAWAY",
+            updated_on: new Date().toISOString(),
+          };
+          
+          await dataService.saveBox(newBox);
+          box = newBox;
+          setBoxId(createdBoxId); // Update state
+          
+          console.log(`✅ Auto-created BOX "${createdBoxId}" for Transfer In ${transferInNo}`);
+        } catch (createError: any) {
+          console.error(`❌ Failed to auto-create BOX:`, createError);
+          
+          // If backend creation fails, create locally only (for offline mode)
+          const localBox = {
+            box_id: finalBoxId,
+            asn_no: transferInNo,
+            store: "WH-MAIN",
+            status: "Open",
+            purpose: "PUTAWAY",
+            updated_on: new Date().toISOString(),
+          };
+          
+          try {
+            await dataService.saveBox(localBox);
+            box = localBox;
+            setBoxId(finalBoxId);
+            console.log(`✅ Created local BOX "${finalBoxId}" (backend creation failed, will sync later)`);
+          } catch (localError: any) {
+            console.error(`❌ Failed to create local BOX:`, localError);
+            Alert.alert(
+              "BOX Not Found",
+              `BOX "${finalBoxId}" not found and could not be created.\n\n` +
+              `Error: ${createError.message || localError.message}\n\n` +
+              `Please go back and generate a carton ID first, or contact support.`
+            );
+            setLoading(false);
+            return;
+          }
+        }
+      }
+      
+      // Update boxId state if it was null
+      if (!boxId && finalBoxId) {
+        setBoxId(finalBoxId);
       }
 
       if (box.status !== "Open" && box.status !== "OPEN" && box.status !== "open") {
-        Alert.alert("BOX Not Active", `BOX "${boxId}" is not active. Current status: ${box.status}`);
+        Alert.alert("BOX Not Active", `BOX "${finalBoxId}" is not active. Current status: ${box.status}`);
         setLoading(false);
         return;
       }
@@ -611,7 +713,7 @@ export default function TransferInReceivingScanItemsScreen() {
         transfer_in: transferInNo,
         carton_id: cartonId,
         item_code: finalItemCode,
-        box_id: boxId,
+        box_id: finalBoxId, // ✅ Use finalBoxId (cartonId if boxId is null)
         store: box.store || "WH-MAIN",
         qty: 1,
         device_id: settings.device_id ?? undefined,
@@ -624,7 +726,7 @@ export default function TransferInReceivingScanItemsScreen() {
       const existing = await db.getFirstAsync<{ scanned_qty: number }>(
         `SELECT scanned_qty FROM scanned_items 
          WHERE asn_no = ? AND carton_id = ? AND item_code = ? AND box_id = ?`,
-        [transferInNo, cartonId, finalItemCode, boxId]
+        [transferInNo, cartonId, finalItemCode, finalBoxId]
       );
 
       if (existing) {
@@ -641,7 +743,7 @@ export default function TransferInReceivingScanItemsScreen() {
             transferInNo,
             cartonId,
             finalItemCode,
-            boxId,
+            finalBoxId,
           ]
         );
       } else {
@@ -654,7 +756,7 @@ export default function TransferInReceivingScanItemsScreen() {
             sessionId || `TI-REC-${Date.now()}`, // Use sessionId as inbound_session
             cartonId,
             finalItemCode,
-            boxId,
+            finalBoxId, // ✅ Use finalBoxId (cartonId if boxId is null)
             box.store || "WH-MAIN",
             1,
             new Date().toISOString(),
@@ -710,12 +812,25 @@ export default function TransferInReceivingScanItemsScreen() {
         console.warn(`⚠️ Event sync failed (will retry later):`, syncError.message);
       }
 
+      // ✅ PERMANENT FIX: Always refocus input after successful scan
+      setTimeout(() => {
+        barcodeInputRef.current?.focus();
+      }, 100);
+
       // Reload Transfer In after delay
       setTimeout(async () => {
         try {
           await loadTransferIn();
+          // ✅ PERMANENT FIX: Refocus input after reload completes
+          setTimeout(() => {
+            barcodeInputRef.current?.focus();
+          }, 300);
         } catch (reloadError: any) {
           console.warn(`⚠️ Failed to reload Transfer In:`, reloadError.message);
+          // ✅ PERMANENT FIX: Refocus input even if reload fails
+          setTimeout(() => {
+            barcodeInputRef.current?.focus();
+          }, 300);
         }
       }, 2000);
 
@@ -731,20 +846,20 @@ export default function TransferInReceivingScanItemsScreen() {
   };
 
   // ✅ NEW: Handle item scan - prompt for BOX (similar to ASN workflow)
-  const handleItemScan = async (barcode: string) => {
-    if (!barcode || !barcode.trim()) return;
+  const handleItemScan = async (barcode: string): Promise<boolean> => {
+    if (!barcode || !barcode.trim()) return false;
 
     // ✅ Block scanning if already completed
     if (isCompleted) {
       Alert.alert("Already Completed", "This Transfer In has already been completed. Scanning is disabled.");
-      return;
+      return false;
     }
 
     // ✅ FIX: Use scan guard to prevent duplicate triggers
     const guard = scanGuard(barcode);
     if (!guard.allow) {
       console.log("⏭️ Scan guard blocked duplicate scan");
-      return;
+      return true;
     }
 
     // ✅ CRITICAL: Validate cartonId FIRST
@@ -766,19 +881,18 @@ export default function TransferInReceivingScanItemsScreen() {
           { text: "Cancel", style: "cancel" },
         ]
       );
-      return;
+      return false;
     }
 
     // Additional debounce
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
     const normalizedBarcode = barcode.trim().toUpperCase();
-    setBarcodeInput("");
     setScanning(true);
 
     try {
@@ -790,10 +904,20 @@ export default function TransferInReceivingScanItemsScreen() {
       const matchingItem = findMatchingItem(itemCode);
       
       if (!matchingItem) {
-        Alert.alert("Item Not Found", `Item "${itemCode}" is not in this Transfer In.`);
+        Alert.alert("Item Not Found", `Item "${itemCode}" is not in this Transfer In.`, [
+          {
+            text: "OK",
+            onPress: () => {
+              // ✅ PERMANENT FIX: Refocus input after alert dismisses
+              setTimeout(() => {
+                barcodeInputRef.current?.focus();
+              }, 200);
+            },
+          },
+        ]);
         setScanning(false);
-        setTimeout(() => barcodeInputRef.current?.focus(), 100);
-        return;
+        setTimeout(() => barcodeInputRef.current?.focus(), 250);
+        return false;
       }
 
       // Check remaining quantity
@@ -801,11 +925,22 @@ export default function TransferInReceivingScanItemsScreen() {
       if (remaining <= 0) {
         Alert.alert(
           "Over-Receive Blocked",
-          `Item ${matchingItem.item_code} has already been fully received.\n\nRequired: ${matchingItem.expected_qty}\nReceived: ${matchingItem.received_qty}\nRemaining: ${remaining}`
+          `Item ${matchingItem.item_code} has already been fully received.\n\nRequired: ${matchingItem.expected_qty}\nReceived: ${matchingItem.received_qty}\nRemaining: ${remaining}`,
+          [
+            {
+              text: "OK",
+              onPress: () => {
+                // ✅ PERMANENT FIX: Refocus input after alert dismisses
+                setTimeout(() => {
+                  barcodeInputRef.current?.focus();
+                }, 200);
+              },
+            },
+          ]
         );
         setScanning(false);
-        setTimeout(() => barcodeInputRef.current?.focus(), 100);
-        return;
+        setTimeout(() => barcodeInputRef.current?.focus(), 250);
+        return false;
       }
 
       // ✅ NEW: Use box_id if it was created during carton generation, otherwise show BOX selection modal
@@ -815,6 +950,10 @@ export default function TransferInReceivingScanItemsScreen() {
         console.log(`📦 Using pre-created box: ${boxId}`);
         await sortItemToBox(matchingItem.item_code, boxId);
         setScanning(false);
+        // ✅ PERMANENT FIX: Refocus input after scan completes
+        setTimeout(() => {
+          barcodeInputRef.current?.focus();
+        }, 150);
       } else {
         // No box_id available - show BOX selection modal (user can select existing or create new)
         setCurrentItem(matchingItem.item_code);
@@ -825,11 +964,27 @@ export default function TransferInReceivingScanItemsScreen() {
         await loadAvailableBoxes();
         
         setScanning(false);
+        // Note: Focus will be restored when modal closes (in handleBoxSelected)
       }
+      return true;
     } catch (error: any) {
       console.error("❌ Error scanning item:", error);
-      Alert.alert("Error", `Failed to scan item: ${error.message}`);
+      Alert.alert("Error", `Failed to scan item: ${error.message}`, [
+        {
+          text: "OK",
+          onPress: () => {
+            // ✅ PERMANENT FIX: Refocus input after alert dismisses
+            setTimeout(() => {
+              barcodeInputRef.current?.focus();
+            }, 200);
+          },
+        },
+      ]);
       setScanning(false);
+      setTimeout(() => {
+        barcodeInputRef.current?.focus();
+      }, 100);
+      return false;
     }
   };
 
@@ -844,10 +999,10 @@ export default function TransferInReceivingScanItemsScreen() {
     setPendingItemForBox(null);
     setBoxSelectionModal({ visible: false, itemCode: "" });
     
-    // Refocus input for next scan
+    // ✅ PERMANENT FIX: Refocus input for next scan (increased timeout for reliability)
     setTimeout(() => {
       barcodeInputRef.current?.focus();
-    }, 100);
+    }, 250);
   };
 
   // ✅ NEW: Handle create new BOX from modal
@@ -907,6 +1062,10 @@ export default function TransferInReceivingScanItemsScreen() {
 
     if (qtyDifference === 0) {
       setEditModal({ visible: false, item: null, newQty: "" });
+      // ✅ PERMANENT FIX: Refocus input after modal closes
+      setTimeout(() => {
+        barcodeInputRef.current?.focus();
+      }, 200);
       return;
     }
 
@@ -1023,6 +1182,11 @@ export default function TransferInReceivingScanItemsScreen() {
         // ✅ Reuse 'online' variable declared earlier (line 528)
         setEditModal({ visible: false, item: null, newQty: "" });
         setLoading(false);
+        
+        // ✅ PERMANENT FIX: Refocus input after edit completes
+        setTimeout(() => {
+          barcodeInputRef.current?.focus();
+        }, 300);
         
         const successMessage = online 
           ? `Quantity updated to ${newQty} for ${itemCode}.\n\nThe change has been sent to the backend.`
@@ -1239,7 +1403,7 @@ export default function TransferInReceivingScanItemsScreen() {
           text: "Change",
           onPress: () => {
             // Clear current item scan input
-            setBarcodeInput("");
+            setBarcodeDraft("");
             // Navigate back to carton scan
             (navigation as any).navigate("TransferInReceivingScanCarton", {
               transferInNo,
@@ -1435,27 +1599,22 @@ export default function TransferInReceivingScanItemsScreen() {
             : "Scan repeatedly to increment quantity"}
         </Text>
         <View style={styles.scanInputRow}>
-          <TextInput
+          <BarcodeInput
             ref={barcodeInputRef}
-            style={[
-              styles.scanInput,
-              (!cartonId || cartonId.trim() === "") && styles.scanInputDisabled,
-            ]}
-            value={barcodeInput}
-            onChangeText={setBarcodeInput}
+            autoFocus={!!cartonId && cartonId.trim() !== "" && !isCompleted}
+            disabled={
+              !cartonId || cartonId.trim() === "" || isCompleted
+            }
             placeholder={
               !cartonId || cartonId.trim() === ""
                 ? "⚠️ Carton ID required - Tap Carton above to scan"
                 : "Scan or enter barcode"
             }
-            autoCapitalize="characters"
-            autoFocus={!!cartonId && cartonId.trim() !== ""}
-            showSoftInputOnFocus={false}
-            editable={!!cartonId && cartonId.trim() !== "" && !isCompleted}
-            onSubmitEditing={() => {
-              if (barcodeInput.trim() && cartonId && cartonId.trim() !== "") {
-                handleItemScan(barcodeInput.trim());
-              } else if (!cartonId || cartonId.trim() === "") {
+            onChangeText={setBarcodeDraft}
+            onBarcodeScanned={async (raw) => {
+              const cleaned = raw.trim();
+              if (!cleaned) return false;
+              if (!cartonId || cartonId.trim() === "") {
                 Alert.alert(
                   "Carton ID Required",
                   "Please scan a carton ID first before scanning items.",
@@ -1463,27 +1622,42 @@ export default function TransferInReceivingScanItemsScreen() {
                     {
                       text: "Scan Carton ID",
                       onPress: () => {
-                        (navigation as any).navigate("TransferInReceivingScanCarton", {
-                          transferInNo,
-                          sessionId,
-                          transactionNo,
-                        });
+                        (navigation as any).navigate(
+                          "TransferInReceivingScanCarton",
+                          {
+                            transferInNo,
+                            sessionId,
+                            transactionNo,
+                          }
+                        );
                       },
                     },
                     { text: "Cancel", style: "cancel" },
                   ]
                 );
+                return false;
               }
+              return handleItemScan(cleaned);
             }}
+            containerStyle={{ flex: 1 }}
+            inputStyle={[
+              styles.scanInput,
+              (!cartonId || cartonId.trim() === "") &&
+                styles.scanInputDisabled,
+            ]}
           />
           <TouchableOpacity
             style={styles.submitButton}
             onPress={() => {
-              if (barcodeInput.trim()) {
-                handleItemScan(barcodeInput.trim());
-              }
+              const b =
+                barcodeDraft.trim() ||
+                barcodeInputRef.current?.getLastText?.()?.trim() ||
+                "";
+              if (b) void handleItemScan(b);
             }}
-            disabled={!barcodeInput.trim() || scanning || !cartonId || isCompleted}
+            disabled={
+              scanning || !cartonId || isCompleted || !barcodeDraft.trim()
+            }
           >
             <Text style={styles.submitButtonText}>Submit</Text>
           </TouchableOpacity>
@@ -1539,7 +1713,13 @@ export default function TransferInReceivingScanItemsScreen() {
         visible={editModal.visible}
         transparent
         animationType="slide"
-        onRequestClose={() => setEditModal({ visible: false, item: null, newQty: "" })}
+        onRequestClose={() => {
+          setEditModal({ visible: false, item: null, newQty: "" });
+          // ✅ PERMANENT FIX: Refocus input when modal is closed
+          setTimeout(() => {
+            barcodeInputRef.current?.focus();
+          }, 200);
+        }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -1562,7 +1742,13 @@ export default function TransferInReceivingScanItemsScreen() {
             <View style={styles.modalButtons}>
               <TouchableOpacity
                 style={styles.modalCancelButton}
-                onPress={() => setEditModal({ visible: false, item: null, newQty: "" })}
+                onPress={() => {
+                  setEditModal({ visible: false, item: null, newQty: "" });
+                  // ✅ PERMANENT FIX: Refocus input when modal is cancelled
+                  setTimeout(() => {
+                    barcodeInputRef.current?.focus();
+                  }, 200);
+                }}
               >
                 <Text style={styles.modalCancelText}>Cancel</Text>
               </TouchableOpacity>

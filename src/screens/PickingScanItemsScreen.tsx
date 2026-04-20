@@ -19,6 +19,10 @@ import { apiService } from "../services/api.service";
 import { getSettings } from "../services/settings.service";
 import { pickingSessionService, PickingSession } from "../services/picking-session.service";
 import { isDeviceOnline } from "../utils/network-check";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 interface RequestedItem {
   line_id: string;
@@ -66,7 +70,8 @@ export default function PickingScanItemsScreen() {
   const [requestedItems, setRequestedItems] = useState<RequestedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
-  const [barcodeInput, setBarcodeInput] = useState("");
+  /** Mirrors BarcodeInput text for manual Submit enable state */
+  const [barcodeDraft, setBarcodeDraft] = useState("");
   // Camera not needed - handheld scanner inputs directly into text field
   const [binLocation, setBinLocation] = useState<string | null>(initialBinLocation || null);
   const [binInfo, setBinInfo] = useState<any>(initialBinInfo || null);
@@ -85,7 +90,7 @@ export default function PickingScanItemsScreen() {
   const [totalScanned, setTotalScanned] = useState(0);
   const [isDirty, setIsDirty] = useState(false);
 
-  const barcodeInputRef = useRef<TextInput>(null);
+  const barcodeInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -202,8 +207,8 @@ export default function PickingScanItemsScreen() {
     );
   };
 
-  const handleItemScan = async (barcode: string) => {
-    if (!barcode || !barcode.trim()) return;
+  const handleItemScan = async (barcode: string): Promise<boolean> => {
+    if (!barcode || !barcode.trim()) return false;
 
     // ✅ CRITICAL: Validate binLocation FIRST (before any processing)
     if (!binLocation || binLocation.trim() === "") {
@@ -223,19 +228,18 @@ export default function PickingScanItemsScreen() {
           { text: "Cancel", style: "cancel" },
         ]
       );
-      return;
+      return false;
     }
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
     const normalizedBarcode = barcode.trim().toUpperCase();
-    setBarcodeInput("");
     setScanning(true);
 
     try {
@@ -244,9 +248,8 @@ export default function PickingScanItemsScreen() {
 
       if (!matchingItem) {
         Alert.alert("Item Not Found", `Item "${normalizedBarcode}" is not in this Material Request.`);
-        setScanning(false);
         setTimeout(() => barcodeInputRef.current?.focus(), 100);
-        return;
+        return false;
       }
 
       // Check if already fully picked
@@ -255,9 +258,8 @@ export default function PickingScanItemsScreen() {
           "Already Fully Picked",
           `Item ${matchingItem.item_code} is already fully picked (${matchingItem.picked_qty}/${matchingItem.requested_qty}).`
         );
-        setScanning(false);
         setTimeout(() => barcodeInputRef.current?.focus(), 100);
-        return;
+        return false;
       }
 
       // ✅ CRITICAL: Validate that item exists at the current bin location and carton ID
@@ -352,9 +354,8 @@ export default function PickingScanItemsScreen() {
               { text: "OK", style: "cancel" },
             ]
           );
-          setScanning(false);
           setTimeout(() => barcodeInputRef.current?.focus(), 100);
-          return;
+          return false;
         }
 
         if (cartonId && cartonId.trim() !== "" && !foundCarton) {
@@ -376,9 +377,8 @@ export default function PickingScanItemsScreen() {
               { text: "OK", style: "cancel" },
             ]
           );
-          setScanning(false);
           setTimeout(() => barcodeInputRef.current?.focus(), 100);
-          return;
+          return false;
         }
 
         console.log(`✅ Validation passed: Item ${matchingItem.item_code} exists at ${binLocation}${cartonId ? ` with carton ${cartonId}` : ""}`);
@@ -456,9 +456,11 @@ export default function PickingScanItemsScreen() {
       setTimeout(() => {
         barcodeInputRef.current?.focus();
       }, 100);
+      return true;
     } catch (error: any) {
       console.error("❌ Error scanning item:", error);
       Alert.alert("Error", `Failed to scan item: ${error.message}`);
+      return false;
     } finally {
       setScanning(false);
     }
@@ -1167,27 +1169,20 @@ export default function PickingScanItemsScreen() {
           Scan repeatedly to increment quantity
         </Text>
         <View style={styles.scanInputRow}>
-          <TextInput
+          <BarcodeInput
             ref={barcodeInputRef}
-            style={[
-              styles.scanInput,
-              (!binLocation || binLocation.trim() === "") && styles.scanInputDisabled,
-            ]}
-            value={barcodeInput}
-            onChangeText={setBarcodeInput}
+            autoFocus={!!binLocation && binLocation.trim() !== ""}
+            disabled={!binLocation || binLocation.trim() === ""}
             placeholder={
               !binLocation || binLocation.trim() === ""
                 ? "⚠️ Bin location required - Tap Bin above to scan"
                 : "Scan or enter barcode"
             }
-            autoCapitalize="characters"
-            autoFocus={!!binLocation && binLocation.trim() !== ""}
-            showSoftInputOnFocus={false}
-            editable={!!binLocation && binLocation.trim() !== ""}
-            onSubmitEditing={() => {
-              if (barcodeInput.trim() && binLocation && binLocation.trim() !== "") {
-                handleItemScan(barcodeInput.trim());
-              } else if (!binLocation || binLocation.trim() === "") {
+            onChangeText={setBarcodeDraft}
+            onBarcodeScanned={async (raw) => {
+              const cleaned = raw.trim();
+              if (!cleaned) return false;
+              if (!binLocation || binLocation.trim() === "") {
                 Alert.alert(
                   "Bin Location Required",
                   "Please scan a bin location first before scanning items.",
@@ -1204,17 +1199,26 @@ export default function PickingScanItemsScreen() {
                     { text: "Cancel", style: "cancel" },
                   ]
                 );
+                return false;
               }
+              return handleItemScan(cleaned);
             }}
+            containerStyle={{ flex: 1 }}
+            inputStyle={[
+              styles.scanInput,
+              (!binLocation || binLocation.trim() === "") && styles.scanInputDisabled,
+            ]}
           />
           <TouchableOpacity
             style={styles.submitButton}
             onPress={() => {
-              if (barcodeInput.trim()) {
-                handleItemScan(barcodeInput.trim());
-              }
+              const b =
+                barcodeDraft.trim() ||
+                barcodeInputRef.current?.getLastText?.()?.trim() ||
+                "";
+              if (b) void handleItemScan(b);
             }}
-            disabled={!barcodeInput.trim() || scanning}
+            disabled={scanning || !barcodeDraft.trim()}
           >
             <Text style={styles.submitButtonText}>Submit</Text>
           </TouchableOpacity>

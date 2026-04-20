@@ -95,10 +95,13 @@ const testMasterDataSync = async (): Promise<boolean> => {
       }
     }
     
-    // Test Items sync
+    // Test Items sync (first page only)
     try {
-      const items = await apiService.pullItemMaster();
-      logResult("GET /api/master/items", "PASS", `Fetched ${Array.isArray(items) ? items.length : 0} items`);
+      const raw = await apiService.pullItemMaster({ limit: 10, offset: 0 });
+      const n = Array.isArray(raw)
+        ? raw.length
+        : raw?.items?.length ?? raw?.data?.length ?? 0;
+      logResult("GET /api/master/items", "PASS", `Fetched ${n} items (first page)`);
     } catch (error: any) {
       const errorMsg = error.message || error.toString();
       if (errorMsg.includes("404") || errorMsg.includes("not found")) {

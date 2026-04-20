@@ -26,12 +26,14 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { resolveItemFromBarcode } from "../services/item-master.service";
 import { normalizeASN } from "../utils/asn";
+import { normalizeItemMasterBarcode } from "../utils/itemMasterBarcode";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import {
   saveWorkflowState,
   loadWorkflowState,
   clearWorkflowState,
 } from "../services/workflow-state.service";
+import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
 
 type WorkflowState = "SELECT_CARTON" | "SCAN_ITEM" | "SCAN_BOX";
 
@@ -51,8 +53,13 @@ export default function ReceiveSortScreen() {
   const [totalScannedQuantities, setTotalScannedQuantities] = useState<
     Record<string, number>
   >({});
+  // ✅ Backend received_qty per item (from getASN or getReceiveLines) – use after backend update
+  const [backendReceivedByItem, setBackendReceivedByItem] = useState<
+    Record<string, number> | null
+  >(null);
   const [currentItem, setCurrentItem] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [resendReceiveLinesLoading, setResendReceiveLinesLoading] = useState(false);
   const [availableCartons, setAvailableCartons] = useState<any[]>([]);
   const [warehousesAndStores, setWarehousesAndStores] = useState<any[]>([]);
 
@@ -280,11 +287,6 @@ export default function ReceiveSortScreen() {
   useEffect(() => {
     loadAvailableCartons();
   }, [activeASN, activeSession]);
-
-  // Load stores from Transfer Order allocations
-  useEffect(() => {
-    loadTransferOrderStores();
-  }, [activeASN, loadTransferOrderStores]);
 
   // Track if we've loaded saved state to prevent multiple loads
   const [savedStateLoaded, setSavedStateLoaded] = React.useState(false);
@@ -545,10 +547,109 @@ export default function ReceiveSortScreen() {
     });
   };
 
+  /**
+   * Fetch updated received_qty from backend (getASN or getReceiveLines).
+   * Call after finish carton and on screen focus so summary shows backend qty.
+   */
+  const refreshASNReceivedQtyFromBackend = useCallback(async () => {
+    if (!activeASN || !activeSession) return;
+    try {
+      const asnRes = await apiService.getASN(activeASN);
+      const details =
+        asnRes?.details ??
+        asnRes?.data?.details ??
+        (Array.isArray(asnRes) ? asnRes : null);
+      const byItem: Record<string, number> = {};
+      if (details && Array.isArray(details)) {
+        for (const row of details as any[]) {
+          const code = row.item_code ?? row.itemCode;
+          const recv = row.received_qty ?? row.recvd_qty ?? row.receivedQty ?? 0;
+          if (code) {
+            byItem[code] = (byItem[code] ?? 0) + Number(recv);
+          }
+        }
+      }
+      if (Object.keys(byItem).length === 0) {
+        const linesRes = await apiService.getReceiveLines(activeSession);
+        const lines =
+          linesRes?.receive_lines ??
+          linesRes?.data?.receive_lines ??
+          (Array.isArray(linesRes) ? linesRes : []);
+        if (Array.isArray(lines)) {
+          for (const row of lines as any[]) {
+            const code = row.item_code ?? row.itemCode;
+            const recv = row.received_qty ?? row.recvd_qty ?? row.receivedQty ?? 0;
+            if (code) {
+              byItem[code] = (byItem[code] ?? 0) + Number(recv);
+            }
+          }
+        }
+      }
+      if (Object.keys(byItem).length === 0 && asnRes) {
+        const cartons = asnRes.cartons ?? asnRes.data?.cartons ?? [];
+        if (Array.isArray(cartons)) {
+          for (const carton of cartons) {
+            const items = carton.items ?? carton.details ?? [];
+            for (const item of items) {
+              const code = item.item_code ?? item.itemCode;
+              const recv = item.received_qty ?? item.recvd_qty ?? item.receivedQty ?? 0;
+              if (code) {
+                byItem[code] = (byItem[code] ?? 0) + Number(recv);
+              }
+            }
+          }
+        }
+      }
+      if (Object.keys(byItem).length > 0) {
+        setBackendReceivedByItem(byItem);
+        console.log(
+          "✅ Refreshed ASN received qty from backend:",
+          Object.keys(byItem).length,
+          "items"
+        );
+      } else {
+        setBackendReceivedByItem(null);
+      }
+    } catch (e: any) {
+      console.warn("⚠️ Refresh ASN received qty from backend failed:", e?.message);
+      setBackendReceivedByItem(null);
+    }
+  }, [activeASN, activeSession]);
+
+  /** Resend all receive lines from local DB to backend (e.g. when user taps Sync). */
+  const handleResendReceiveLines = useCallback(async () => {
+    if (!activeASN || !activeSession) return;
+    setResendReceiveLinesLoading(true);
+    try {
+      const result = await resendReceiveLinesToBackend(activeASN, activeSession);
+      await refreshASNReceivedQtyFromBackend();
+      if (result.linesSent > 0) {
+        Alert.alert(
+          "Sync receive data",
+          `Resent ${result.linesSent} receive line(s) from ${result.cartonsSent} carton(s) to the backend.`
+        );
+      } else {
+        Alert.alert(
+          "Sync receive data",
+          "No scanned items to resend. Scan and finish cartons first, or data is already in sync."
+        );
+      }
+    } catch (e: any) {
+      console.warn("Resend receive lines failed:", e?.message);
+      Alert.alert("Sync failed", e?.message || "Failed to resend receive data.");
+    } finally {
+      setResendReceiveLinesLoading(false);
+    }
+  }, [activeASN, activeSession, refreshASNReceivedQtyFromBackend]);
+
   // Reset state when screen is focused (to handle navigation from Unload screen)
   // Also check for saved state when returning to screen after app restart
   useFocusEffect(
     React.useCallback(() => {
+      // ✅ Get updated received qty from backend when screen gains focus
+      if (activeASN && activeSession) {
+        refreshASNReceivedQtyFromBackend();
+      }
       // When screen is focused, check if we have a cartonId in params
       const params = route.params as { cartonId?: string } | undefined;
       const cartonIdFromParams = params?.cartonId
@@ -641,6 +742,7 @@ export default function ReceiveSortScreen() {
       workflowState,
       savedStateLoaded,
       loadSavedState,
+      refreshASNReceivedQtyFromBackend,
     ])
   );
 
@@ -1094,14 +1196,14 @@ export default function ReceiveSortScreen() {
                         [
                           {
                             text: "OK",
-                            style: "cancel",
+                            style: "cancel" as const,
                           },
                           // Only show "Force Unlock" in demo mode
                           ...(settings.demo_mode === 1
                             ? [
                                 {
                                   text: "Force Unlock (Demo)",
-                                  style: "destructive",
+                                  style: "destructive" as const,
                                   onPress: async () => {
                                     console.log(
                                       `🔓 Force unlocking carton ${cartonId} in demo mode`
@@ -1112,8 +1214,8 @@ export default function ReceiveSortScreen() {
                                       inbound_session: activeSession,
                                       carton_id: cartonId,
                                       status: "Unloaded",
-                                      locked_by: null,
-                                      locked_on: null,
+                                      locked_by: undefined,
+                                      locked_on: undefined,
                                       updated_on: new Date().toISOString(),
                                     });
                                     // Retry locking by calling the lock logic again
@@ -1295,7 +1397,7 @@ export default function ReceiveSortScreen() {
                   if (statusLower !== "unloaded" && statusLower !== "pending") {
                     Alert.alert(
                       "Carton Not Available",
-                      `Carton ${cartonId} cannot be processed.\n\nCurrent status: ${status.status}\n\nOnly "Unloaded" or "Pending" cartons can be received.`
+                      `Carton ${cartonId} cannot be processed.\n\nCurrent status: ${status?.status ?? "unknown"}\n\nOnly "Unloaded" or "Pending" cartons can be received.`
                     );
                     setLoading(false);
                     return;
@@ -1620,9 +1722,9 @@ export default function ReceiveSortScreen() {
             }
             uniqueStores = Array.from(
               new Set(
-                apiAllocations
+                (apiAllocations as any[])
                   .map((a: any) => a.store || a.store_code)
-                  .filter((s: any) => s)
+                  .filter((s): s is string => Boolean(s))
               )
             ).sort();
             console.log(
@@ -1690,6 +1792,11 @@ export default function ReceiveSortScreen() {
       setSelectedStoreForBox("");
     }
   }, [activeASN, selectedStoreForBox]);
+
+  // Load stores from Transfer Order allocations (effect must be after loadTransferOrderStores definition)
+  useEffect(() => {
+    loadTransferOrderStores();
+  }, [activeASN, loadTransferOrderStores]);
 
   const loadCartonItems = async (cartonId?: string | null) => {
     // Use provided cartonId or fall back to lockedCarton state
@@ -1899,7 +2006,7 @@ export default function ReceiveSortScreen() {
         );
         await dataService.updateCartonStatus({
           asn_no: normalizedASN,
-          inbound_session: activeSession,
+          inbound_session: currentSession,
           carton_id: cartonId,
           status: "Unloaded",
           updated_on: new Date().toISOString(),
@@ -1908,8 +2015,8 @@ export default function ReceiveSortScreen() {
         // Sync status change to backend
         try {
           await apiService.updateCartonStatus({
-            asn_no: activeASN, // Use original format from desktop
-            inbound_session: activeSession,
+            asn_no: currentASN, // Use original format from desktop
+            inbound_session: currentSession,
             carton_id: cartonId,
             status: "Unloaded",
             user_id: settings.user_id,
@@ -1929,7 +2036,7 @@ export default function ReceiveSortScreen() {
         // Reload status
         status = await dataService.getCartonStatus(
           normalizedASN,
-          activeSession,
+          currentSession,
           cartonId
         );
 
@@ -1979,14 +2086,14 @@ export default function ReceiveSortScreen() {
             [
               {
                 text: "OK",
-                style: "cancel",
+                style: "cancel" as const,
               },
               // Only show "Force Unlock" in demo mode
               ...(settings.demo_mode === 1
                 ? [
                     {
                       text: "Force Unlock (Demo)",
-                      style: "destructive",
+                      style: "destructive" as const,
                       onPress: async () => {
                         console.log(
                           `🔓 Force unlocking carton ${cartonId} in demo mode`
@@ -1994,19 +2101,19 @@ export default function ReceiveSortScreen() {
                         // Force unlock in demo mode
                         await dataService.updateCartonStatus({
                           asn_no: normalizedASN,
-                          inbound_session: activeSession,
+                          inbound_session: currentSession,
                           carton_id: cartonId,
                           status: "Unloaded",
-                          locked_by: null,
-                          locked_on: null,
+                          locked_by: undefined,
+                          locked_on: undefined,
                           updated_on: new Date().toISOString(),
                         });
 
                         // Sync status change to backend
                         try {
                           await apiService.updateCartonStatus({
-                            asn_no: activeASN, // Use original format from desktop
-                            inbound_session: activeSession,
+                            asn_no: currentASN, // Use original format from desktop
+                            inbound_session: currentSession,
                             carton_id: cartonId,
                             status: "Unloaded",
                             user_id: settings.user_id,
@@ -2046,7 +2153,7 @@ export default function ReceiveSortScreen() {
         await addEvent({
           event_type: "UNLOAD_SCAN",
           asn_no: normalizedASN,
-          inbound_session: activeSession,
+          inbound_session: currentSession,
           carton_id: cartonId,
           device_id: pendingSettings.device_id || "",
           user_id: pendingSettings.user_id || "",
@@ -2055,7 +2162,7 @@ export default function ReceiveSortScreen() {
         // Update status to Unloaded
         await dataService.updateCartonStatus({
           asn_no: normalizedASN,
-          inbound_session: activeSession,
+          inbound_session: currentSession,
           carton_id: cartonId,
           status: "Unloaded",
           updated_on: new Date().toISOString(),
@@ -2064,8 +2171,8 @@ export default function ReceiveSortScreen() {
         // Sync status change to backend
         try {
           await apiService.updateCartonStatus({
-            asn_no: activeASN, // Use original format from desktop
-            inbound_session: activeSession,
+            asn_no: currentASN, // Use original format from desktop
+            inbound_session: currentSession,
             carton_id: cartonId,
             status: "Unloaded",
             user_id: pendingSettings.user_id,
@@ -2085,7 +2192,7 @@ export default function ReceiveSortScreen() {
         // Reload status
         status = await dataService.getCartonStatus(
           normalizedASN,
-          activeSession,
+          currentSession,
           cartonId
         );
         console.log(
@@ -2097,7 +2204,7 @@ export default function ReceiveSortScreen() {
       if (statusLower !== "unloaded" && statusLower !== "pending") {
         Alert.alert(
           "Carton Not Available",
-          `Carton ${cartonId} cannot be processed.\n\nCurrent status: ${status.status}\n\nOnly "Unloaded" or "Pending" cartons can be received.`
+          `Carton ${cartonId} cannot be processed.\n\nCurrent status: ${status?.status ?? "unknown"}\n\nOnly "Unloaded" or "Pending" cartons can be received.`
         );
         setLoading(false);
         await loadAvailableCartons(); // Refresh available cartons
@@ -2590,8 +2697,8 @@ export default function ReceiveSortScreen() {
           [
             newQty,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
             normalizedASN,
             activeSession,
             targetCartonId,
@@ -2613,8 +2720,8 @@ export default function ReceiveSortScreen() {
             box.store,
             1,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
           ]
         );
       }
@@ -2701,6 +2808,57 @@ export default function ReceiveSortScreen() {
       const allocations = await dataService.getTransferOrderAllocations(
         activeASN
       );
+      
+      // ✅ PERMANENT FIX: Check if ALL TO-allocated items are already scanned
+      // If yes, block ALL further scanning (including non-TO items and Putaway)
+      if (allocations.length > 0) {
+        let allTOItemsScanned = true;
+        for (const alloc of allocations) {
+          if (alloc.allocated_qty > 0) {
+            // Get current scanned quantity for this item/store combination
+            // Count ONLY items scanned to STORE boxes (not Putaway boxes)
+            // TO items must be scanned to store boxes, Putaway is for remaining items only
+            const scannedQtyResult = await db.getFirstAsync<{ total_qty: number }>(
+              `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty
+               FROM scanned_items
+               WHERE (asn_no = ? OR asn_no = ?)
+                 AND inbound_session = ?
+                 AND item_code = ?
+                 AND store = ?
+                 AND (box_id NOT LIKE 'PAW-%' OR box_id IS NULL)`,
+              [activeASN, normalizedASN, activeSession, alloc.item_code, alloc.store]
+            );
+            const currentScannedQtyForStore = scannedQtyResult?.total_qty || 0;
+            
+            console.log(
+              `🔍 TO Completion Check: Item=${alloc.item_code}, Store=${alloc.store}, ` +
+              `Allocated=${alloc.allocated_qty}, Scanned to Store=${currentScannedQtyForStore}`
+            );
+            
+            // Check if this allocation is fully scanned (only count store boxes, not putaway)
+            if (currentScannedQtyForStore < alloc.allocated_qty) {
+              allTOItemsScanned = false;
+              break; // Found at least one incomplete allocation
+            }
+          }
+        }
+        
+        if (allTOItemsScanned) {
+          console.warn(
+            `⚠️ All TO-allocated items are already scanned - blocking ALL further scanning (including Putaway)`
+          );
+          Alert.alert(
+            "All TO Items Scanned",
+            `All Transfer Order allocated items have been scanned.\n\n` +
+            `No further scanning is allowed.\n\n` +
+            `Please finish the current carton to complete the process.`
+          );
+          setLoading(false);
+          setIsProcessingScan(false);
+          return;
+        }
+      }
+      
       const itemAllocation = allocations.find(
         (alloc) => alloc.item_code === itemCode && alloc.store === box.store
       );
@@ -2712,6 +2870,23 @@ export default function ReceiveSortScreen() {
           itemAllocation?.allocated_qty || 0
         }`
       );
+
+      // ✅ PERMANENT FIX: Only allow scanning items that have TO allocation
+      // Block items that are not in TO allocation (unless it's a Putaway box)
+      const isPutawayBox = boxId.startsWith("PAW-");
+      if (!isPutawayBox && !itemAllocation) {
+        console.error(
+          `❌ TO Validation FAILED: Item=${itemCode} has no TO allocation for ${box.store}`
+        );
+        Alert.alert(
+          "Item Not in Transfer Order",
+          `Item ${itemCode} is not allocated to ${box.store} in the Transfer Order.\n\n` +
+          `Only items with TO allocation can be scanned to store boxes.\n\n` +
+          `Items without TO allocation should be scanned to Putaway boxes (PAW-*).`
+        );
+        setLoading(false);
+        return;
+      }
 
       if (itemAllocation && itemAllocation.allocated_qty > 0) {
         // Get all boxes for this store
@@ -2782,14 +2957,10 @@ export default function ReceiveSortScreen() {
         console.warn(
           `⚠️ TO Validation: Item=${itemCode} has allocation with 0 quantity for ${box.store} - allowing scan`
         );
-      } else {
-        console.warn(
-          `⚠️ TO Validation: No allocation found for Item=${itemCode} in ${box.store} - allowing scan`
-        );
       }
+      // Note: Non-TO items are already blocked above (unless Putaway box)
 
       // ✅ PUTAWAY BOX VALIDATION: Restrict Putaway scanning to (ASN - TO) quantity
-      const isPutawayBox = boxId.startsWith("PAW-");
       if (isPutawayBox) {
         console.log(
           `🔍 Putaway BOX Validation: Item=${itemCode}, BOX=${boxId}`
@@ -2899,8 +3070,8 @@ export default function ReceiveSortScreen() {
           [
             newQty,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
             normalizedASN,
             activeSession,
             boxId,
@@ -2915,14 +3086,14 @@ export default function ReceiveSortScreen() {
           [
             normalizedASN,
             activeSession,
-            null,
+            null as unknown as string,
             itemCode,
             boxId,
             box.store,
             1,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
           ]
         );
       }
@@ -2944,12 +3115,12 @@ export default function ReceiveSortScreen() {
           event_type: "SORT_TO_BOX",
           asn_no: normalizedASN,
           inbound_session: activeSession,
-          carton_id: null, // No carton tracking when using BOX ID directly
+          carton_id: undefined, // No carton tracking when using BOX ID directly
           item_code: itemCode,
           box_id: boxId,
           store: box.store,
-          device_id: settings.device_id,
-          user_id: settings.user_id,
+          device_id: settings.device_id ?? "",
+          user_id: settings.user_id ?? "",
         }).catch((err) => console.warn("Error creating event:", err)),
 
         // Reload boxes in background
@@ -3067,7 +3238,14 @@ export default function ReceiveSortScreen() {
       } | null = null;
 
       try {
-        resolvedItem = await resolveItemFromBarcode(scannedValue);
+        const resolved = await resolveItemFromBarcode(scannedValue);
+        resolvedItem = resolved
+          ? {
+              item_code: resolved.item_code,
+              barcode: resolved.barcode ?? resolved.item_code,
+              item_name: resolved.item_name ?? null,
+            }
+          : null;
         if (resolvedItem) {
           console.warn(
             `✅ Resolved via resolveItemFromBarcode: item_code="${resolvedItem.item_code}", barcode="${resolvedItem.barcode}"`
@@ -3399,21 +3577,10 @@ export default function ReceiveSortScreen() {
             try {
               const settings = await getSettings();
               if (settings.api_url && settings.demo_mode !== 1) {
-                const backendItems = await apiService.pullItemMaster();
-                let itemsList: any[] = [];
-                if (Array.isArray(backendItems)) {
-                  itemsList = backendItems;
-                } else if (
-                  backendItems?.data &&
-                  Array.isArray(backendItems.data)
-                ) {
-                  itemsList = backendItems.data;
-                } else if (
-                  backendItems?.items &&
-                  Array.isArray(backendItems.items)
-                ) {
-                  itemsList = backendItems.items;
-                }
+                const { fetchAllItemMasterRowsForLookup } = await import(
+                  "../services/item-master-sync.service"
+                );
+                const itemsList = await fetchAllItemMasterRowsForLookup();
 
                 // Find item with matching barcode
                 const foundBackendItem = itemsList.find((item: any) => {
@@ -3451,17 +3618,21 @@ export default function ReceiveSortScreen() {
 
                       // Cache this item in local database for future use
                       try {
+                        const cachedBarcode = normalizeItemMasterBarcode(
+                          foundBackendItem.barcode,
+                          backendItemCode
+                        );
                         await db.runAsync(
                           `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) VALUES (?, ?, ?, ?)`,
                           [
                             foundBackendItem.item_code,
-                            foundBackendItem.barcode,
+                            cachedBarcode,
                             foundBackendItem.item_name || null,
                             new Date().toISOString(),
                           ]
                         );
                         console.warn(
-                          `💾 Cached item from backend: item_code="${foundBackendItem.item_code}", barcode="${foundBackendItem.barcode}"`
+                          `💾 Cached item from backend: item_code="${foundBackendItem.item_code}", barcode="${cachedBarcode}"`
                         );
                       } catch (cacheError: any) {
                         console.warn(
@@ -3527,6 +3698,10 @@ export default function ReceiveSortScreen() {
           cartonItemDetails = cartonItemCodes || "No items found";
         }
 
+        const cartonBarcodesList = targetCartonItems
+          .map((ci) => (ci as { barcode?: string; item_code: string }).barcode || (ci as { item_code: string }).item_code)
+          .filter(Boolean)
+          .join(", ");
         console.error(
           `❌ Item not found in carton after all matching strategies:`,
           {
@@ -3534,7 +3709,7 @@ export default function ReceiveSortScreen() {
             scannedBarcode: item.barcode,
             originalScannedValue: scannedValue,
             cartonItemCodes,
-            cartonBarcodes,
+            cartonBarcodes: cartonBarcodesList,
             carton: targetCartonId,
             asn: activeASN,
           }
@@ -3923,8 +4098,8 @@ export default function ReceiveSortScreen() {
             [
               newQty,
               new Date().toISOString(),
-              settings.device_id,
-              settings.user_id,
+              settings.device_id ?? "",
+              settings.user_id ?? "",
               normalizedASN,
               activeSession,
               targetCartonId,
@@ -3950,8 +4125,8 @@ export default function ReceiveSortScreen() {
               box.store,
               1, // scanned_qty
               new Date().toISOString(),
-              settings.device_id,
-              settings.user_id,
+              settings.device_id ?? "",
+              settings.user_id ?? "",
             ]
           );
           console.log(
@@ -4478,44 +4653,56 @@ export default function ReceiveSortScreen() {
         const db = await getDatabase();
         const normalizedASN = normalizeASN(activeASN);
 
-        // Calculate ASN Qty from carton items
-        const totalASNQty = cartonItems.reduce(
+        // ✅ PERMANENT FIX: Calculate ASN Qty from ALL cartons in the ASN (not just current carton)
+        // Get all carton items for this ASN from asn_carton_map
+        const allASNItems = await db.getAllAsync<{
+          item_code: string;
+          shipped_qty: number;
+        }>(
+          `SELECT item_code, SUM(shipped_qty) as shipped_qty
+           FROM asn_carton_map
+           WHERE (asn_no = ? OR asn_no = ?)
+           GROUP BY item_code`,
+          [activeASN, normalizedASN]
+        );
+        
+        // Calculate total ASN Qty across ALL cartons
+        const totalASNQty = allASNItems.reduce(
           (sum, item) => sum + (item.shipped_qty || 0),
           0
         );
 
-        // Get scanned quantities from database (sum scanned_qty by item_code)
-        // Try original ASN format first
+        // ✅ PERMANENT FIX: Get scanned quantities from ALL cartons (not just current carton)
+        // Count ALL scanned items for this ASN/session, excluding Putaway boxes
+        // Putaway items shouldn't count towards "Scanned" - they're remaining items
         let scannedItemsFromDB = await db.getAllAsync<{
           item_code: string;
           scanned_qty: number;
         }>(
           `SELECT item_code, SUM(scanned_qty) as scanned_qty 
            FROM scanned_items 
-           WHERE asn_no = ? AND inbound_session = ? AND carton_id = ?
+           WHERE (asn_no = ? OR asn_no = ?)
+             AND inbound_session = ?
+             AND (box_id NOT LIKE 'PAW-%' OR box_id IS NULL)
            GROUP BY item_code`,
-          [activeASN, activeSession, lockedCarton]
+          [activeASN, normalizedASN, activeSession]
         );
 
-        // If no results and ASN was normalized, try with normalized format
-        if (scannedItemsFromDB.length === 0 && normalizedASN !== activeASN) {
-          scannedItemsFromDB = await db.getAllAsync<{
-            item_code: string;
-            scanned_qty: number;
-          }>(
-            `SELECT item_code, SUM(scanned_qty) as scanned_qty 
-             FROM scanned_items 
-             WHERE asn_no = ? AND inbound_session = ? AND carton_id = ?
-             GROUP BY item_code`,
-            [normalizedASN, activeSession, lockedCarton]
-          );
-        }
-
-        // Calculate total scanned qty
-        const totalScannedQty = scannedItemsFromDB.reduce(
+        // Calculate total scanned qty (only store boxes, not Putaway)
+        let totalScannedQty = scannedItemsFromDB.reduce(
           (sum, item) => sum + (item.scanned_qty || 0),
           0
         );
+        // ✅ Use backend received qty when available (after backend update / refresh)
+        if (backendReceivedByItem && Object.keys(backendReceivedByItem).length > 0) {
+          totalScannedQty = Object.values(backendReceivedByItem).reduce(
+            (sum, qty) => sum + (qty || 0),
+            0
+          );
+        }
+        
+        // ✅ Remaining = ASN Qty - Scanned (store boxes only)
+        // Putaway items are part of "remaining", not "scanned"
         const totalRemainingForPutaway = totalASNQty - totalScannedQty;
 
         // Get TO allocations
@@ -4531,8 +4718,9 @@ export default function ReceiveSortScreen() {
         const boxes = await dataService.getBoxes(activeASN);
         const boxStoreMap = new Map(boxes.map((b) => [b.box_id, b.store]));
 
-        // Calculate TO allocated scanned: sum scanned_qty for items that are allocated to TO
-        // Get all scanned items with store info
+        // ✅ PERMANENT FIX: Calculate TO allocated scanned across ALL cartons (not just current)
+        // Get all scanned items with store info, excluding Putaway boxes
+        // TO items must be scanned to store boxes, not Putaway boxes
         let scannedItemsWithStore = await db.getAllAsync<{
           item_code: string;
           box_id: string | null;
@@ -4541,24 +4729,11 @@ export default function ReceiveSortScreen() {
         }>(
           `SELECT item_code, box_id, store, scanned_qty 
            FROM scanned_items 
-           WHERE asn_no = ? AND inbound_session = ? AND carton_id = ?`,
-          [activeASN, activeSession, lockedCarton]
+           WHERE (asn_no = ? OR asn_no = ?)
+             AND inbound_session = ?
+             AND (box_id NOT LIKE 'PAW-%' OR box_id IS NULL)`,
+          [activeASN, normalizedASN, activeSession]
         );
-
-        // If no results and ASN was normalized, try with normalized format
-        if (scannedItemsWithStore.length === 0 && normalizedASN !== activeASN) {
-          scannedItemsWithStore = await db.getAllAsync<{
-            item_code: string;
-            box_id: string | null;
-            store: string | null;
-            scanned_qty: number;
-          }>(
-            `SELECT item_code, box_id, store, scanned_qty 
-             FROM scanned_items 
-             WHERE asn_no = ? AND inbound_session = ? AND carton_id = ?`,
-            [normalizedASN, activeSession, lockedCarton]
-          );
-        }
 
         // Create a map of item_code -> allocated stores
         const itemAllocatedStores = new Map<string, Set<string>>();
@@ -4573,35 +4748,39 @@ export default function ReceiveSortScreen() {
 
         // Sum scanned quantities for items that are allocated to TO
         let toAllocatedScanned = 0;
-        scannedItemsWithStore.forEach((item) => {
-          const itemCode = item.item_code;
-          const allocatedStores = itemAllocatedStores.get(itemCode);
+        // ✅ When backend received qty is available, use it for TO allocated scanned
+        if (backendReceivedByItem && Object.keys(backendReceivedByItem).length > 0) {
+          allocations.forEach((alloc) => {
+            const recv = backendReceivedByItem[alloc.item_code] ?? 0;
+            toAllocatedScanned += Math.min(recv, alloc.allocated_qty || 0);
+          });
+        } else {
+          scannedItemsWithStore.forEach((item) => {
+            const itemCode = item.item_code;
+            const allocatedStores = itemAllocatedStores.get(itemCode);
 
-          if (allocatedStores && allocatedStores.size > 0) {
-            // Get store from box_id or item.store
-            const boxStore = item.box_id ? boxStoreMap.get(item.box_id) : null;
-            const itemStore = (item.store || boxStore || "")
-              .trim()
-              .toUpperCase();
+            if (allocatedStores && allocatedStores.size > 0) {
+              const boxStore = item.box_id ? boxStoreMap.get(item.box_id) : null;
+              const itemStore = (item.store || boxStore || "")
+                .trim()
+                .toUpperCase();
 
-            // If item is scanned to an allocated store, count it (up to allocated qty)
-            if (allocatedStores.has(itemStore)) {
-              // Find the allocation for this item/store combination
-              const allocation = allocations.find(
-                (a) =>
-                  a.item_code === itemCode &&
-                  a.store.trim().toUpperCase() === itemStore
-              );
-              if (allocation) {
-                // Count only up to allocated qty (don't count excess)
-                toAllocatedScanned += Math.min(
-                  item.scanned_qty || 0,
-                  allocation.allocated_qty || 0
+              if (allocatedStores.has(itemStore)) {
+                const allocation = allocations.find(
+                  (a) =>
+                    a.item_code === itemCode &&
+                    a.store.trim().toUpperCase() === itemStore
                 );
+                if (allocation) {
+                  toAllocatedScanned += Math.min(
+                    item.scanned_qty || 0,
+                    allocation.allocated_qty || 0
+                  );
+                }
               }
             }
-          }
-        });
+          });
+        }
 
         const toAllocatedRemaining = totalTOAllocatedQty - toAllocatedScanned;
 
@@ -4655,6 +4834,7 @@ export default function ReceiveSortScreen() {
     cartonItems,
     scannedQuantities,
     toAllocationsByItem,
+    backendReceivedByItem,
   ]);
 
   // Load TO stores and calculate remaining items for Create CTN modal
@@ -4827,14 +5007,14 @@ export default function ReceiveSortScreen() {
       const warehouseStore =
         warehouseStores.length > 0 ? warehouseStores[0].code : "WH-MAIN";
 
-      // Create Putaway BOX
+      // Create Putaway BOX (no TO for putaway)
       const putawayBox = {
         box_id: putawayBoxId,
         asn_no: activeASN,
-        to_no: null,
+        to_no: "",
         store: warehouseStore,
         status: "Open",
-        purpose: "PUTAWAY",
+        purpose: "PUTAWAY" as const,
         updated_on: new Date().toISOString(),
       };
 
@@ -4928,7 +5108,8 @@ export default function ReceiveSortScreen() {
     const itemsSortedToPutaway = new Set(putawayEvents.map((e) => e.item_code));
 
     // Find items in this carton that are NOT allocated to any TO AND not already in a Putaway box
-    const unallocatedItemsInCarton = scannedItemsFromDB.filter((item) => {
+    type ScannedItemRow = { item_code: string; box_id: string | null; store: string | null; carton_id?: string | null; scanned_qty: number };
+    const unallocatedItemsInCarton = (scannedItemsFromDB as ScannedItemRow[]).filter((item: ScannedItemRow) => {
       const itemCode = item.item_code;
       const isAllocated = allocatedItemCodes.has(itemCode);
 
@@ -4973,7 +5154,7 @@ export default function ReceiveSortScreen() {
         "Create Putaway Box Required",
         `You have ${totalUnallocatedQty} item(s) that are not allocated to any Transfer Order.\n\nThese items need to go to Putaway.\n\nPlease create a BOX for Putaway before finishing this carton.`,
         [
-          { text: "Cancel", style: "cancel" },
+          { text: "Cancel", style: "cancel" as const },
           {
             text: "Create Putaway Box",
             onPress: async () => {
@@ -5003,21 +5184,21 @@ export default function ReceiveSortScreen() {
                     ? warehouseStores[0].code
                     : "WH-MAIN";
 
-                // Create BOX for Putaway
+                // Create BOX for Putaway (no TO for putaway items)
                 const putawayBox = {
                   box_id: putawayBoxId,
                   asn_no: activeASN,
-                  to_no: null, // No TO for putaway items
+                  to_no: "",
                   store: warehouseStore,
                   status: "Open",
-                  purpose: "PUTAWAY", // Mark as Putaway box
+                  purpose: "PUTAWAY" as const,
                   updated_on: new Date().toISOString(),
                 };
 
                 await dataService.saveBox(putawayBox);
 
                 // Move unallocated items to Putaway box
-                for (const item of unallocatedItemsInCarton) {
+                for (const item of unallocatedItemsInCarton as ScannedItemRow[]) {
                   // Use the actual carton_id from the item record (not lockedCarton)
                   // This ensures the correct carton is associated with the SORT_TO_BOX event
                   const itemCartonId = item.carton_id || lockedCarton;
@@ -5122,8 +5303,7 @@ export default function ReceiveSortScreen() {
       }
 
       // Group scanned items by item_code and aggregate quantities
-      // Note: Backend expects carton_id, so we use lockedCarton for all items
-      for (const scannedItem of scannedItemsFromDB) {
+      for (const scannedItem of scannedItemsFromDB as Array<{ item_code: string; scanned_qty?: number }>) {
         const itemCode = scannedItem.item_code;
         const qty = scannedItem.scanned_qty || 0;
 
@@ -5146,6 +5326,20 @@ export default function ReceiveSortScreen() {
         }
       }
 
+      // Include every carton item (full state). Items not in scanned list get received_qty 0
+      // so backend gets correct Recvd Qty for all items (e.g. 108228, 108230) and can UPSERT.
+      for (const cartonItem of cartonItems) {
+        const itemCode = cartonItem.item_code;
+        if (!itemCode) continue;
+        if (receiveLinesMap.has(itemCode)) continue;
+        const expectedQty = expectedQtyByItem.get(itemCode) ?? 0;
+        receiveLinesMap.set(itemCode, {
+          item_code: itemCode,
+          expected_qty: expectedQty,
+          received_qty: 0,
+        });
+      }
+
       // Convert map to array - use lockedCarton as carton_id (backend requirement)
       // According to PDF section 12.5, parent_title should be inside each receive_line object
       const receiveLines = Array.from(receiveLinesMap.values()).map((line) => ({
@@ -5166,14 +5360,18 @@ export default function ReceiveSortScreen() {
       });
 
       // Call batch receive lines API only if there are scanned items
-      // According to PDF section 12.5, format is { receive_lines: [...] }
-      // Backend requires receive_lines array to not be empty
+      // ✅ CRITICAL: Backend expects parent_title (inbound_session) at TOP level to associate
+      // receive_lines with the correct ASN/session. Backend must UPSERT by (session, carton_id, item_code)
+      // and SET received_qty (not ADD) so resend/sync does not double-count.
       if (receiveLines.length > 0) {
         try {
           await apiService.createReceiveLines({
+            parent_title: activeSession, // ✅ REQUIRED: Session ID so backend applies to correct ASN
             receive_lines: receiveLines,
           });
-          console.log(`✅ Receive lines created for carton ${lockedCarton}`);
+          console.log(`✅ Receive lines created for carton ${lockedCarton} (parent_title=${activeSession})`);
+          // ✅ Get updated received qty from backend so summary matches desktop
+          await refreshASNReceivedQtyFromBackend();
         } catch (receiveLinesError: any) {
           console.warn(
             `⚠️ Failed to create receive lines for carton ${lockedCarton}:`,
@@ -5208,8 +5406,8 @@ export default function ReceiveSortScreen() {
         inbound_session: activeSession,
         carton_id: lockedCarton,
         status: "Received" as const,
-        locked_by: null, // Clear lock when carton is completed
-        locked_on: null, // Clear lock timestamp
+        locked_by: undefined, // Clear lock when carton is completed
+        locked_on: undefined, // Clear lock timestamp
         updated_on: new Date().toISOString(),
       };
 
@@ -5901,9 +6099,11 @@ export default function ReceiveSortScreen() {
       console.log(
         `📊 TO Breakdown: Found ${scannedItemsFromDB.length} scanned item record(s) for item ${itemCode} (including items with carton_id = NULL from BOX ID workflow)`
       );
+      type ScannedItemWithCarton = { box_id: string | null; store: string | null; carton_id?: string | null; scanned_qty: number };
+      const scannedWithCarton = scannedItemsFromDB as ScannedItemWithCarton[];
       console.log(
         `📊 TO Breakdown: Scanned items details:`,
-        scannedItemsFromDB.map((si) => ({
+        scannedWithCarton.map((si) => ({
           box_id: si.box_id,
           store: si.store,
           carton_id: si.carton_id,
@@ -5913,7 +6113,7 @@ export default function ReceiveSortScreen() {
 
       // Calculate total scanned by carton
       const scannedByCarton = new Map<string, number>();
-      scannedItemsFromDB.forEach((si) => {
+      scannedWithCarton.forEach((si) => {
         const cartonId = si.carton_id || "No Carton";
         const current = scannedByCarton.get(cartonId) || 0;
         scannedByCarton.set(cartonId, current + (si.scanned_qty || 0));
@@ -5923,7 +6123,7 @@ export default function ReceiveSortScreen() {
       console.log(`📦 Box Store Map:`, Object.fromEntries(boxStoreMap));
 
       // Calculate total scanned across ALL scanned items (for comparison with Expected Items)
-      const totalScannedFromDB = scannedItemsFromDB.reduce(
+      const totalScannedFromDB = scannedWithCarton.reduce(
         (sum, si) => sum + (si.scanned_qty || 0),
         0
       );
@@ -5944,7 +6144,7 @@ export default function ReceiveSortScreen() {
         // Has TO allocations - show breakdown by store
         itemAllocations.forEach((alloc) => {
           // Filter scanned items for this store
-          const storeScannedItems = scannedItemsFromDB.filter((si) => {
+          const storeScannedItems = scannedWithCarton.filter((si) => {
             // Get store from box_id if available, otherwise use store from scanned_items
             const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
             const itemStore = si.store || boxStore;
@@ -6016,18 +6216,24 @@ export default function ReceiveSortScreen() {
           console.warn(
             `⚠️ TO Breakdown: Found ${unmatchedScanned} scanned item(s) for ${itemCode} that don't match any TO allocation (total scanned=${totalScannedFromDB}, in breakdown=${totalScannedInBreakdown})`
           );
-          unmatchedItems = scannedItemsFromDB.filter((si) => {
-            const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
-            const itemStore = si.store || boxStore;
-            const itemStoreUpper = itemStore
-              ? itemStore.trim().toUpperCase()
-              : "";
-            // Check if this item matches any TO allocation
-            return !itemAllocations.some((alloc) => {
-              const allocStoreUpper = alloc.store.trim().toUpperCase();
-              return itemStoreUpper === allocStoreUpper;
-            });
-          });
+          unmatchedItems = scannedWithCarton
+            .filter((si) => {
+              const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
+              const itemStore = si.store || boxStore;
+              const itemStoreUpper = itemStore
+                ? itemStore.trim().toUpperCase()
+                : "";
+              return !itemAllocations.some((alloc) => {
+                const allocStoreUpper = alloc.store.trim().toUpperCase();
+                return itemStoreUpper === allocStoreUpper;
+              });
+            })
+            .map((si) => ({
+              box_id: si.box_id,
+              store: si.store,
+              carton_id: si.carton_id ?? null,
+              scanned_qty: si.scanned_qty || 0,
+            }));
           if (unmatchedItems.length > 0) {
             console.warn(
               `⚠️ Unmatched scanned items:`,
@@ -6071,7 +6277,7 @@ export default function ReceiveSortScreen() {
 
         // Calculate scanned by carton for warehouse
         const scannedByCartonForWarehouse = new Map<string, number>();
-        scannedItemsFromDB.forEach((si) => {
+        (scannedItemsFromDB as Array<{ carton_id?: string | null; scanned_qty?: number }>).forEach((si) => {
           const cartonId = si.carton_id || "No Carton";
           const current = scannedByCartonForWarehouse.get(cartonId) || 0;
           scannedByCartonForWarehouse.set(
@@ -6398,8 +6604,8 @@ export default function ReceiveSortScreen() {
             ? [
                 qtyDifference,
                 timestamp,
-                settings.device_id,
-                settings.user_id,
+                settings.device_id ?? "",
+                settings.user_id ?? "",
                 existingASN,
                 activeSession,
                 lockedCarton,
@@ -6407,11 +6613,11 @@ export default function ReceiveSortScreen() {
                 targetBox.box_id,
                 editQtyModal.store,
               ]
-            : [
+            :               [
                 qtyDifference,
                 timestamp,
-                settings.device_id,
-                settings.user_id,
+                settings.device_id ?? "",
+                settings.user_id ?? "",
                 existingASN,
                 activeSession,
                 editQtyModal.itemCode,
@@ -6437,14 +6643,14 @@ export default function ReceiveSortScreen() {
             [
               normalizedASN,
               activeSession,
-              lockedCarton || null,
+              lockedCarton ?? "",
               editQtyModal.itemCode,
               targetBox.box_id,
               editQtyModal.store,
               qtyDifference,
               timestamp,
-              settings.device_id,
-              settings.user_id,
+              settings.device_id ?? "",
+              settings.user_id ?? "",
             ]
           );
           console.log(
@@ -6520,8 +6726,8 @@ export default function ReceiveSortScreen() {
               ? [
                   remainingToRemove,
                   timestamp,
-                  settings.device_id,
-                  settings.user_id,
+                  settings.device_id ?? "",
+                  settings.user_id ?? "",
                   item.asn_no,
                   activeSession,
                   item.carton_id,
@@ -6532,8 +6738,8 @@ export default function ReceiveSortScreen() {
               : [
                   remainingToRemove,
                   timestamp,
-                  settings.device_id,
-                  settings.user_id,
+                  settings.device_id ?? "",
+                  settings.user_id ?? "",
                   item.asn_no,
                   activeSession,
                   editQtyModal.itemCode,
@@ -6661,7 +6867,7 @@ export default function ReceiveSortScreen() {
       const scannedItemsFromDB = await dataService.getScannedItems(
         normalizedASN,
         activeSession,
-        lockedCarton
+        lockedCarton ?? undefined
       );
 
       // Update scanned items state
@@ -6669,7 +6875,7 @@ export default function ReceiveSortScreen() {
 
       // Recalculate scanned quantities by item_code
       const scannedQtyMap = new Map<string, number>();
-      scannedItemsFromDB.forEach((item) => {
+      (scannedItemsFromDB as Array<{ item_code: string; scanned_qty?: number }>).forEach((item) => {
         const current = scannedQtyMap.get(item.item_code) || 0;
         scannedQtyMap.set(item.item_code, current + (item.scanned_qty || 0));
       });
@@ -6911,8 +7117,8 @@ export default function ReceiveSortScreen() {
           [
             newQty,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
             activeASN, // Use original format
             activeSession,
             lockedCarton,
@@ -6932,14 +7138,14 @@ export default function ReceiveSortScreen() {
           [
             activeASN, // Use original format
             activeSession,
-            lockedCarton,
+            lockedCarton ?? "",
             manualQtyItem,
             manualQtyBox,
             box.store,
             qty,
             new Date().toISOString(),
-            settings.device_id,
-            settings.user_id,
+            settings.device_id ?? "",
+            settings.user_id ?? "",
           ]
         );
         console.log(
@@ -7309,7 +7515,7 @@ export default function ReceiveSortScreen() {
             <View style={styles.boxesList}>
               <Text style={styles.boxesLabel}>BOXes:</Text>
               <View style={styles.boxesChips}>
-                {item.boxes.map((boxId, idx) => (
+                {item.boxes.map((boxId: string, idx: number) => (
                   <View key={idx} style={styles.boxChip}>
                     <Text style={styles.boxChipText}>{boxId}</Text>
                   </View>
@@ -7388,6 +7594,16 @@ export default function ReceiveSortScreen() {
             </View>
           )}
         </View>
+
+        <TouchableOpacity
+          style={[styles.resendReceiveDataButton, resendReceiveLinesLoading && styles.resendReceiveDataButtonDisabled]}
+          onPress={handleResendReceiveLines}
+          disabled={resendReceiveLinesLoading}
+        >
+          <Text style={styles.resendReceiveDataButtonText}>
+            {resendReceiveLinesLoading ? "Syncing..." : "🔄 Sync receive data"}
+          </Text>
+        </TouchableOpacity>
 
         <BarcodeScanner
           onScan={(barcode) => {
@@ -7938,7 +8154,9 @@ export default function ReceiveSortScreen() {
                     )}
                 </View>
               )}
-              {areAllItemsReceived &&
+              {/* ✅ PERMANENT FIX: Show message when ALL TO items are scanned (across all cartons) */}
+              {summaryTotals.toAllocatedRemaining === 0 &&
+                summaryTotals.totalTOAllocatedQty > 0 &&
                 summaryTotals.totalRemainingForPutaway > 0 && (
                   <View
                     style={{
@@ -9118,6 +9336,21 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 16,
   },
+  resendReceiveDataButton: {
+    backgroundColor: "#34C759",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    alignItems: "center",
+  },
+  resendReceiveDataButtonDisabled: {
+    opacity: 0.6,
+  },
+  resendReceiveDataButtonText: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "600",
+  },
   stateText: {
     color: "#fff",
     fontSize: 16,
@@ -9966,13 +10199,10 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     marginRight: 8,
     alignItems: "center",
-    borderRadius: 8,
     borderRadius: 6,
     borderWidth: 2,
     borderColor: "#ddd",
     backgroundColor: "#fff",
-    alignItems: "center",
-    marginRight: 8,
   },
   manualQtyBoxButtonActive: {
     borderColor: "#2196F3",

@@ -5,7 +5,6 @@ import {
   TouchableOpacity,
   StyleSheet,
   ScrollView,
-  TextInput,
   ActivityIndicator,
   Alert,
 } from "react-native";
@@ -16,6 +15,10 @@ import { apiService } from "../services/api.service";
 import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { relocationSessionService } from "../services/relocation-session.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function RelocationScanFromBinScreen() {
   const navigation = useNavigation();
@@ -26,7 +29,7 @@ export default function RelocationScanFromBinScreen() {
   const [binCode, setBinCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [binInfo, setBinInfo] = useState<any>(null);
-  const binInputRef = useRef<TextInput>(null);
+  const binInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -37,14 +40,14 @@ export default function RelocationScanFromBinScreen() {
     }, 100);
   }, []);
 
-  const validateBin = async (bin: string) => {
-    if (!bin || !bin.trim()) return;
+  const validateBin = async (bin: string): Promise<boolean> => {
+    if (!bin || !bin.trim()) return false;
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
@@ -64,7 +67,7 @@ export default function RelocationScanFromBinScreen() {
         setBinInfo(localBin);
         setBinCode(localBin.bin_code);
         setLoading(false);
-        return;
+        return true;
       }
 
       // If not found locally, try backend
@@ -99,9 +102,9 @@ export default function RelocationScanFromBinScreen() {
           setBinInfo(binData);
           setBinCode(binData.bin_code);
           setLoading(false);
-        } else {
-          throw new Error("Bin not found");
+          return true;
         }
+        throw new Error("Bin not found");
       } catch (backendError: any) {
         setLoading(false);
         Alert.alert(
@@ -110,11 +113,13 @@ export default function RelocationScanFromBinScreen() {
         );
         setBinInfo(null);
         setBinCode("");
+        return false;
       }
     } catch (error: any) {
       setLoading(false);
       console.error("❌ Error validating bin:", error);
       Alert.alert("Error", `Failed to validate bin: ${error.message}`);
+      return false;
     }
   };
 
@@ -154,15 +159,6 @@ export default function RelocationScanFromBinScreen() {
     }
   };
 
-  const handleInputChange = (text: string) => {
-    setBinCode(text.toUpperCase());
-    if (text.trim()) {
-      validateBin(text.toUpperCase());
-    } else {
-      setBinInfo(null);
-    }
-  };
-
   return (
     <View style={styles.container}>
       <View style={styles.headerSection}>
@@ -183,20 +179,15 @@ export default function RelocationScanFromBinScreen() {
 
         <View style={styles.inputSection}>
           <Text style={styles.inputLabel}>Bin Location</Text>
-          <TextInput
+          <BarcodeInput
             ref={binInputRef}
-            style={styles.input}
-            value={binCode}
-            onChangeText={handleInputChange}
+            autoFocus
             placeholder="Scan or enter bin code"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={() => {
-              if (binCode.trim()) {
-                validateBin(binCode.trim().toUpperCase());
-              }
-            }}
+            onBarcodeScanned={async (raw) =>
+              validateBin(raw.trim().toUpperCase())
+            }
+            containerStyle={{ alignSelf: "stretch" }}
+            inputStyle={styles.input}
           />
         </View>
 

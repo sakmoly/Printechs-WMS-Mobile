@@ -46,6 +46,7 @@ export default function BoxManagementScreen() {
   const [totalASNQty, setTotalASNQty] = useState(0);
   const [totalTOAllocatedQty, setTotalTOAllocatedQty] = useState(0);
   const [remainingItemsQty, setRemainingItemsQty] = useState(0);
+  const [refreshingTO, setRefreshingTO] = useState(false);
   const [boxItemsModal, setBoxItemsModal] = useState<{
     visible: boolean;
     boxId: string;
@@ -125,7 +126,10 @@ export default function BoxManagementScreen() {
         
         const toResponse = await apiService.getTransferOrderByASN(activeASN);
         if (toResponse) {
-          const toData = toResponse?.data || toResponse?.transfer_order || toResponse;
+          const toData =
+            toResponse?.data ||
+            (typeof toResponse?.transfer_order === "object" ? toResponse?.transfer_order : null) ||
+            toResponse;
           const allocations = 
             toData?.allocations || 
             toData?.items || 
@@ -167,18 +171,10 @@ export default function BoxManagementScreen() {
       }
       setTotalTOAllocatedQty(totalTO);
 
-      // ✅ FIX: Calculate remaining: Total ASN - Total TO
-      // If no TO exists (totalTO = 0), remaining = totalASN (all items need putaway)
-      let remaining = Math.max(0, totalASN - totalTO);
-      
-      // ✅ FIX: If no TO exists and there's available quantity, all items need putaway
-      // This ensures Putaway box creation is allowed when there's no TO but there's available quantity
-      if (!transferOrder && totalASN > 0) {
-        // No TO means no allocations, so all items need putaway
-        remaining = totalASN;
-        console.log(`✅ No TO found - all ${totalASN} items need putaway`);
-      }
-      
+      // Remaining putaway = ASN total minus TO allocation sum from API.
+      // Do NOT override with full ASN when `transferOrder` string is missing but API still returned
+      // allocations (totalTO > 0) — that caused Remaining to show 800 while TO Allocated showed 400.
+      const remaining = Math.max(0, totalASN - totalTO);
       setRemainingItemsQty(remaining);
 
       console.log(`📊 Remaining Items Calculation:`);
@@ -252,7 +248,10 @@ export default function BoxManagementScreen() {
         
         const toResponse = await apiService.getTransferOrderByASN(activeASN);
         if (toResponse) {
-          const toData = toResponse?.data || toResponse?.transfer_order || toResponse;
+          const toData =
+            toResponse?.data ||
+            (typeof toResponse?.transfer_order === "object" ? toResponse?.transfer_order : null) ||
+            toResponse;
           const allocations = 
             toData?.allocations || 
             toData?.items || 
@@ -422,9 +421,21 @@ export default function BoxManagementScreen() {
         return;
       }
       
-      // Fetch TO from API directly (skip cache check)
+      // Fetch TO from API (try activeASN, then normalized ASN if 404)
+      let toResponse: any = null;
       try {
-        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        toResponse = await apiService.getTransferOrderByASN(activeASN);
+        if (toResponse === null) {
+          const normalizedASNForTO = normalizeASN(activeASN);
+          if (normalizedASNForTO !== activeASN) {
+            console.log(`🔄 Retrying Transfer Order with normalized ASN: ${normalizedASNForTO}`);
+            toResponse = await apiService.getTransferOrderByASN(normalizedASNForTO);
+          }
+        }
+      } catch (_) {
+        toResponse = null;
+      }
+      try {
         console.log("📋 Transfer Order API Response (raw):", toResponse);
         console.log("📋 Transfer Order API Response (stringified):", JSON.stringify(toResponse, null, 2));
         console.log(`✅ DATA SOURCE: Transfer Order data comes from backend API - NO CACHE - NO MOCK DATA`);
@@ -433,38 +444,77 @@ export default function BoxManagementScreen() {
           console.log("📋 Transfer Order API Response is undefined?", toResponse === undefined);
           console.log("📋 Transfer Order API Response keys:", toResponse ? Object.keys(toResponse) : "null/undefined");
           
-          // Handle different response formats
-          const toData = toResponse?.data || toResponse?.transfer_order || toResponse;
+          // Handle different response formats (backend may wrap in .data or use different TO keys)
+          // IMPORTANT: If transfer_order is a string (e.g. "WMS-TO-00006"), do NOT use it as toData —
+          // use the full toResponse so we have access to allocations and to_no at top level.
+          const toData =
+            toResponse?.data ||
+            (typeof toResponse?.transfer_order === "object" ? toResponse?.transfer_order : null) ||
+            toResponse;
           console.log("📋 Extracted toData:", toData);
           console.log("📋 toData type:", typeof toData);
-          console.log("📋 toData is null?", toData === null);
-          console.log("📋 toData is undefined?", toData === undefined);
-          console.log("📋 toData keys:", toData ? Object.keys(toData) : "null/undefined");
+          console.log("📋 toData keys:", toData && typeof toData === "object" ? Object.keys(toData) : toData);
           
-          // If toResponse is null, it means no TO was found (404)
+          // If toResponse is null, try to get TO and stores from ASN details (backend may embed them in ASN)
           if (toResponse === null) {
-            console.log(`ℹ️ API returned null - No Transfer Order found for ASN ${activeASN}`);
+            console.log(`ℹ️ No Transfer Order from by-asn API - trying ASN details for TO and stores...`);
+            try {
+              const asnRes = await apiService.getASN(activeASN);
+              const asnData = asnRes?.data || asnRes;
+              const toNoFromASN = asnData?.transfer_order || asnData?.to_no || asnData?.transfer_order_no || asnData?.linked_to;
+              const details: any[] = asnData?.details || asnData?.lines || asnData?.items || asnData?.data?.details || [];
+              const storeFromRow = (r: any) => r.store || r.store_code || r.destination || r.to_store || r.warehouse || r.destination_store;
+              const storesFromDetails = Array.from(new Set(
+                details.map((r: any) => storeFromRow(r)).filter((s: any) => s && String(s).trim() !== "")
+              )) as string[];
+              const directStoresFromASN = asnData?.stores || asnData?.store_codes || asnData?.destinations || [];
+              const directList = Array.isArray(directStoresFromASN)
+                ? directStoresFromASN.map((s: any) => (typeof s === "string" ? s : s?.code ?? s?.store ?? "")).filter(Boolean)
+                : [];
+              const allStoresFromASN = storesFromDetails.length > 0 ? storesFromDetails : directList;
+              if (toNoFromASN && String(toNoFromASN).trim()) {
+                setTransferOrder(String(toNoFromASN).trim());
+                console.log(`✅ Transfer Order from ASN details: ${toNoFromASN}`);
+              }
+              if (allStoresFromASN.length > 0) {
+                setDistributionStores(Array.from(new Set(allStoresFromASN)).sort());
+                console.log(`✅ Stores from ASN details:`, allStoresFromASN);
+                return;
+              }
+            } catch (asnErr: any) {
+              console.warn(`⚠️ Could not get stores from ASN details:`, asnErr?.message);
+            }
             setTransferOrder(null);
             setDistributionStores([]);
-            return; // Exit early if no TO found
+            return;
           }
           
-          if (toData && (toData.to_no || toData.transfer_order)) {
-            const toNo = toData.to_no || toData.transfer_order;
-            setTransferOrder(toNo);
+          // Accept multiple possible keys for TO number (e.g. WMS-TO-00006 from backend)
+          const toNo =
+            toData?.to_no ||
+            toData?.transfer_order ||
+            toData?.to_number ||
+            toData?.transfer_order_no ||
+            toData?.id ||
+            toData?.title;
+          const hasValidTO = toData && toNo && String(toNo).trim().length > 0;
+          
+          if (hasValidTO) {
+            setTransferOrder(String(toNo).trim());
             console.log(`✅ Transfer Order found from API: ${toNo}`);
             console.log(`✅ Setting transferOrder state to: ${toNo} (from API, not cache)`);
             
-            // Extract stores from allocations if available
-            // Try multiple possible field names for allocations
-            // Based on backend structure, it might be: allocations, items, item_lines, line_items, lines, etc.
-            const allocations = 
-              toData.allocations || 
-              toData.items || 
-              toData.item_lines ||  // Backend might use "item_lines" (as seen in TO details modal)
-              toData.allocation || 
-              toData.line_items ||
-              toData.lines ||
+            // Extract stores from allocations (try toData first, then top-level toResponse for WMS-TO-* style APIs)
+            const allocations =
+              toData?.allocations ||
+              toData?.items ||
+              toData?.item_lines ||
+              toData?.allocation ||
+              toData?.line_items ||
+              toData?.lines ||
+              toResponse?.allocations ||
+              toResponse?.items ||
+              toResponse?.item_lines ||
               (Array.isArray(toData) ? toData : []);
             
             console.log(`📦 Extracted allocations from API:`, allocations);
@@ -515,24 +565,46 @@ export default function BoxManagementScreen() {
                 // Continue - cache update is optional, API data is primary
               }
 
-              // Get store codes from API allocations (NOT from cache)
+              // Get store codes from API allocations (try all common field names)
+              const storeFromAlloc = (a: any) =>
+                a.store || a.store_code || a.warehouse || a.to_store || a.destination_store ||
+                a.destination || a.target_store || a.location_code || a.warehouse_code;
               const allocationStoreCodes: string[] = Array.from(
                 new Set(
                   allocations
-                    .map((a: any) => a.store || a.store_code || a.warehouse || a.to_store || a.destination_store)
+                    .map((a: any) => (typeof a === "string" ? a : storeFromAlloc(a)))
                     .filter((s: any) => s && String(s).trim() !== "")
                 )
               ) as string[];
 
-              console.log(`📦 Store codes from API TO allocations:`, allocationStoreCodes);
-              console.log(`📦 Raw allocations from API:`, allocations.slice(0, 5).map(a => ({ 
-                store: a.store || a.store_code, 
+              // If no stores from allocations, try direct store list (backend may send stores[] or store_codes[])
+              let storeCodes = allocationStoreCodes;
+              if (storeCodes.length === 0) {
+                const directStores =
+                  toData?.stores ||
+                  toData?.store_codes ||
+                  toData?.destinations ||
+                  toResponse?.stores ||
+                  toResponse?.store_codes ||
+                  [];
+                const directList = Array.isArray(directStores)
+                  ? directStores.map((s: any) => (typeof s === "string" ? s : s?.code ?? s?.store ?? s?.store_code ?? "")).filter(Boolean)
+                  : [];
+                if (directList.length > 0) {
+                  storeCodes = Array.from(new Set(directList)) as string[];
+                  console.log(`📦 Store codes from TO direct list (stores/store_codes):`, storeCodes);
+                }
+              }
+
+              console.log(`📦 Store codes from API TO:`, storeCodes);
+              console.log(`📦 Raw allocations from API:`, allocations.slice(0, 5).map((a: any) => ({
+                store: storeFromAlloc(a),
                 item: a.item_code,
-                allocated_qty: a.allocated_qty || a.qty 
+                allocated_qty: a.allocated_qty || a.qty,
               })));
 
               // Set stores from API data (NOT from cache)
-              setDistributionStores(allocationStoreCodes.sort());
+              setDistributionStores(storeCodes.sort());
               
               // Log which stores are in master for reference (but don't filter)
               if (warehousesAndStores.length > 0) {
@@ -555,12 +627,30 @@ export default function BoxManagementScreen() {
                 }
               }
             } else {
-              // No allocations in TO - show empty list
-              console.log(`⚠️ No allocations found in TO response from API`);
-              console.log(`⚠️ toData structure:`, JSON.stringify(toData, null, 2));
-              console.log(`⚠️ Available fields in toData:`, toData ? Object.keys(toData) : "null");
-              console.log(`ℹ️ No allocations in TO - showing empty store list`);
-              setDistributionStores([]);
+              // No allocations in TO - try ASN details for stores (ASN may have store per line)
+              console.log(`⚠️ No allocations/stores in TO response - trying ASN details...`);
+              try {
+                const asnRes = await apiService.getASN(activeASN);
+                const asnData = asnRes?.data || asnRes;
+                const details: any[] = asnData?.details || asnData?.lines || asnData?.items || asnData?.data?.details || [];
+                const storeFromRow = (r: any) => r.store || r.store_code || r.destination || r.to_store || r.warehouse || r.destination_store;
+                const storesFromDetails = Array.from(new Set(
+                  details.map((r: any) => storeFromRow(r)).filter((s: any) => s && String(s).trim() !== "")
+                )) as string[];
+                const directStoresFromASN = asnData?.stores || asnData?.store_codes || asnData?.destinations || [];
+                const directList = Array.isArray(directStoresFromASN)
+                  ? directStoresFromASN.map((s: any) => (typeof s === "string" ? s : s?.code ?? s?.store ?? "")).filter(Boolean)
+                  : [];
+                const allStoresFromASN = storesFromDetails.length > 0 ? storesFromDetails : directList;
+                if (allStoresFromASN.length > 0) {
+                  setDistributionStores(Array.from(new Set(allStoresFromASN)).sort());
+                  console.log(`✅ Stores from ASN details (TO had no allocations):`, allStoresFromASN);
+                } else {
+                  setDistributionStores([]);
+                }
+              } catch (_) {
+                setDistributionStores([]);
+              }
             }
           } else {
             // No Transfer Order found - show empty list
@@ -1584,7 +1674,56 @@ export default function BoxManagementScreen() {
         ? `BOX ${boxId} closed successfully.\n\nThis is a ${isPutawayBox ? 'putaway' : 'warehouse'} box. You can navigate to Putaway screen when ready.`
         : `BOX ${boxId} closed successfully.`;
       
-      Alert.alert("Success", message);
+      // ✅ PERMANENT FIX: Check if there are open cartons for other stores
+      // If yes, stay on screen; if no, navigate to main menu
+      let hasOpenCartons = false;
+      if (activeASN && activeSession) {
+        try {
+          const allCartonStatuses = await dataService.getAllCartonStatuses(
+            activeASN,
+            activeSession
+          );
+          // Check if there are any cartons that are not "Received" (i.e., still open)
+          // Valid statuses: "Pending" | "Unloaded" | "Receiving" | "Received"
+          hasOpenCartons = allCartonStatuses.some(
+            (status) => status.status !== "Received"
+          );
+          console.log(
+            `🔍 Open cartons check: ${hasOpenCartons ? "Found" : "No"} open cartons`
+          );
+        } catch (error: any) {
+          console.warn(
+            `⚠️ Could not check for open cartons:`,
+            error.message
+          );
+          // If check fails, assume there might be open cartons (safer to stay)
+          hasOpenCartons = true;
+        }
+      }
+      
+      Alert.alert(
+        "Success",
+        message,
+        [
+          {
+            text: "OK",
+            onPress: () => {
+              // If no open cartons, navigate to main menu
+              // If there are open cartons, stay on current screen
+              if (!hasOpenCartons) {
+                console.log(
+                  `✅ No open cartons - navigating to Home screen`
+                );
+                (navigation as any).navigate("Home");
+              } else {
+                console.log(
+                  `ℹ️ Open cartons exist - staying on Box Management screen`
+                );
+              }
+            },
+          },
+        ]
+      );
     } catch (error: any) {
       console.error("❌ Error closing box:", error);
       
@@ -2451,13 +2590,41 @@ export default function BoxManagementScreen() {
       <View style={styles.content}>
         {/* Show Transfer Order info if available */}
         {/* ✅ DATA SOURCE: Transfer Order ALWAYS comes from backend API (GET /api/transfer-order/by-asn/{asn}) - NOT from local cache */}
-        {transferOrder && (
+        {(transferOrder || activeASN) && (
           <View style={styles.toInfoSection}>
-            <Text style={styles.toInfoText}>
-              Transfer Order: <Text style={styles.toInfoValue}>{transferOrder}</Text>
-            </Text>
-            {/* Debug info (can be removed in production) */}
-            {__DEV__ && (
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+              <Text style={styles.toInfoText}>
+                {transferOrder ? (
+                  <>Transfer Order: <Text style={styles.toInfoValue}>{transferOrder}</Text></>
+                ) : (
+                  <>ASN: <Text style={styles.toInfoValue}>{activeASN}</Text></>
+                )}
+              </Text>
+              <TouchableOpacity
+                style={[styles.refreshTOButton, refreshingTO && { opacity: 0.6 }]}
+                onPress={async () => {
+                  if (refreshingTO || !activeASN) return;
+                  setRefreshingTO(true);
+                  try {
+                    await loadTransferOrderAndStores();
+                    await loadBoxes();
+                    if (activeASN) {
+                      await checkItemsWithoutTO();
+                      await calculateRemainingItems();
+                    }
+                    Alert.alert("Refreshed", "Transfer Order and stores have been reloaded from the backend. You can now create boxes per store.");
+                  } catch (e: any) {
+                    Alert.alert("Refresh failed", e?.message || "Could not refresh. Check connection and try again.");
+                  } finally {
+                    setRefreshingTO(false);
+                  }
+                }}
+                disabled={refreshingTO}
+              >
+                <Text style={styles.refreshTOButtonText}>{refreshingTO ? "Refreshing…" : "Refresh TO & Stores"}</Text>
+              </TouchableOpacity>
+            </View>
+            {__DEV__ && transferOrder && (
               <Text style={[styles.toInfoText, { fontSize: 10, color: "#666", marginTop: 4 }]}>
                 Source: Backend API (always fetched directly, not from cache)
               </Text>
@@ -2856,8 +3023,8 @@ export default function BoxManagementScreen() {
         {transferOrder && stores.length > 0 ? (
           stores.map((store) => {
             const storeBoxes = boxesByStore[store] || [];
-            const openCount = storeBoxes.filter((b) => b.status === "Open").length;
-            const closedCount = storeBoxes.filter((b) => b.status === "Closed").length;
+            const openCount = storeBoxes.filter((b) => b.status === "Open" || b.status === "OPEN" || b.status === "open").length;
+            const closedCount = storeBoxes.filter((b) => b.status === "Closed" || b.status === "CLOSED" || b.status === "closed").length;
             const totalCount = storeBoxes.length;
             const isCreating = loading && selectedStore === store;
 
@@ -2889,7 +3056,9 @@ export default function BoxManagementScreen() {
                   const displayBoxes = boxesByStoreForDisplay[store] || [];
                   return displayBoxes.length === 0 ? (
                     <Text style={styles.emptyText}>
-                      No boxes created for {store} yet
+                      {totalCount === 0
+                        ? `No boxes created for ${store} yet`
+                        : `${closedCount} closed box${closedCount === 1 ? "" : "es"} — go to Packing to create Transfer Carton`}
                     </Text>
                   ) : (
                     <FlatList
@@ -3029,7 +3198,7 @@ export default function BoxManagementScreen() {
             <Text style={styles.sectionTitle}>Create New BOX</Text>
             <Text style={styles.emptyText}>
               {distributionStores.length === 0
-                ? "No stores found in Transfer Order. Please check the TO allocations or wait for stores to load."
+                ? "No stores found in Transfer Order.\n\nEnsure GET /api/transfer-order/by-asn/{ASN} returns allocations (each with store or store_code) or a stores array so you can create boxes per store."
                 : "Loading stores from Transfer Order..."}
             </Text>
             {/* Show stores if they exist but weren't displayed above */}
@@ -3600,6 +3769,17 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#007AFF",
     fontWeight: "bold",
+  },
+  refreshTOButton: {
+    backgroundColor: "#007AFF",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  refreshTOButtonText: {
+    color: "#FFF",
+    fontSize: 13,
+    fontWeight: "600",
   },
   putawaySection: {
     backgroundColor: "#FFF3E0",

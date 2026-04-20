@@ -2,6 +2,7 @@ import { ItemMaster } from "../types";
 import { getSettings } from "./settings.service";
 import { apiService } from "./api.service";
 import { getDatabase } from "../database/database";
+import { normalizeItemMasterBarcode } from "../utils/itemMasterBarcode";
 
 /**
  * Resolve item_code from barcode or item code
@@ -89,7 +90,10 @@ export const resolveItemFromBarcode = async (
 
       // Fetch all items from backend and search
       // Catch network errors gracefully - fallback to local database is expected
-      const response = await apiService.pullItemMaster().catch((error: any) => {
+      const { fetchAllItemMasterRowsForLookup } = await import(
+        "./item-master-sync.service"
+      );
+      const response = await fetchAllItemMasterRowsForLookup().catch((error: any) => {
         // Check if it's a network error (expected when offline or server unavailable)
         const isNetworkError =
           error?.message?.includes("Network") ||
@@ -178,7 +182,6 @@ export const resolveItemFromBarcode = async (
           // Prioritize item_code from backend - only use barcode as fallback if item_code is truly missing
           // This ensures we get the correct item_code (e.g., "SKU-TSHIRT-001-BLK-S") not the barcode (e.g., "1234567890124")
           let resolvedItemCode = foundItem.item_code;
-          let resolvedBarcode = foundItem.barcode;
 
           // If item_code is missing or empty, try to use barcode, but log a warning
           if (!resolvedItemCode || resolvedItemCode.trim() === "") {
@@ -189,10 +192,10 @@ export const resolveItemFromBarcode = async (
             resolvedItemCode = foundItem.barcode || originalInput;
           }
 
-          // If barcode is missing, use item_code as barcode (for items that use item_code as barcode)
-          if (!resolvedBarcode || resolvedBarcode.trim() === "") {
-            resolvedBarcode = foundItem.item_code || originalInput;
-          }
+          const resolvedBarcode = normalizeItemMasterBarcode(
+            foundItem.barcode,
+            String(resolvedItemCode).trim()
+          );
 
           // Ensure we have at least one identifier
           if (!resolvedItemCode || resolvedItemCode.trim() === "") {

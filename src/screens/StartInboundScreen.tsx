@@ -258,8 +258,73 @@ export default function StartInboundScreen() {
       return;
     }
 
-    // STEP 4: ASN is valid - proceed with normal flow
-    console.log(`✅ ASN ${scannedASN} is valid, proceeding...`);
+    // STEP 4: Check if ASN has completed putaway
+    let hasCompletedPutaway = false;
+    try {
+      const settings = await getSettings();
+      if (settings.api_url && settings.demo_mode !== 1) {
+        console.log(`🔍 Checking putaway status for ASN ${scannedASN}...`);
+        const putawayTasks = await apiService.getPutawayTasks({
+          asn_no: scannedASN,
+        });
+        
+        let tasksList: any[] = [];
+        if (Array.isArray(putawayTasks)) {
+          tasksList = putawayTasks;
+        } else if (putawayTasks?.data && Array.isArray(putawayTasks.data)) {
+          tasksList = putawayTasks.data;
+        } else if (putawayTasks?.tasks && Array.isArray(putawayTasks.tasks)) {
+          tasksList = putawayTasks.tasks;
+        }
+        
+        // Check if all putaway tasks for this ASN are completed
+        const asnTasks = tasksList.filter((t: any) => {
+          const taskASN = t.asn_no || t.advance_shipping_notice || "";
+          return normalizeASN(taskASN) === normalizeASN(scannedASN) ||
+                 taskASN.toUpperCase().trim() === scannedASN.toUpperCase().trim();
+        });
+        
+        if (asnTasks.length > 0) {
+          const allCompleted = asnTasks.every((t: any) => {
+            const status = (t.status || "").toUpperCase();
+            return status === "COMPLETED" || status === "CLOSED";
+          });
+          
+          if (allCompleted) {
+            hasCompletedPutaway = true;
+            console.log(`⚠️ ASN ${scannedASN} has completed putaway - all ${asnTasks.length} task(s) are completed`);
+          } else {
+            console.log(`✅ ASN ${scannedASN} has ${asnTasks.length} putaway task(s), not all completed`);
+          }
+        } else {
+          console.log(`ℹ️ No putaway tasks found for ASN ${scannedASN}`);
+        }
+      }
+    } catch (putawayCheckError: any) {
+      // If putaway check fails, allow proceeding (might be network issue or API not available)
+      console.warn(`⚠️ Could not check putaway status:`, putawayCheckError.message);
+    }
+    
+    // STEP 5: If putaway is completed, show warning and clear ASN
+    if (hasCompletedPutaway) {
+      Alert.alert(
+        "Putaway Already Completed",
+        `ASN ${scannedASN} has already completed putaway.\n\nThis ASN should not be used for new inbound sessions.`,
+        [
+          {
+            text: "OK",
+            onPress: () => {
+              setAsnNo(""); // Clear the ASN input
+              setActiveASN(""); // Clear active ASN
+            },
+          },
+        ]
+      );
+      return; // Don't proceed with this ASN
+    }
+
+    // STEP 6: ASN is valid and putaway not completed - proceed with normal flow
+    console.log(`✅ ASN ${scannedASN} is valid and putaway not completed, proceeding...`);
 
     // Preserve the original scanned format for display
     setAsnNo(scannedASN);
@@ -546,25 +611,105 @@ export default function StartInboundScreen() {
         );
 
         try {
-          const toData = await apiService.getTransferOrderByASN(asnToQuery);
-          if (toData && toData.to_no) {
-            setTransferOrder(toData.to_no);
-            setTransferOrders([toData.to_no]);
+          const toResponse = await apiService.getTransferOrderByASN(asnToQuery);
+          const toData =
+            toResponse?.data ||
+            (typeof toResponse?.transfer_order === "object"
+              ? toResponse?.transfer_order
+              : null) ||
+            toResponse;
 
-            // Cache transfer order allocations
-            if (toData.allocations) {
+          const extractToNumber = (obj: any): string | undefined => {
+            if (!obj || typeof obj !== "object") return undefined;
+            const v =
+              obj.to_no ||
+              obj.transfer_order ||
+              obj.to_number ||
+              obj.transfer_order_no ||
+              obj.linked_to ||
+              obj.linked_transfer_order ||
+              obj.document_name ||
+              obj.name ||
+              obj.title ||
+              obj.id;
+            return v != null && String(v).trim().length > 0
+              ? String(v).trim()
+              : undefined;
+          };
+
+          let toNo = extractToNumber(toData);
+          let allocations =
+            toData?.allocations ||
+            toData?.items ||
+            toData?.item_lines ||
+            toData?.allocation ||
+            toData?.line_items ||
+            toData?.lines ||
+            toResponse?.allocations ||
+            toResponse?.items ||
+            [];
+
+          // Same pattern as BoxManagementScreen: by-asn may 404 or return ERP-style
+          // `{ name: "WMS-TO-00001" }` until export; ASN details may still list the linked TO.
+          if (!toNo || toResponse === null) {
+            try {
+              const asnRes = await apiService.getASN(asnToQuery);
+              const asnData = asnRes?.data || asnRes;
+              const fromAsn =
+                asnData?.transfer_order ||
+                asnData?.to_no ||
+                asnData?.transfer_order_no ||
+                asnData?.linked_to ||
+                asnData?.linked_transfer_order;
+              if (fromAsn && String(fromAsn).trim()) {
+                toNo = String(fromAsn).trim();
+              }
+              if (
+                (!allocations || !Array.isArray(allocations) || allocations.length === 0) &&
+                asnData
+              ) {
+                const fromLines =
+                  asnData.details ||
+                  asnData.lines ||
+                  asnData.items ||
+                  asnData?.data?.details ||
+                  [];
+                if (Array.isArray(fromLines) && fromLines.length > 0) {
+                  allocations = fromLines;
+                }
+              }
+            } catch (asnErr: any) {
+              console.warn(
+                "⚠️ StartInbound: ASN fallback for Transfer Order:",
+                asnErr?.message
+              );
+            }
+          }
+
+          const hasValidTO =
+            !!toNo && String(toNo).trim().length > 0;
+          if (hasValidTO) {
+            const toNoStr = String(toNo).trim();
+            setTransferOrder(toNoStr);
+            setTransferOrders([toNoStr]);
+
+            if (allocations && Array.isArray(allocations)) {
               const db = await getDatabase();
-              for (const alloc of toData.allocations) {
-                await db.runAsync(
-                  "INSERT OR REPLACE INTO transfer_order_cache (to_no, asn_no, store, item_code, allocated_qty) VALUES (?, ?, ?, ?, ?)",
-                  [
-                    toData.to_no,
-                    asn,
-                    alloc.store,
-                    alloc.item_code,
-                    alloc.allocated_qty,
-                  ]
-                );
+              for (const alloc of allocations) {
+                const store = alloc.store || alloc.store_code;
+                const itemCode = alloc.item_code ?? "";
+                if (store) {
+                  await db.runAsync(
+                    "INSERT OR REPLACE INTO transfer_order_cache (to_no, asn_no, store, item_code, allocated_qty) VALUES (?, ?, ?, ?, ?)",
+                    [
+                      toNoStr,
+                      asn,
+                      store,
+                      itemCode || "",
+                      alloc.allocated_qty ?? alloc.qty ?? 0,
+                    ]
+                  );
+                }
               }
             }
           } else {
@@ -661,6 +806,55 @@ export default function StartInboundScreen() {
         }
 
         if (asnToUse) {
+          // ✅ Check if ASN has completed putaway before restoring
+          let hasCompletedPutaway = false;
+          try {
+            const settings = await getSettings();
+            if (settings.api_url && settings.demo_mode !== 1) {
+              console.log(`🔍 Checking putaway status for ASN ${asnToUse} (on screen focus)...`);
+              const putawayTasks = await apiService.getPutawayTasks({
+                asn_no: asnToUse,
+              });
+              
+              let tasksList: any[] = [];
+              if (Array.isArray(putawayTasks)) {
+                tasksList = putawayTasks;
+              } else if (putawayTasks?.data && Array.isArray(putawayTasks.data)) {
+                tasksList = putawayTasks.data;
+              } else if (putawayTasks?.tasks && Array.isArray(putawayTasks.tasks)) {
+                tasksList = putawayTasks.tasks;
+              }
+              
+              const asnTasks = tasksList.filter((t: any) => {
+                const taskASN = t.asn_no || t.advance_shipping_notice || "";
+                return normalizeASN(taskASN) === normalizeASN(asnToUse) ||
+                       taskASN.toUpperCase().trim() === asnToUse.toUpperCase().trim();
+              });
+              
+              if (asnTasks.length > 0) {
+                const allCompleted = asnTasks.every((t: any) => {
+                  const status = (t.status || "").toUpperCase();
+                  return status === "COMPLETED" || status === "CLOSED";
+                });
+                
+                if (allCompleted) {
+                  hasCompletedPutaway = true;
+                  console.log(`⚠️ ASN ${asnToUse} has completed putaway - clearing from screen`);
+                }
+              }
+            }
+          } catch (putawayCheckError: any) {
+            console.warn(`⚠️ Could not check putaway status on focus:`, putawayCheckError.message);
+          }
+          
+          // If putaway is completed, clear the ASN
+          if (hasCompletedPutaway) {
+            console.log(`🧹 Clearing ASN ${asnToUse} - putaway already completed`);
+            setAsnNo("");
+            setActiveASN("");
+            return; // Don't restore this ASN
+          }
+          
           // Only set the ASN in state if it's different (avoid unnecessary updates)
           if (!asnNo || asnNo.trim() !== asnToUse.trim()) {
             console.log(`📝 Setting asnNo state to: ${asnToUse}`);
@@ -1156,17 +1350,20 @@ export default function StartInboundScreen() {
               `⚠️ No cartons found for ASN ${normalizedASN} after all attempts.`
             );
 
-            // Show alert with option to proceed (backend endpoint doesn't exist - 404 error)
+            // Show alert with option to proceed (API returned no cartons or 404)
             const proceedWithoutCartons = await new Promise<boolean>(
               (resolve) => {
                 Alert.alert(
                   "No Cartons Found",
                   `No cartons found for ASN ${scannedASN}.\n\n` +
-                    `The backend API endpoint /api/asn/{asn_no} is not implemented (404 error).\n\n` +
+                    `The server returned no carton data (or 404). This can mean:\n` +
+                    `• The ASN does not exist on the server yet, or\n` +
+                    `• The server expects a different ASN format (e.g. ASN-7 vs ASN-0007), or\n` +
+                    `• GET /api/asn/{asn_no} is not implemented.\n\n` +
                     `Options:\n` +
-                    `1. Scan cartons manually in Unload screen (they will be added automatically)\n` +
+                    `1. Scan cartons in Unload screen (they will be added automatically)\n` +
                     `2. Sync ASN data from desktop using Sync Center\n` +
-                    `3. Ensure backend implements GET /api/asn/{asn_no} endpoint\n\n` +
+                    `3. On the backend, ensure ASN "${scannedASN}" exists and GET /api/asn/${scannedASN} returns carton details\n\n` +
                     `You can proceed to Unload screen and scan cartons - they will be recognized automatically.`,
                   [
                     {
@@ -1518,6 +1715,54 @@ export default function StartInboundScreen() {
           `ASN ${scannedASN} was not found.\n\nPlease check the ASN number and try again.`,
           [{ text: "OK" }]
         );
+        return;
+      }
+
+      // ✅ Final check: Verify putaway is not completed before creating session
+      let hasCompletedPutaway = false;
+      try {
+        if (settings.api_url && settings.demo_mode !== 1) {
+          const putawayTasks = await apiService.getPutawayTasks({
+            asn_no: scannedASN,
+          });
+          
+          let tasksList: any[] = [];
+          if (Array.isArray(putawayTasks)) {
+            tasksList = putawayTasks;
+          } else if (putawayTasks?.data && Array.isArray(putawayTasks.data)) {
+            tasksList = putawayTasks.data;
+          } else if (putawayTasks?.tasks && Array.isArray(putawayTasks.tasks)) {
+            tasksList = putawayTasks.tasks;
+          }
+          
+          const asnTasks = tasksList.filter((t: any) => {
+            const taskASN = t.asn_no || t.advance_shipping_notice || "";
+            return normalizeASN(taskASN) === normalizeASN(scannedASN) ||
+                   taskASN.toUpperCase().trim() === scannedASN.toUpperCase().trim();
+          });
+          
+          if (asnTasks.length > 0) {
+            const allCompleted = asnTasks.every((t: any) => {
+              const status = (t.status || "").toUpperCase();
+              return status === "COMPLETED" || status === "CLOSED";
+            });
+            
+            if (allCompleted) {
+              hasCompletedPutaway = true;
+            }
+          }
+        }
+      } catch (putawayCheckError: any) {
+        console.warn(`⚠️ Could not check putaway status in handleStart:`, putawayCheckError.message);
+      }
+      
+      if (hasCompletedPutaway) {
+        Alert.alert(
+          "Putaway Already Completed",
+          `ASN ${scannedASN} has already completed putaway.\n\nCannot create a new inbound session for this ASN.`,
+          [{ text: "OK" }]
+        );
+        setAsnNo(""); // Clear the ASN
         return;
       }
 

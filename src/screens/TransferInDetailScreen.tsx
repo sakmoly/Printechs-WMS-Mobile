@@ -189,45 +189,6 @@ export default function TransferInDetailScreen() {
     );
   };
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "Draft":
-        return "#9E9E9E";
-      case "Submitted":
-        return "#2196F3";
-      case "In Transit":
-        return "#FF9800";
-      case "Received":
-        return "#9C27B0";
-      case "Completed":
-        return "#4CAF50";
-      case "Cancelled":
-        return "#F44336";
-      default:
-        return "#9E9E9E";
-    }
-  };
-
-  const getItemStatusColor = (status?: string, receivedQty: number = 0, qty: number = 0): string => {
-    // Use backend status if available, otherwise calculate from received_qty
-    if (status) {
-      switch (status) {
-        case "Pending":
-          return "#9E9E9E";
-        case "Picking":
-          return "#FF9800";
-        case "Received":
-          return "#4CAF50";
-        default:
-          return "#9E9E9E";
-      }
-    }
-    // Fallback: calculate status from received_qty
-    if (receivedQty === 0) return "#9E9E9E"; // Pending
-    if (receivedQty >= qty) return "#4CAF50"; // Received
-    return "#FF9800"; // Picking
-  };
-
   const getItemStatusLabel = (status?: string, receivedQty: number = 0, qty: number = 0): string => {
     // Use backend status if available, otherwise calculate from received_qty
     if (status) {
@@ -244,7 +205,6 @@ export default function TransferInDetailScreen() {
     const remainingQty = item.qty - receivedQty;
     const progress = item.qty > 0 ? (receivedQty / item.qty) * 100 : 0;
     const itemStatus = getItemStatusLabel(item.status, receivedQty, item.qty);
-    const statusColor = getItemStatusColor(item.status, receivedQty, item.qty);
 
     return (
       <View style={styles.itemCard}>
@@ -252,7 +212,6 @@ export default function TransferInDetailScreen() {
           <Text style={styles.itemCode}>{item.item_code}</Text>
           <StatusBadge
             status={itemStatus}
-            color={statusColor}
           />
         </View>
         <View style={styles.itemDetails}>
@@ -328,9 +287,19 @@ export default function TransferInDetailScreen() {
         <Text style={styles.title}>{transferIn.title}</Text>
         <StatusBadge
           status={transferIn.status}
-          color={getStatusColor(transferIn.status)}
         />
       </View>
+
+      {(transferIn.status === "Submitted" || transferIn.status === "In Transit" || transferIn.status === "Receiving") && (
+        <View style={styles.actionSection}>
+          <TouchableOpacity
+            style={styles.startButton}
+            onPress={handleStartReceiving}
+          >
+            <Text style={styles.startButtonText}>Start Receiving</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Transfer Information</Text>
@@ -427,17 +396,6 @@ export default function TransferInDetailScreen() {
           scrollEnabled={false}
         />
       </View>
-
-      {(transferIn.status === "Submitted" || transferIn.status === "In Transit" || transferIn.status === "Receiving") && (
-        <View style={styles.actionSection}>
-          <TouchableOpacity
-            style={styles.startButton}
-            onPress={handleStartReceiving}
-          >
-            <Text style={styles.startButtonText}>Start Receiving</Text>
-          </TouchableOpacity>
-        </View>
-      )}
 
       {transferIn.status === "Received" && (
         <View style={styles.actionSection}>
@@ -619,7 +577,7 @@ const styles = StyleSheet.create({
   },
   actionSection: {
     padding: 16,
-    paddingBottom: 32,
+    paddingBottom: 16,
   },
   startButton: {
     backgroundColor: "#2196F3",

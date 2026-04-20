@@ -17,8 +17,12 @@ import {
   clearErrorMessages,
 } from "../services/event-queue.service";
 import { dataService } from "../services/data.service";
-import { syncMasterDataFromDesktop } from "../services/master-data-sync.service";
+import {
+  syncMasterDataFromDesktop,
+  type MasterSyncProgress,
+} from "../services/master-data-sync.service";
 import { syncAllUnsyncedSessions } from "../services/session-sync.service";
+import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
 import { normalizeASN } from "../utils/asn";
 import { ScanEvent } from "../types";
 
@@ -27,7 +31,11 @@ export default function SyncCenterScreen() {
   const [events, setEvents] = useState<ScanEvent[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
+  const [syncStatusLine, setSyncStatusLine] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+
+  const formatMasterProgress = (p: MasterSyncProgress) =>
+    `${p.phase} (${p.step}/${p.totalSteps})${p.detail ? ` — ${p.detail}` : ""}`;
 
   useEffect(() => {
     loadEvents();
@@ -40,11 +48,17 @@ export default function SyncCenterScreen() {
 
   const handleSync = async () => {
     setSyncing(true);
+    setSyncStatusLine("");
     try {
       // First sync master data from desktop
       setSyncingMasters(true);
+      setSyncStatusLine("Master data: starting…");
       try {
-        const masterResult = await syncMasterDataFromDesktop();
+        const masterResult = await syncMasterDataFromDesktop({
+          onProgress: (p) => {
+            setSyncStatusLine(`Master data: ${formatMasterProgress(p)}`);
+          },
+        });
         setSyncingMasters(false);
 
         const masterSummary = `
@@ -65,6 +79,7 @@ Item Barcode Map: ${masterResult.itemBarcodeMap.synced} synced, ${masterResult.i
       } catch (error: any) {
         setSyncingMasters(false);
         console.error("Master data sync error:", error);
+        setSyncStatusLine("Master data: error (continuing with sessions & events)…");
         // Continue with event sync even if master sync fails
       }
 
@@ -72,6 +87,7 @@ Item Barcode Map: ${masterResult.itemBarcodeMap.synced} synced, ${masterResult.i
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Sync sessions to backend
+      setSyncStatusLine("Sessions: uploading…");
       try {
         const sessionResult = await syncAllUnsyncedSessions();
         console.log(
@@ -86,15 +102,33 @@ Item Barcode Map: ${masterResult.itemBarcodeMap.synced} synced, ${masterResult.i
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       // Then sync events to desktop
+      setSyncStatusLine("Events: uploading…");
       const result = await syncEvents();
       await loadEvents();
       await refreshPendingEvents();
 
+      // Resend receive lines for active inbound session so backend Recvd Qty stays in sync
+      let receiveResendMsg = "";
+      if (activeASN && activeSession) {
+        setSyncStatusLine("Receive data: syncing with backend…");
+        try {
+          const resend = await resendReceiveLinesToBackend(activeASN, activeSession);
+          if (resend.linesSent > 0) {
+            receiveResendMsg = `\nReceive data: ${resend.linesSent} line(s) from ${resend.cartonsSent} carton(s) resent.`;
+          }
+        } catch (e: any) {
+          console.warn("Resend receive lines during sync failed:", e?.message);
+          receiveResendMsg = "\nReceive data resend failed (see console).";
+        }
+      }
+
+      setSyncStatusLine("");
       Alert.alert(
         "Sync Complete",
-        `Events synced: ${result.synced}\nEvents failed: ${result.failed}\n\nMaster data and sessions have been synced.`
+        `Events synced: ${result.synced}\nEvents failed: ${result.failed}\n\nMaster data and sessions have been synced.${receiveResendMsg}`
       );
     } catch (error: any) {
+      setSyncStatusLine("");
       Alert.alert("Sync Error", error.message || "Failed to sync events");
     } finally {
       setSyncing(false);
@@ -221,6 +255,10 @@ ${
             <Text style={styles.syncButtonText}>Sync Now</Text>
           )}
         </TouchableOpacity>
+
+        {syncStatusLine ? (
+          <Text style={styles.syncStatusText}>{syncStatusLine}</Text>
+        ) : null}
 
         {activeASN && (
           <TouchableOpacity
@@ -393,6 +431,12 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
+  },
+  syncStatusText: {
+    fontSize: 14,
+    color: "#333",
+    marginBottom: 14,
+    lineHeight: 20,
   },
   verifyButton: {
     backgroundColor: "#2196F3",

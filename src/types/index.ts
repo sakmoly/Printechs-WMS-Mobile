@@ -1,3 +1,6 @@
+/** Item master sync: full replaces local table; incremental uses modified_since watermark. */
+export type ItemMasterSyncMode = "full" | "incremental";
+
 export interface Settings {
   api_url?: string;
   device_id?: string;
@@ -9,6 +12,12 @@ export interface Settings {
   active_session?: string;
   auth_token?: string;
   auth_token_expires?: string;
+  /** Default full. Incremental uses item_master_modified_watermark when set. */
+  item_master_sync_mode?: ItemMasterSyncMode | string | null;
+  /** Server page size (rows per request). Default 5000. */
+  item_master_page_size?: number | null;
+  /** ISO timestamp: last successful incremental sync high-water mark. */
+  item_master_modified_watermark?: string | null;
 }
 
 export interface ASNItem {

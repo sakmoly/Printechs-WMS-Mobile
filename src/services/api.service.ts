@@ -1,7 +1,20 @@
 import { getSettings } from "./settings.service";
 import { ScanEvent } from "../types";
 
+/** Query params for GET /api/master/items (paging + incremental). */
+export type PullItemMasterParams = {
+  limit?: number;
+  offset?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+  after_item_code?: string;
+  after_modified?: string;
+  modified_since?: string;
+};
+
 const API_TIMEOUT = 10000;
+/** Large JSON payloads (paged item master). */
+const ITEM_MASTER_API_TIMEOUT_MS = 120000;
 
 // Login/Authentication function
 const authenticate = async (): Promise<string | null> => {
@@ -131,7 +144,8 @@ const makeRequest = async (
   endpoint: string,
   method: string,
   body?: any,
-  retryAuth = true
+  retryAuth = true,
+  timeoutMs?: number
 ) => {
   const settings = await getSettings();
 
@@ -213,8 +227,9 @@ const makeRequest = async (
     console.warn(`⚠️ No auth token available for request`);
   }
 
+  const effectiveTimeout = timeoutMs ?? API_TIMEOUT;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT);
+  const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
   try {
     const headers: Record<string, string> = {
@@ -812,7 +827,7 @@ const makeRequest = async (
   } catch (error: any) {
     clearTimeout(timeoutId);
     if (error.name === "AbortError") {
-      throw new Error(`Request timeout after ${API_TIMEOUT}ms: ${url}`);
+      throw new Error(`Request timeout after ${effectiveTimeout}ms: ${url}`);
     }
     if (error.message && error.message.includes("API error")) {
       // Check if this is a picking endpoint 404 (handled gracefully)
@@ -1045,9 +1060,16 @@ const simulateApiResponse = async (
     return [];
   }
 
-  // Master Data Pull APIs
-  if (endpoint === "/api/master/items") {
-    return [
+  // Master Data Pull APIs — paged item master (demo)
+  if (endpoint.startsWith("/api/master/items")) {
+    const query = endpoint.includes("?") ? endpoint.split("?")[1] : "";
+    const sp = new URLSearchParams(query);
+    const limit = Math.min(
+      Math.max(parseInt(sp.get("limit") || "5000", 10) || 5000, 1),
+      20000
+    );
+    const offset = Math.max(parseInt(sp.get("offset") || "0", 10) || 0, 0);
+    const allItems = [
       {
         item_code: "ITEM-0001",
         barcode: "100000000001",
@@ -1060,7 +1082,22 @@ const simulateApiResponse = async (
         item_name: "Product 2",
         updated_on: new Date().toISOString(),
       },
+      {
+        item_code: "ITEM-0003",
+        barcode: "100000000003",
+        item_name: "Product 3",
+        updated_on: new Date().toISOString(),
+      },
     ];
+    const slice = allItems.slice(offset, offset + limit);
+    return {
+      items: slice,
+      total: allItems.length,
+      limit,
+      offset,
+      has_more: offset + slice.length < allItems.length,
+      next_offset: offset + slice.length,
+    };
   }
 
   if (endpoint === "/api/master/asns") {
@@ -1687,12 +1724,28 @@ export const apiService = {
     carton_id?: string;
     cartons?: Array<{ carton_id: string; status: string }>;
     status?: string;
+    locked_by?: string;
+    locked_on?: string;
     user_id?: string;
     device_id?: string;
   }) => {
     // Send status as-is: Mobile app uses "Receiving" (without space)
     // Backend must accept "Receiving" instead of "In Receiving"
     return makeRequest("/api/cartons/update-status", "POST", data);
+  },
+
+  /**
+   * Complete inbound session — tells the backend that receiving for this ASN is finished.
+   * Backend should set ASN status to "Completed" / "Received" and carton/receiving status accordingly.
+   * Call this when all cartons are received (e.g. after sync when all cartons are in "Received" state).
+   */
+  completeInboundSession: async (data: {
+    inbound_session: string;
+    asn_no: string;
+    user_id: string;
+    device_id: string;
+  }) => {
+    return makeRequest("/api/inbound/complete", "POST", data);
   },
 
   // Unload Line APIs
@@ -1895,12 +1948,24 @@ export const apiService = {
 
   // PULL APIs
   getASN: async (asn_no: string) => {
-    // Use ASN format exactly as received (no normalization)
-    // Backend returns ASNs in exact format from database (e.g., ASN-0001, ASN-0002)
-    console.log(
-      `🔄 getASN: Using ASN format "${asn_no}" (preserving exact format)`
-    );
-    return await makeRequest(`/api/asn/${asn_no}`, "GET");
+    const trimmed = asn_no.trim();
+    const encoded = encodeURIComponent(trimmed);
+    console.log(`🔄 getASN: Requesting /api/asn/${encoded} (original: "${trimmed}")`);
+    try {
+      return await makeRequest(`/api/asn/${encoded}`, "GET");
+    } catch (err: any) {
+      // If 404, backend may expect shorter format (e.g. ASN-7 instead of ASN-0007)
+      const is404 = err?.message?.includes("404") || err?.status === 404;
+      const match = trimmed.match(/^ASN-0+(\d+)$/i);
+      if (is404 && match) {
+        const shortFormat = `ASN-${match[1]}`;
+        if (shortFormat !== trimmed) {
+          console.log(`🔄 getASN: Retrying with shorter format /api/asn/${encodeURIComponent(shortFormat)}`);
+          return await makeRequest(`/api/asn/${encodeURIComponent(shortFormat)}`, "GET");
+        }
+      }
+      throw err;
+    }
   },
 
   getTransferOrderByASN: async (asn_no: string) => {
@@ -1978,8 +2043,23 @@ export const apiService = {
   },
 
   // Master Data Pull APIs (Desktop → Mobile)
-  pullItemMaster: async () => {
-    return makeRequest("/api/master/items", "GET");
+  pullItemMaster: async (params?: PullItemMasterParams) => {
+    let path = "/api/master/items";
+    if (params && Object.keys(params).length > 0) {
+      const q = new URLSearchParams();
+      if (params.limit != null) q.set("limit", String(params.limit));
+      if (params.offset != null) q.set("offset", String(params.offset));
+      if (params.sort) q.set("sort", params.sort);
+      if (params.order) q.set("order", params.order);
+      if (params.after_item_code)
+        q.set("after_item_code", params.after_item_code);
+      if (params.after_modified) q.set("after_modified", params.after_modified);
+      if (params.modified_since)
+        q.set("modified_since", params.modified_since);
+      const qs = q.toString();
+      if (qs) path += `?${qs}`;
+    }
+    return makeRequest(path, "GET", undefined, true, ITEM_MASTER_API_TIMEOUT_MS);
   },
 
   pullASNData: async () => {
@@ -2506,15 +2586,22 @@ export const apiService = {
     }
   },
 
-  // ✅ NEW: Validate Transfer In carton from tabsortbox (similar to ASN carton validation)
-  // Note: When validating carton, carton_id should be the BOX ID (TI-PUT-...), not the Carton ID (CTN-TI-...)
-  validateTransferInCarton: async (transferInNo: string, boxId: string) => {
-    // Validate carton exists in tabsortbox backend table using BOX ID
-    // This is similar to ASN validating from asn_carton_map
+  // ✅ Validate Transfer In carton/box. Body: box_id or carton_id (required), create_carton_if_missing (optional).
+  // When create_carton_if_missing is true, backend links an existing warehouse box to this Transfer In if not already linked.
+  validateTransferInCarton: async (
+    transferInNo: string,
+    boxId: string,
+    options?: { create_carton_if_missing?: boolean }
+  ) => {
     try {
-      return await makeRequest(`/api/transfer-in/${transferInNo}/validate-carton`, "POST", {
-        carton_id: boxId, // ✅ Pass BOX ID as carton_id when validating
-      });
+      const body: { box_id: string; carton_id?: string; create_carton_if_missing?: boolean } = {
+        box_id: boxId,
+        carton_id: boxId, // Backend may expect either; send both for compatibility
+      };
+      if (options?.create_carton_if_missing === true) {
+        body.create_carton_if_missing = true;
+      }
+      return await makeRequest(`/api/transfer-in/${transferInNo}/validate-carton`, "POST", body);
     } catch (error: any) {
       // ✅ Check if this is a database schema error (source_type column missing)
       const errorData = error?.data || error?.errorJson || error?.response?.data;
@@ -2632,8 +2719,7 @@ export const apiService = {
   
   /**
    * Complete full carton relocation - creates session and commits atomically
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { warehouse_id, user_id, from_bin, to_bin, from_carton, mode }
+   * Payload: { warehouse_id, user_id, from_bin, to_bin, from_carton, mode, create_carton_if_missing? }
    * Creates OUT from from_bin, IN to to_bin
    */
   completeRelocationFull: async (relocationData: {
@@ -2642,23 +2728,27 @@ export const apiService = {
     user_id: string;
     from_bin: string;
     to_bin: string;
-    from_carton: string; // ✅ CORRECT: Use from_carton (not carton_id)
+    from_carton: string;
+    create_carton_if_missing?: boolean;
   }) => {
-    return makeRequest(`/api/relocation/complete-full`, "POST", {
+    const body: any = {
       warehouse_id: relocationData.warehouse_id,
       user_id: relocationData.user_id,
       from_bin: relocationData.from_bin,
       to_bin: relocationData.to_bin,
       from_carton: relocationData.from_carton,
-      mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
-    });
+      mode: relocationData.mode,
+    };
+    if (relocationData.create_carton_if_missing === true) {
+      body.create_carton_if_missing = true;
+    }
+    return makeRequest(`/api/relocation/complete-full`, "POST", body);
   },
 
   /**
    * Complete partial relocation / carton merge - creates session and commits atomically
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { warehouse_id, user_id, from_carton, to_carton, from_bin, to_bin, mode, lines[] }
-   * Creates OUT old carton, IN new carton
+   * Payload: { warehouse_id, user_id, from_carton, to_carton, from_bin, to_bin, mode, lines[], create_carton_if_missing? }
+   * Creates OUT old carton, IN new carton. Use create_carton_if_missing when target carton does not exist yet.
    */
   completeRelocationPartial: async (relocationData: {
     mode: "PARTIAL_ITEMS" | "CARTON_TO_CARTON";
@@ -2668,18 +2758,23 @@ export const apiService = {
     to_bin: string;
     from_carton: string;
     to_carton: string;
-    lines: Array<{ item_code: string; qty: number }>; // ✅ CORRECT: Items in lines[] array
+    lines: Array<{ item_code: string; qty: number }>;
+    create_carton_if_missing?: boolean;
   }) => {
-    return makeRequest(`/api/relocation/complete-partial`, "POST", {
+    const body: any = {
       warehouse_id: relocationData.warehouse_id,
       user_id: relocationData.user_id,
       from_carton: relocationData.from_carton,
       to_carton: relocationData.to_carton,
       from_bin: relocationData.from_bin,
       to_bin: relocationData.to_bin,
-      mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
-      lines: relocationData.lines, // ✅ CORRECT: Items in lines[] array
-    });
+      mode: relocationData.mode,
+      lines: relocationData.lines,
+    };
+    if (relocationData.create_carton_if_missing === true) {
+      body.create_carton_if_missing = true;
+    }
+    return makeRequest(`/api/relocation/complete-partial`, "POST", body);
   },
 
   // ============================================
@@ -2780,8 +2875,8 @@ export const apiService = {
 
   /**
    * Pick items for Material Request
-   * ✅ CORRECT: Per actual backend API specification
-   * Payload: { user_id, items: [{ item_code, picked_qty, source_bin, carton_id }] }
+   * Payload: { items: [{ item_code, picked_qty, source_bin, carton_id }], user_id?, created_by? }
+   * Backend requires user_id or created_by for validation.
    * Must create OUT history, source_bin must be correct
    */
   pickMaterialRequestItems: async (
@@ -2789,28 +2884,31 @@ export const apiService = {
     items: Array<{
       item_code: string;
       picked_qty: number;    // ✅ CORRECT: picked_qty (not qty)
-      source_bin: string;    // ✅ CORRECT: source_bin (not bin_location)
-      carton_id?: string;    // Optional carton_id for carton-level inventory
+      source_bin: string;   // ✅ CORRECT: source_bin (not bin_location)
+      carton_id?: string;   // Optional carton_id for carton-level inventory
     }>,
     warehouse?: string,
-    user_id?: string
+    user_id?: string  // Required by backend; falls back to settings.user_id / user_code
   ) => {
-    // Get user_id from settings if not provided
-    let userId = user_id;
-    if (!userId) {
+    // Resolve user_id/created_by: backend requires one of them
+    let resolvedUserId = user_id;
+    if (!resolvedUserId || resolvedUserId.trim() === "") {
       const settings = await getSettings();
-      userId = settings.user_id || settings.user_code || "";
+      resolvedUserId = settings.user_id || settings.user_code || "";
+    }
+    if (!resolvedUserId || resolvedUserId.trim() === "") {
+      throw new Error("user_id or created_by is required. Please set User ID / User Code in Settings.");
     }
 
-    // ✅ CORRECT: Build request body per actual backend API specification
     const requestBody: any = {
-      user_id: userId,
       items: items.map(item => ({
         item_code: item.item_code,
-        picked_qty: item.picked_qty,   // ✅ CORRECT: picked_qty (not qty)
-        source_bin: item.source_bin,   // ✅ CORRECT: source_bin (not bin_location)
+        picked_qty: item.picked_qty,
+        source_bin: item.source_bin,
         carton_id: item.carton_id,
       })),
+      user_id: resolvedUserId,
+      created_by: resolvedUserId,
     };
 
     console.warn(
@@ -2864,14 +2962,16 @@ export const apiService = {
   // ✅ NEW: Picking Flow APIs
   // Note: These APIs may not be implemented on backend yet
   // They will gracefully fail and use local storage only
-  startPickingSession: async (materialRequestTitle: string, user_id: string) => {
+  startPickingSession: async (materialRequestTitle: string, user_id?: string) => {
+    // ✅ PERMANENT FIX: Do NOT send user_id in API payload
+    // Backend should read user from its own config/session, not from API request
     try {
       return await makeRequest(
         `/api/wms/picking/start`,
         "POST",
         {
           material_request_title: materialRequestTitle,
-          user_id,
+          // Note: user_id is NOT included - backend reads from config
         }
       );
     } catch (error: any) {

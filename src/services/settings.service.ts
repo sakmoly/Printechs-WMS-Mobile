@@ -195,6 +195,28 @@ const executeSaveSettings = async (settings: Partial<Settings>) => {
             ? settings.auth_token_expires || null
             : existing?.auth_token_expires || null;
 
+        const itemMasterSyncModeValue =
+          settings.item_master_sync_mode !== undefined
+            ? (settings.item_master_sync_mode || "full").toString()
+            : (existing as any)?.item_master_sync_mode || "full";
+
+        const rawPage =
+          settings.item_master_page_size !== undefined
+            ? settings.item_master_page_size
+            : (existing as any)?.item_master_page_size;
+        let itemMasterPageSizeValue = 5000;
+        if (rawPage != null && rawPage !== "") {
+          const n = Number(rawPage);
+          if (Number.isFinite(n)) {
+            itemMasterPageSizeValue = Math.min(20000, Math.max(500, Math.floor(n)));
+          }
+        }
+
+        const itemMasterWatermarkValue =
+          settings.item_master_modified_watermark !== undefined
+            ? settings.item_master_modified_watermark || null
+            : (existing as any)?.item_master_modified_watermark ?? null;
+
         // Only log fields that are being updated or are relevant
         const logData: any = {
           api_url: apiUrlValue || "(null)",
@@ -234,7 +256,7 @@ const executeSaveSettings = async (settings: Partial<Settings>) => {
           
           // Insert new row with all fields - this ensures the API URL is always saved
           await db.runAsync(
-            "INSERT INTO settings (api_url, device_id, user_id, user_code, password, demo_mode, active_asn, active_session, auth_token, auth_token_expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO settings (api_url, device_id, user_id, user_code, password, demo_mode, active_asn, active_session, auth_token, auth_token_expires, item_master_sync_mode, item_master_page_size, item_master_modified_watermark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
               apiUrlValue,
               deviceIdValue,
@@ -246,6 +268,9 @@ const executeSaveSettings = async (settings: Partial<Settings>) => {
               activeSessionValue,
               authTokenValue,
               authTokenExpiresValue,
+              itemMasterSyncModeValue,
+              itemMasterPageSizeValue,
+              itemMasterWatermarkValue,
             ]
           );
           // Transaction will COMMIT automatically on success

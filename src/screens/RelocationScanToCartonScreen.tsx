@@ -5,7 +5,6 @@ import {
   TouchableOpacity,
   StyleSheet,
   ScrollView,
-  TextInput,
   ActivityIndicator,
   Alert,
 } from "react-native";
@@ -14,6 +13,10 @@ import { PickingTheme } from "../theme/picking-theme";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
 import { relocationSessionService } from "../services/relocation-session.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function RelocationScanToCartonScreen() {
   const navigation = useNavigation();
@@ -23,7 +26,7 @@ export default function RelocationScanToCartonScreen() {
 
   const [cartonId, setCartonId] = useState("");
   const [loading, setLoading] = useState(false);
-  const cartonInputRef = useRef<TextInput>(null);
+  const cartonInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -68,23 +71,25 @@ export default function RelocationScanToCartonScreen() {
     }
   };
 
-  const handleContinue = async () => {
-    if (!cartonId || !cartonId.trim()) {
+  const handleContinue = async (overrideCarton?: string): Promise<boolean> => {
+    const source = overrideCarton !== undefined ? overrideCarton : cartonId;
+    if (!source || !source.trim()) {
       Alert.alert("Error", "Please scan or enter a carton ID");
-      return;
+      return false;
     }
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
     setLoading(true);
     try {
-      const normalizedCarton = cartonId.trim().toUpperCase();
+      const normalizedCarton = source.trim().toUpperCase();
+      setCartonId(normalizedCarton);
 
       // Validation: FULL_CARTON mode requires same carton ID
       if (mode === "FULL_CARTON" && fromCarton && normalizedCarton !== fromCarton.toUpperCase()) {
@@ -96,10 +101,10 @@ export default function RelocationScanToCartonScreen() {
           "If you want to move items to a different carton, please use 'Carton → Carton' mode instead.",
           [
             { text: "Cancel", style: "cancel" },
-            { text: "Use Same Carton", onPress: () => handleKeepSameCarton() }
+            { text: "Use Same Carton", onPress: () => void handleKeepSameCarton() }
           ]
         );
-        return;
+        return false;
       }
 
       // ✅ NEW APPROACH: Update local session only - NO backend API call
@@ -122,17 +127,15 @@ export default function RelocationScanToCartonScreen() {
         toBin,
         toCarton: normalizedCarton,
       });
+      return true;
     } catch (error: any) {
       setLoading(false);
       console.error("❌ Error saving to carton:", error);
       Alert.alert("Error", `Failed to save carton ID: ${error.message}`);
+      return false;
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleInputChange = (text: string) => {
-    setCartonId(text.toUpperCase());
   };
 
   return (
@@ -170,29 +173,24 @@ export default function RelocationScanToCartonScreen() {
 
         <View style={styles.inputSection}>
           <Text style={styles.inputLabel}>TO Carton ID</Text>
-          <TextInput
+          <BarcodeInput
             ref={cartonInputRef}
-            style={styles.input}
-            value={cartonId}
-            onChangeText={handleInputChange}
+            autoFocus
             placeholder="Scan or enter carton ID"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={() => {
-              // Only submit if carton ID is not empty
-              if (cartonId && cartonId.trim()) {
-                handleContinue();
-              }
-            }}
-            blurOnSubmit={false}
+            onBarcodeScanned={async (raw) =>
+              handleContinue(raw.trim().toUpperCase())
+            }
+            containerStyle={{ alignSelf: "stretch" }}
+            inputStyle={styles.input}
           />
         </View>
 
         {cartonId.trim() && !loading && (
           <TouchableOpacity
             style={styles.continueButton}
-            onPress={handleContinue}
+            onPress={() => {
+              void handleContinue();
+            }}
             disabled={loading}
           >
             <Text style={styles.continueButtonText}>Continue to Execute</Text>

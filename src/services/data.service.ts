@@ -946,7 +946,8 @@ export const dataService = {
           query += " AND (store = ? OR store = ?)";
           params.push(store, "WAREHOUSE");
         } else {
-          query += " AND store = ?";
+          // Case-insensitive store match so Packing finds boxes when TO and box_cache use different casing
+          query += " AND (TRIM(store) COLLATE NOCASE = TRIM(?))";
           params.push(store);
         }
       }
@@ -982,7 +983,7 @@ export const dataService = {
               fallbackQuery += " AND (store = ? OR store = ?)";
               fallbackParams.push(store, "WAREHOUSE");
             } else {
-              fallbackQuery += " AND store = ?";
+              fallbackQuery += " AND (TRIM(store) COLLATE NOCASE = TRIM(?))";
               fallbackParams.push(store);
             }
           }
@@ -2139,23 +2140,54 @@ export const dataService = {
     inbound_session: string
   ): Promise<boolean> => {
     const db = await getDatabase();
+    if (!db) return false;
     const normalizedASN = normalizeASN(asn_no);
-    
-    // Get all unique cartons in ASN
-    const allCartons = await db.getAllAsync<{ carton_id: string }>(
-      "SELECT DISTINCT carton_id FROM asn_carton_map WHERE asn_no = ?",
+
+    // Get all unique cartons in ASN (try normalized and original format)
+    let allCartons = await db.getAllAsync<{ carton_id: string }>(
+      "SELECT DISTINCT carton_id FROM asn_carton_map WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?))",
       [normalizedASN]
     );
-    
-    if (allCartons.length === 0) return false;
-    
-    // Get all received cartons
-    const receivedCartons = await db.getAllAsync<{ carton_id: string }>(
-      "SELECT DISTINCT carton_id FROM carton_status_cache WHERE asn_no = ? AND inbound_session = ? AND status = ?",
-      [normalizedASN, inbound_session, "Received"]
+    if (allCartons.length === 0 && asn_no !== normalizedASN) {
+      allCartons = await db.getAllAsync<{ carton_id: string }>(
+        "SELECT DISTINCT carton_id FROM asn_carton_map WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?))",
+        [asn_no]
+      );
+    }
+
+    // Get received cartons from cache (try normalized and original ASN format)
+    const receivedCartonsNormalized = await db.getAllAsync<{ carton_id: string }>(
+      "SELECT DISTINCT carton_id FROM carton_status_cache WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND inbound_session = ? AND (status = ? OR status = ?)",
+      [normalizedASN, inbound_session, "Received", "RECEIVED"]
     );
-    
-    return allCartons.length === receivedCartons.length;
+    let receivedCartons = receivedCartonsNormalized;
+    if (receivedCartons.length === 0 && asn_no !== normalizedASN) {
+      receivedCartons = await db.getAllAsync<{ carton_id: string }>(
+        "SELECT DISTINCT carton_id FROM carton_status_cache WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND inbound_session = ? AND (status = ? OR status = ?)",
+        [asn_no, inbound_session, "Received", "RECEIVED"]
+      );
+    }
+
+    if (allCartons.length > 0) {
+      // We have a list of expected cartons: all must be received
+      const receivedSet = new Set(receivedCartons.map((r) => r.carton_id?.toUpperCase?.() ?? r.carton_id));
+      const allReceived = allCartons.every(
+        (c) => receivedSet.has(c.carton_id?.toUpperCase?.() ?? c.carton_id)
+      );
+      return allReceived;
+    }
+
+    // Fallback: asn_carton_map empty (e.g. not synced from desktop). Use carton_status_cache only:
+    // "all received" = we have at least one carton for this session and all of them are Received
+    const allInSession = await db.getAllAsync<{ carton_id: string; status: string }>(
+      "SELECT carton_id, status FROM carton_status_cache WHERE (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?))) AND inbound_session = ?",
+      [normalizedASN, asn_no, inbound_session]
+    );
+    if (allInSession.length === 0) return false;
+    const allReceivedStatus = allInSession.every(
+      (r) => r.status === "Received" || r.status === "RECEIVED"
+    );
+    return allReceivedStatus;
   },
 
   // Clear all demo data from the mobile device

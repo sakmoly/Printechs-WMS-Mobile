@@ -10,6 +10,7 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  Switch,
 } from "react-native";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { PickingTheme } from "../theme/picking-theme";
@@ -20,6 +21,10 @@ import { relocationSessionService, RelocationMode, RelocationPolicy } from "../s
 import { addEvent } from "../services/event-queue.service";
 import { getDatabase } from "../database/database";
 import { getSettings as getAppSettings } from "../services/settings.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 interface RelocationItem {
   item_code: string;
@@ -86,18 +91,19 @@ export default function RelocationExecuteScreen() {
   }, [mode, fromBin, fromCarton, toBin, toCarton]);
 
   const [policy, setPolicy] = useState<RelocationPolicy>("BLIND");
+  const [createCartonIfMissing, setCreateCartonIfMissing] = useState(false);
   const [cartonContents, setCartonContents] = useState<RelocationItem[]>([]);
   const [scannedItems, setScannedItems] = useState<RelocationItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [completing, setCompleting] = useState(false);
-  const [barcodeInput, setBarcodeInput] = useState("");
+  const [barcodeDraft, setBarcodeDraft] = useState("");
   const [editModal, setEditModal] = useState<{
     visible: boolean;
     item: RelocationItem | null;
     newQty: string;
   }>({ visible: false, item: null, newQty: "" });
 
-  const barcodeInputRef = useRef<TextInput>(null);
+  const barcodeInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -335,15 +341,16 @@ export default function RelocationExecuteScreen() {
     }
   };
 
-  const handleItemScan = async (barcode: string) => {
-    if (!barcode || !barcode.trim()) return;
-    if (mode !== "PARTIAL_ITEMS" && mode !== "CARTON_TO_CARTON") return;
+  const handleItemScan = async (barcode: string): Promise<boolean> => {
+    if (!barcode || !barcode.trim()) return false;
+    if (mode !== "PARTIAL_ITEMS" && mode !== "CARTON_TO_CARTON")
+      return false;
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
@@ -361,11 +368,10 @@ export default function RelocationExecuteScreen() {
         "Item Not Found",
         `Item "${normalizedBarcode}" not found in source carton.\n\nPlease scan an item that exists in carton ${fromCarton}.`
       );
-      setBarcodeInput("");
       setTimeout(() => {
         barcodeInputRef.current?.focus();
       }, 100);
-      return;
+      return false;
     }
 
     // Increment move_qty (but don't exceed available_qty)
@@ -387,11 +393,10 @@ export default function RelocationExecuteScreen() {
       scanned_lines: updatedItems,
     });
 
-    // Clear input and refocus
-    setBarcodeInput("");
     setTimeout(() => {
       barcodeInputRef.current?.focus();
     }, 100);
+    return true;
   };
 
   const handleEditQty = (item: RelocationItem) => {
@@ -504,12 +509,13 @@ export default function RelocationExecuteScreen() {
           // ✅ CORRECT: Full Carton Move
           // Payload: { warehouse_id, user_id, from_bin, to_bin, from_carton, mode }
           const response = await apiService.completeRelocationFull({
-            mode: "FULL_CARTON", // ✅ CORRECT: mode is REQUIRED
+            mode: "FULL_CARTON",
             warehouse_id: warehouseId,
             user_id: userId,
             from_bin: relocationData.fromBin!,
             to_bin: relocationData.toBin!,
-            from_carton: relocationData.fromCarton!, // ✅ CORRECT: from_carton (not carton_id)
+            from_carton: relocationData.fromCarton!,
+            create_carton_if_missing: createCartonIfMissing || undefined,
           });
           
           // Session ID is now created and returned in response
@@ -527,14 +533,15 @@ export default function RelocationExecuteScreen() {
           
           // ✅ CORRECT: Send all items in lines[] array (not per-item calls)
           const response = await apiService.completeRelocationPartial({
-            mode: relocationData.mode, // ✅ CORRECT: mode is REQUIRED
+            mode: relocationData.mode,
             warehouse_id: warehouseId,
             user_id: userId,
             from_bin: relocationData.fromBin!,
             to_bin: relocationData.toBin!,
             from_carton: relocationData.fromCarton!,
             to_carton: relocationData.toCarton || relocationData.fromCarton!,
-            lines: lines, // ✅ CORRECT: Items in lines[] array
+            lines: lines,
+            create_carton_if_missing: createCartonIfMissing || undefined,
           });
           
           createdSessionId = response.session_id || response.data?.session_id || null;
@@ -698,6 +705,22 @@ export default function RelocationExecuteScreen() {
           </View>
         )}
 
+        {/* Create target carton if missing - avoid "Target carton does not exist" */}
+        <View style={styles.policyCard}>
+          <View style={styles.optionRow}>
+            <Text style={styles.optionLabel}>Create target carton if missing</Text>
+            <Switch
+              value={createCartonIfMissing}
+              onValueChange={setCreateCartonIfMissing}
+              trackColor={{ false: PickingTheme.colors.borderLight, true: PickingTheme.colors.buttonBlue }}
+              thumbColor={PickingTheme.colors.textWhite}
+            />
+          </View>
+          <Text style={styles.optionHint}>
+            Enable when moving to a new carton ID that does not exist yet (e.g. new carton at target bin).
+          </Text>
+        </View>
+
         {/* Item Scan Card (PARTIAL_ITEMS and CARTON_TO_CARTON) */}
         {(mode === "PARTIAL_ITEMS" || mode === "CARTON_TO_CARTON") && (
           <View style={styles.scanCard}>
@@ -709,24 +732,28 @@ export default function RelocationExecuteScreen() {
               </Text>
             </View>
             <View style={styles.scanInputContainer}>
-              <TextInput
+              <BarcodeInput
                 ref={barcodeInputRef}
-                style={styles.scanInput}
-                value={barcodeInput}
-                onChangeText={setBarcodeInput}
+                autoFocus
                 placeholder="Scan barcode"
-                autoCapitalize="characters"
-                autoFocus={true}
-                showSoftInputOnFocus={false}
+                onChangeText={setBarcodeDraft}
+                onBarcodeScanned={(raw) => handleItemScan(raw.trim())}
+                containerStyle={{ flex: 1 }}
+                inputStyle={styles.scanInput}
               />
               <TouchableOpacity
-                style={[styles.validateButton, !barcodeInput.trim() && styles.validateButtonDisabled]}
+                style={[
+                  styles.validateButton,
+                  !barcodeDraft.trim() && styles.validateButtonDisabled,
+                ]}
                 onPress={() => {
-                  if (barcodeInput.trim()) {
-                    handleItemScan(barcodeInput);
-                  }
+                  const b =
+                    barcodeDraft.trim() ||
+                    barcodeInputRef.current?.getLastText?.()?.trim() ||
+                    "";
+                  if (b) void handleItemScan(b);
                 }}
-                disabled={!barcodeInput.trim()}
+                disabled={!barcodeDraft.trim()}
               >
                 <Text style={styles.validateButtonText}>Validate</Text>
               </TouchableOpacity>
@@ -930,6 +957,23 @@ const styles = StyleSheet.create({
   },
   policyButtonTextActive: {
     color: PickingTheme.colors.textWhite,
+  },
+  optionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: PickingTheme.spacing.xs,
+  },
+  optionLabel: {
+    ...PickingTheme.typography.body,
+    color: PickingTheme.colors.textPrimary,
+    fontWeight: "600",
+    flex: 1,
+  },
+  optionHint: {
+    ...PickingTheme.typography.caption,
+    color: PickingTheme.colors.textSecondary,
+    marginTop: 4,
   },
   scanCard: {
     backgroundColor: PickingTheme.colors.buttonBlue,

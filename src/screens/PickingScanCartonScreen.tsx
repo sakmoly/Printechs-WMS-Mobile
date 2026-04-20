@@ -4,7 +4,6 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
-  TextInput,
   ActivityIndicator,
   Alert,
   ScrollView,
@@ -16,6 +15,10 @@ import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
 import { pickingSessionService, PickingSession } from "../services/picking-session.service";
 import { getDatabase } from "../database/database";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function PickingScanCartonScreen() {
   const navigation = useNavigation();
@@ -27,7 +30,7 @@ export default function PickingScanCartonScreen() {
   const [loading, setLoading] = useState(false);
   const [cartonValidated, setCartonValidated] = useState(false);
   const [cartonInfo, setCartonInfo] = useState<any>(null);
-  const cartonInputRef = useRef<TextInput>(null);
+  const cartonInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -39,18 +42,18 @@ export default function PickingScanCartonScreen() {
   }, []);
 
   // Validate carton ID when entered (for handheld scanner)
-  const validateCarton = async (carton: string) => {
+  const validateCarton = async (carton: string): Promise<boolean> => {
     if (!carton || !carton.trim()) {
       setCartonValidated(false);
       setCartonInfo(null);
-      return;
+      return false;
     }
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate carton validation");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
@@ -68,6 +71,7 @@ export default function PickingScanCartonScreen() {
 
       if (localCarton) {
         console.log(`✅ Carton found in box_cache: ${localCarton.box_id}`);
+        setCartonId(localCarton.box_id);
         setCartonInfo({
           carton_id: localCarton.box_id,
           box_id: localCarton.box_id,
@@ -75,7 +79,7 @@ export default function PickingScanCartonScreen() {
         });
         setCartonValidated(true);
         setLoading(false);
-        return;
+        return true;
       }
 
       // Try carton_status_cache (carton_id)
@@ -86,6 +90,7 @@ export default function PickingScanCartonScreen() {
 
       if (localCarton) {
         console.log(`✅ Carton found in carton_status_cache: ${localCarton.carton_id}`);
+        setCartonId(localCarton.carton_id);
         setCartonInfo({
           carton_id: localCarton.carton_id,
           box_id: localCarton.carton_id,
@@ -93,7 +98,7 @@ export default function PickingScanCartonScreen() {
         });
         setCartonValidated(true);
         setLoading(false);
-        return;
+        return true;
       }
 
       // Try asn_carton_map (carton_id)
@@ -104,6 +109,7 @@ export default function PickingScanCartonScreen() {
 
       if (localCarton) {
         console.log(`✅ Carton found in asn_carton_map: ${localCarton.carton_id}`);
+        setCartonId(localCarton.carton_id);
         setCartonInfo({
           carton_id: localCarton.carton_id,
           box_id: localCarton.carton_id,
@@ -111,7 +117,7 @@ export default function PickingScanCartonScreen() {
         });
         setCartonValidated(true);
         setLoading(false);
-        return;
+        return true;
       }
 
       // If not found locally, try backend API (if we have required parameters)
@@ -122,6 +128,7 @@ export default function PickingScanCartonScreen() {
       
       // Accept the carton ID even if not found in cache (offline mode or cache miss)
       // The carton will be validated when items are actually scanned
+      setCartonId(normalizedCarton);
       setCartonInfo({
         carton_id: normalizedCarton,
         box_id: normalizedCarton,
@@ -129,27 +136,14 @@ export default function PickingScanCartonScreen() {
       });
       setCartonValidated(true);
       setLoading(false);
+      return true;
     } catch (error: any) {
       setLoading(false);
       console.error("❌ Error validating carton:", error);
       Alert.alert("Error", `Failed to validate carton: ${error.message}`);
       setCartonInfo(null);
       setCartonValidated(false);
-    }
-  };
-
-  // Handle carton input change (for handheld scanner)
-  const handleCartonInputChange = (text: string) => {
-    setCartonId(text);
-    // Auto-validate when text is entered (for handheld scanner that sends Enter)
-    if (text.trim().length > 0) {
-      // Small delay to allow full barcode to be entered
-      setTimeout(() => {
-        validateCarton(text.trim());
-      }, 300);
-    } else {
-      setCartonValidated(false);
-      setCartonInfo(null);
+      return false;
     }
   };
 
@@ -254,20 +248,15 @@ export default function PickingScanCartonScreen() {
           </View>
         </View>
         <View style={styles.cartonInputRow}>
-          <TextInput
+          <BarcodeInput
             ref={cartonInputRef}
-            style={styles.cartonInput}
-            value={cartonId}
-            onChangeText={handleCartonInputChange}
+            autoFocus
             placeholder="Scan or enter carton ID"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={() => {
-              if (cartonId.trim()) {
-                validateCarton(cartonId.trim());
-              }
-            }}
+            onBarcodeScanned={async (raw) =>
+              validateCarton(raw.trim().toUpperCase())
+            }
+            containerStyle={{ flex: 1 }}
+            inputStyle={styles.cartonInput}
           />
         </View>
         

@@ -14,6 +14,10 @@ import { PickingTheme } from "../theme/picking-theme";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
 import { relocationSessionService } from "../services/relocation-session.service";
+import {
+  BarcodeInput,
+  type BarcodeInputHandle,
+} from "../components/BarcodeInput";
 
 export default function RelocationScanFromCartonScreen() {
   const navigation = useNavigation();
@@ -38,7 +42,7 @@ export default function RelocationScanFromCartonScreen() {
 
   const [cartonId, setCartonId] = useState("");
   const [loading, setLoading] = useState(false);
-  const cartonInputRef = useRef<TextInput>(null);
+  const cartonInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
@@ -50,8 +54,8 @@ export default function RelocationScanFromCartonScreen() {
   }, []);
 
   // Internal function to save carton and navigate (ONLY called after validation passes)
-  const saveCartonAndNavigate = async () => {
-    const normalizedCarton = cartonId.trim().toUpperCase();
+  const saveCartonAndNavigate = async (explicitCarton?: string) => {
+    const normalizedCarton = (explicitCarton ?? cartonId).trim().toUpperCase();
     const binToUse = currentFromBin || fromBin;
 
     if (!normalizedCarton || !binToUse) {
@@ -76,10 +80,6 @@ export default function RelocationScanFromCartonScreen() {
       fromCarton: normalizedCarton,
       binInfo,
     });
-  };
-
-  const handleInputChange = (text: string) => {
-    setCartonId(text.toUpperCase());
   };
 
   // ✅ VALIDATION: Validate carton exists and optionally check location
@@ -292,17 +292,20 @@ export default function RelocationScanFromCartonScreen() {
   };
 
   // Handle when user submits carton ID (Enter key or scanner) - validates immediately
-  const handleCartonSubmit = async () => {
-    console.log(`🔍 [SUBMIT] handleCartonSubmit called with cartonId: "${cartonId}"`);
+  const handleCartonSubmit = async (
+    scannedValue?: string
+  ): Promise<boolean> => {
+    const effectiveCarton = (scannedValue !== undefined ? scannedValue : cartonId).trim();
+    console.log(`🔍 [SUBMIT] handleCartonSubmit called with cartonId: "${effectiveCarton}"`);
     
-    if (!cartonId || !cartonId.trim()) {
+    if (!effectiveCarton) {
       console.warn(`⚠️ [SUBMIT] Empty carton ID`);
       Alert.alert("Error", "Please scan or enter a carton ID");
-      return;
+      return false;
     }
 
     // ✅ Client-side validation: Check if user accidentally scanned a bin code instead of carton ID
-    const normalizedCarton = cartonId.trim().toUpperCase();
+    const normalizedCarton = effectiveCarton.toUpperCase();
     // Bin codes typically match pattern like "A1-R01-L3-B1" (alphanumeric with dashes)
     // Carton IDs typically start with "CTN-" or have different pattern
     // Simple check: If it looks like a bin code (matches bin location pattern), warn user
@@ -319,14 +322,14 @@ export default function RelocationScanFromCartonScreen() {
       setTimeout(() => {
         cartonInputRef.current?.focus();
       }, 100);
-      return;
+      return false;
     }
 
     // Debounce: prevent duplicate processing
     const now = Date.now();
     if (now - lastScanTimeRef.current < SCAN_DEBOUNCE_MS) {
       console.log("⏭️ Debounced duplicate scan");
-      return;
+      return true;
     }
     lastScanTimeRef.current = now;
 
@@ -334,16 +337,16 @@ export default function RelocationScanFromCartonScreen() {
     if (!binToUse) {
       console.warn(`⚠️ [SUBMIT] No bin location available`);
       Alert.alert("Error", "Bin location is required");
-      return;
+      return false;
     }
 
-    console.log(`🔍 [SUBMIT] Starting validation - cartonId: "${cartonId.trim()}", bin: "${binToUse}"`);
+    console.log(`🔍 [SUBMIT] Starting validation - cartonId: "${effectiveCarton}", bin: "${binToUse}"`);
 
     setLoading(true);
     try {
       // ✅ IMMEDIATE VALIDATION: Validate carton location right away with backend
-      console.log(`🔍 [SUBMIT] Starting validation for carton: "${cartonId.trim()}" at bin: "${binToUse}"`);
-      const validation = await validateCartonLocation(cartonId.trim(), binToUse);
+      console.log(`🔍 [SUBMIT] Starting validation for carton: "${effectiveCarton}" at bin: "${binToUse}"`);
+      const validation = await validateCartonLocation(effectiveCarton, binToUse);
       
       console.log(`🔍 [SUBMIT] Validation result:`, {
         valid: validation.valid,
@@ -381,7 +384,7 @@ export default function RelocationScanFromCartonScreen() {
           );
         });
         
-        return;
+        return false;
       }
       
       if (validation.valid) {
@@ -391,11 +394,13 @@ export default function RelocationScanFromCartonScreen() {
       }
       
       // ✅ Validation passed - save to session and navigate
-      await saveCartonAndNavigate();
+      await saveCartonAndNavigate(effectiveCarton);
+      return true;
     } catch (error: any) {
       setLoading(false);
       console.error("❌ [SUBMIT] Error in handleCartonSubmit:", error);
       Alert.alert("Error", `Failed to validate carton: ${error.message || error.toString()}`);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -421,24 +426,25 @@ export default function RelocationScanFromCartonScreen() {
 
         <View style={styles.inputSection}>
           <Text style={styles.inputLabel}>Carton ID</Text>
-          <TextInput
+          <BarcodeInput
             ref={cartonInputRef}
-            style={styles.input}
-            value={cartonId}
-            onChangeText={handleInputChange}
+            autoFocus
             placeholder="Scan or enter carton ID"
-            autoCapitalize="characters"
-            autoFocus={true}
-            showSoftInputOnFocus={false}
-            onSubmitEditing={handleCartonSubmit}
-            blurOnSubmit={false}
+            onChangeText={(t) => setCartonId(t.toUpperCase())}
+            onBarcodeScanned={async (raw) =>
+              handleCartonSubmit(raw.trim().toUpperCase())
+            }
+            containerStyle={{ alignSelf: "stretch" }}
+            inputStyle={styles.input}
           />
         </View>
 
         {cartonId.trim() && !loading && (
           <TouchableOpacity
             style={styles.continueButton}
-            onPress={handleCartonSubmit}
+            onPress={() => {
+              void handleCartonSubmit();
+            }}
             disabled={loading}
           >
             <Text style={styles.continueButtonText}>Continue to Scan TO Bin</Text>

@@ -1,0 +1,1063 @@
+{
+  "info": {
+    "name": "Printechs WMS Mobile API",
+    "description": "Complete API collection for Printechs WMS Mobile. Set http://localhost:3000 and auth_token (after login) in collection or environment variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{auth_token}}", "type": "string" }]
+  },
+  "variable": [
+    { "key": "http://localhost:3000", "value": "http://localhost:3000" },
+    { "key": "auth_token", "value": "" },
+    { "key": "user_code", "value": "" },
+    { "key": "password", "value": "" },
+    { "key": "asn_no", "value": "ASN-0001" },
+    { "key": "title", "value": "" },
+    { "key": "tc_id", "value": "" },
+    { "key": "session_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Authentication",
+      "item": [
+        {
+          "name": "Login (auth/login)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_code\": \"{{user_code}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/auth/login"
+          }
+        },
+        {
+          "name": "Login (login)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_code\": \"{{user_code}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/login"
+          }
+        },
+        {
+          "name": "Login (device-login)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_code\": \"{{user_code}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/auth/device-login"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Health",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/health"
+          }
+        },
+        {
+          "name": "Ping",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/ping"
+          }
+        },
+        {
+          "name": "Root",
+          "request": { "method": "GET", "url": "{{http://localhost:3000}}/" }
+        }
+      ]
+    },
+    {
+      "name": "3. Inbound Session",
+      "item": [
+        {
+          "name": "Start Inbound",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\",\n  \"transfer_order\": \"TO-0001\",\n  \"dock\": \"DOCK-01\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/start"
+          }
+        },
+        {
+          "name": "Update Inbound Session",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inbound_session\": \"SESSION-001\",\n  \"asn_no\": \"{{asn_no}}\",\n  \"status\": \"Active\",\n  \"completed_cartons\": 0,\n  \"total_cartons\": 10,\n  \"transfer_order\": \"TO-0001\",\n  \"dock\": \"DOCK-01\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/update"
+          }
+        },
+        {
+          "name": "Complete Inbound",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inbound_session\": \"SESSION-001\",\n  \"asn_no\": \"{{asn_no}}\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Cartons & Unload",
+      "item": [
+        {
+          "name": "Update Carton Status",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\",\n  \"inbound_session\": \"SESSION-001\",\n  \"carton_id\": \"CTN-001\",\n  \"status\": \"Unloaded\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/cartons/update-status"
+          }
+        },
+        {
+          "name": "Lock Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inbound_session\": \"SESSION-001\",\n  \"asn_no\": \"{{asn_no}}\",\n  \"carton_id\": \"CTN-001\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/carton/lock"
+          }
+        },
+        {
+          "name": "Complete Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inbound_session\": \"SESSION-001\",\n  \"asn_no\": \"{{asn_no}}\",\n  \"carton_id\": \"CTN-001\",\n  \"user_id\": \"USER-001\",\n  \"device_id\": \"DEVICE-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/carton/complete"
+          }
+        },
+        {
+          "name": "Create Unload Line",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_title\": \"SESSION-001\",\n  \"unit_type\": \"CARTON\",\n  \"unit_id\": \"CTN-001\",\n  \"scanned_by\": \"USER-001\",\n  \"scanned_on\": \"2025-01-27T08:00:00.000Z\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/unload-line"
+          }
+        },
+        {
+          "name": "Get Unload Lines",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/inbound/unload-lines?parent_title=SESSION-001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Receive Lines",
+      "item": [
+        {
+          "name": "Create Receive Line",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_title\": \"SESSION-001\",\n  \"carton_id\": \"CTN-001\",\n  \"item_code\": \"ITEM-001\",\n  \"expected_qty\": 10,\n  \"received_qty\": 10,\n  \"condition\": \"Good\",\n  \"remarks\": null\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/receive-line"
+          }
+        },
+        {
+          "name": "Create Receive Lines (Batch)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"parent_title\": \"SESSION-001\",\n  \"receive_lines\": [\n    {\n      \"carton_id\": \"CTN-001\",\n      \"item_code\": \"ITEM-001\",\n      \"expected_qty\": 10,\n      \"received_qty\": 10,\n      \"condition\": \"Good\",\n      \"remarks\": null\n    }\n  ]\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/inbound/receive-lines"
+          }
+        },
+        {
+          "name": "Get Receive Lines",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/inbound/receive-lines?parent_title=SESSION-001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Events Batch",
+      "item": [
+        {
+          "name": "Batch Events",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    {\n      \"offline_uuid\": \"uuid-123\",\n      \"event_type\": \"UNLOAD_SCAN\",\n      \"asn_no\": \"{{asn_no}}\",\n      \"carton_id\": \"CTN-001\",\n      \"event_time\": \"2025-01-27T08:00:00.000Z\",\n      \"device_id\": \"DEVICE-001\",\n      \"user_id\": \"USER-001\"\n    }\n  ],\n  \"update_mode\": false\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/events/batch"
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Boxes",
+      "item": [
+        {
+          "name": "Create Box",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\",\n  \"to_no\": \"TO-0001\",\n  \"store\": \"SR-01\",\n  \"purpose\": \"STORE\",\n  \"user_id\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/boxes/create"
+          }
+        },
+        {
+          "name": "Close Box",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"box_id\": \"BOX-001\"\n}" },
+            "url": "{{http://localhost:3000}}/api/boxes/close"
+          }
+        },
+        {
+          "name": "Reopen Box",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"box_id\": \"BOX-001\"\n}" },
+            "url": "{{http://localhost:3000}}/api/boxes/reopen"
+          }
+        },
+        {
+          "name": "Delete Box",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"box_id\": \"BOX-001\"\n}" },
+            "url": "{{http://localhost:3000}}/api/boxes/delete"
+          }
+        },
+        {
+          "name": "Get Boxes",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/boxes?asn={{asn_no}}&store=SR-01"
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Sort Box",
+      "item": [
+        {
+          "name": "Create Sort Box",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"box_id\": \"BOX-001\",\n  \"store\": \"SR-01\",\n  \"transfer_in\": \"TI-001\",\n  \"purpose\": \"PUTAWAY\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/sort-box/create"
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. Transfer Cartons",
+      "item": [
+        {
+          "name": "Create Transfer Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\",\n  \"to_no\": \"TO-0001\",\n  \"store\": \"SR-01\",\n  \"user_id\": \"USER-001\",\n  \"created_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-cartons/create"
+          }
+        },
+        {
+          "name": "Seal Transfer Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tc_id\": \"{{tc_id}}\",\n  \"sealed_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-cartons/seal"
+          }
+        },
+        {
+          "name": "Dispatch Transfer Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tc_id\": \"{{tc_id}}\",\n  \"dispatched_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-cartons/dispatch"
+          }
+        },
+        {
+          "name": "Add Items to Transfer Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    {\n      \"item_code\": \"ITEM-001\",\n      \"qty\": 10,\n      \"carton_id\": \"CTN-001\",\n      \"source_bin\": \"A1-R01-B1\"\n    }\n  ],\n  \"user_id\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-cartons/{{tc_id}}/add-items"
+          }
+        },
+        {
+          "name": "Get Transfer Cartons",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/transfer-cartons?asn={{asn_no}}&store=SR-01"
+          }
+        },
+        {
+          "name": "Get Transfer Carton by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/transfer-cartons/{{tc_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. ASN & Transfer Order",
+      "item": [
+        {
+          "name": "Get ASN",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/asn/{{asn_no}}"
+          }
+        },
+        {
+          "name": "Get Transfer Order by ASN",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/transfer-order/by-asn/{{asn_no}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Put Away",
+      "item": [
+        {
+          "name": "Get Remaining Items",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/putaway/remaining-items?asn={{asn_no}}"
+          }
+        },
+        {
+          "name": "Assign Rack",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\",\n  \"item_code\": \"ITEM-001\",\n  \"rack_id\": \"RACK-001\",\n  \"bin_id\": \"BIN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/assign-rack"
+          }
+        },
+        {
+          "name": "Dispatch Put Away",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tc_id\": \"{{tc_id}}\",\n  \"asn_no\": \"{{asn_no}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/dispatch"
+          }
+        },
+        {
+          "name": "Get Putaway Tasks",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/putaway/tasks?asn_no={{asn_no}}"
+          }
+        },
+        {
+          "name": "Create Putaway Tasks (by ASN)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"asn_no\": \"{{asn_no}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/create-tasks"
+          }
+        },
+        {
+          "name": "Create Putaway Tasks (by Transfer In)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"transfer_in\": \"TI-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/create-tasks"
+          }
+        },
+        {
+          "name": "Get Putaway Task",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/putaway/tasks/{{title}}"
+          }
+        },
+        {
+          "name": "Scan Transfer Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"box_id\": \"BOX-001\",\n  \"putaway_task\": \"{{title}}\",\n  \"location_id\": \"LOC-001\",\n  \"warehouse_id\": \"WH-001\",\n  \"tc_id\": \"{{tc_id}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/scan-transfer-carton"
+          }
+        },
+        {
+          "name": "Complete Putaway",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"location_id\": \"LOC-001\",\n  \"warehouse\": \"WH-001\",\n  \"tc_id\": \"{{tc_id}}\",\n  \"box_id\": \"BOX-001\",\n  \"items\": [\n    {\n      \"item_code\": \"ITEM-001\",\n      \"qty\": 10,\n      \"carton_id\": \"CTN-001\"\n    }\n  ]\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/putaway/complete"
+          }
+        }
+      ]
+    },
+    {
+      "name": "12. Master Data",
+      "item": [
+        {
+          "name": "Get Items",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/items"
+          }
+        },
+        {
+          "name": "Get ASNs",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/asns"
+          }
+        },
+        {
+          "name": "Get Transfer Orders",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/transfer-orders"
+          }
+        },
+        {
+          "name": "Get Boxes",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/boxes"
+          }
+        },
+        {
+          "name": "Get Transfer Cartons",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/transfer-cartons"
+          }
+        },
+        {
+          "name": "Get Warehouse Racks",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/warehouse-racks"
+          }
+        },
+        {
+          "name": "Get Warehouses",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/warehouses"
+          }
+        },
+        {
+          "name": "Get Locations",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/locations"
+          }
+        },
+        {
+          "name": "Get Bin Master",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/bin-master?limit=100&offset=0"
+          }
+        },
+        {
+          "name": "Get Bin by Code",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/bin-master/A1-R01-L1-B1"
+          }
+        },
+        {
+          "name": "Get Stock Ledger (pull)",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/stock-ledger"
+          }
+        },
+        {
+          "name": "Get Item Barcode Map",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/item-barcode-map"
+          }
+        },
+        {
+          "name": "Get Users",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/users"
+          }
+        },
+        {
+          "name": "Get All Master",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/master/all"
+          }
+        }
+      ]
+    },
+    {
+      "name": "13. Transfer In",
+      "item": [
+        {
+          "name": "Get Transfer Ins",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/transfer-in?status=Submitted"
+          }
+        },
+        {
+          "name": "Get Transfer In",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}"
+          }
+        },
+        {
+          "name": "Create Transfer In",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_showroom\": \"SR-01\",\n  \"to_warehouse\": \"WH-001\",\n  \"items\": []\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in"
+          }
+        },
+        {
+          "name": "Submit Transfer In",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/submit"
+          }
+        },
+        {
+          "name": "Update Transfer In Status",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"In Transit\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/update-status"
+          }
+        },
+        {
+          "name": "Complete Transfer In Receiving",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"completed_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/complete-receiving"
+          }
+        },
+        {
+          "name": "Receive Transfer In Line",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"carton_id\": \"CTN-001\",\n  \"item_code\": \"ITEM-001\",\n  \"received_qty\": 10,\n  \"received_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/receive-line"
+          }
+        },
+        {
+          "name": "Update Transfer In Line Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"item_code\": \"ITEM-001\",\n  \"carton_id\": \"CTN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/update-line-carton"
+          }
+        },
+        {
+          "name": "Validate Transfer In Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"carton_id\": \"TI-PUT-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/transfer-in/{{title}}/validate-carton"
+          }
+        }
+      ]
+    },
+    {
+      "name": "14. Relocation",
+      "item": [
+        {
+          "name": "Start Relocation Session",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"FULL_CARTON\",\n  \"warehouse_id\": \"WH-001\",\n  \"user_id\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/relocation/session/start"
+          }
+        },
+        {
+          "name": "Set Relocation From",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_bin\": \"A1-R01-B1\",\n  \"from_carton\": \"CTN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/relocation/session/{{session_id}}/from"
+          }
+        },
+        {
+          "name": "Set Relocation To",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to_bin\": \"A1-R02-B1\",\n  \"to_carton\": null\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/relocation/session/{{session_id}}/to"
+          }
+        },
+        {
+          "name": "Get Carton Contents",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/relocation/carton/CTN-001/contents"
+          }
+        },
+        {
+          "name": "Complete Relocation Full",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"FULL_CARTON\",\n  \"warehouse_id\": \"WH-001\",\n  \"user_id\": \"USER-001\",\n  \"from_bin\": \"A1-R01-B1\",\n  \"to_bin\": \"A1-R02-B1\",\n  \"from_carton\": \"CTN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/relocation/complete-full"
+          }
+        },
+        {
+          "name": "Complete Relocation Partial",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"mode\": \"PARTIAL_ITEMS\",\n  \"warehouse_id\": \"WH-001\",\n  \"user_id\": \"USER-001\",\n  \"from_bin\": \"A1-R01-B1\",\n  \"to_bin\": \"A1-R02-B1\",\n  \"from_carton\": \"CTN-001\",\n  \"to_carton\": \"CTN-002\",\n  \"lines\": [\n    { \"item_code\": \"ITEM-001\", \"qty\": 5 }\n  ]\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/relocation/complete-partial"
+          }
+        }
+      ]
+    },
+    {
+      "name": "15. Material Request",
+      "item": [
+        {
+          "name": "Get Material Requests",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/material-requests?status=Pending"
+          }
+        },
+        {
+          "name": "Get Material Request",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/material-requests/{{title}}"
+          }
+        },
+        {
+          "name": "Create Material Request",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"from_warehouse\": \"WH-001\",\n  \"to_showroom\": \"SR-01\",\n  \"items\": []\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/material-requests"
+          }
+        },
+        {
+          "name": "Update Material Request Status",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"status\": \"Picked\"\n}" },
+            "url": "{{http://localhost:3000}}/api/material-requests/{{title}}/update-status"
+          }
+        },
+        {
+          "name": "Get Material Request Picking Status",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/material-requests/{{title}}/picking-status"
+          }
+        },
+        {
+          "name": "Pick Material Request Items",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    {\n      \"item_code\": \"ITEM-001\",\n      \"picked_qty\": 10,\n      \"source_bin\": \"A1-R01-B1\",\n      \"carton_id\": \"CTN-001\"\n    }\n  ]\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/material-requests/{{title}}/pick-items"
+          }
+        }
+      ]
+    },
+    {
+      "name": "16. WMS Picking",
+      "item": [
+        {
+          "name": "Start Picking Session",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"material_request_title\": \"{{title}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/start"
+          }
+        },
+        {
+          "name": "Scan Bin",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"bin_code\": \"A1-R01-B1\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/scan-bin"
+          }
+        },
+        {
+          "name": "Scan Carton",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"carton_id\": \"CTN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/scan-carton"
+          }
+        },
+        {
+          "name": "Scan Item",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"item_code\": \"ITEM-001\",\n  \"barcode\": \"1234567890123\",\n  \"qty\": 10,\n  \"bin_code\": \"A1-R01-B1\",\n  \"carton_id\": \"CTN-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/scan-item"
+          }
+        },
+        {
+          "name": "Update Line Qty",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"line_id\": \"ITEM-001\",\n  \"qty\": 10,\n  \"reason\": \"Adjusted\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/line-qty"
+          }
+        },
+        {
+          "name": "Complete Picking",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/wms/picking/complete"
+          }
+        },
+        {
+          "name": "Get Picking Session",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/wms/picking/session/{{session_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "17. Stock & Stock Ledger",
+      "item": [
+        {
+          "name": "Get Stock Ledger",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/stock/ledger?item_code=ITEM-001&warehouse=WH-001"
+          }
+        },
+        {
+          "name": "Get Stock Ledger by Location",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/stock/ledger?bin_location=A1-R01-B1&carton_id=CTN-001"
+          }
+        },
+        {
+          "name": "Get Stock by Item and Warehouse",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/stock/item/ITEM-001/warehouse/WH-001"
+          }
+        },
+        {
+          "name": "Get Stock Ledger (alt)",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/stock-ledger/ITEM-001/WH-001"
+          }
+        },
+        {
+          "name": "Update Stock by Location",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"location_id\": \"LOC-001\",\n  \"item_code\": \"ITEM-001\",\n  \"qty\": 100\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/stock/update-by-location"
+          }
+        }
+      ]
+    },
+    {
+      "name": "18. Cycle Count",
+      "item": [
+        {
+          "name": "Get Cycle Counts",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/cycle-count?status=In Progress"
+          }
+        },
+        {
+          "name": "Get Cycle Count",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}?carton_id=CTN-001"
+          }
+        },
+        {
+          "name": "Start Cycle Count",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"started_by\": \"USER-001\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}/start"
+          }
+        },
+        {
+          "name": "Submit Cycle Count Counts",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"counted_by\": \"USER-001\",\n  \"lines\": [\n    {\n      \"lineId\": 1,\n      \"item_code\": \"ITEM-001\",\n      \"actual_qty\": 48,\n      \"expected_qty\": 50,\n      \"bin_location\": \"A1-R01-B1\",\n      \"carton_id\": \"CTN-001\"\n    }\n  ]\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}/count"
+          }
+        },
+        {
+          "name": "Update Cycle Count Line",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"line_id\": 1,\n  \"actual_qty\": 48,\n  \"counted_by\": \"USER-001\",\n  \"discrepancy_reason\": \"Damaged\"\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}/update-line"
+          }
+        },
+        {
+          "name": "Submit Cycle Count",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}/submit"
+          }
+        },
+        {
+          "name": "Complete Cycle Count",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}/complete"
+          }
+        },
+        {
+          "name": "Delete Cycle Count",
+          "request": {
+            "method": "DELETE",
+            "url": "{{http://localhost:3000}}/api/cycle-count/{{title}}"
+          }
+        },
+        {
+          "name": "Create Cycle Count",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"warehouse\": \"WH-001\",\n  \"count_type\": \"Directed\",\n  \"count_date\": \"2025-01-27\",\n  \"created_by\": \"USER-001\",\n  \"bin_code\": \"A1-R01-B1\",\n  \"lines\": []\n}"
+            },
+            "url": "{{http://localhost:3000}}/api/cycle-count"
+          }
+        }
+      ]
+    },
+    {
+      "name": "19. Warehouses & Stores",
+      "item": [
+        {
+          "name": "Get Warehouses and Stores",
+          "request": {
+            "method": "GET",
+            "url": "{{http://localhost:3000}}/api/warehouses/stores"
+          }
+        }
+      ]
+    }
+  ]
+}

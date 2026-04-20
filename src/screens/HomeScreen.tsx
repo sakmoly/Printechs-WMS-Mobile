@@ -14,10 +14,12 @@ import { useApp } from "../context/AppContext";
 import { StatusBadge } from "../components/StatusBadge";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { runAutomatedTest } from "../utils/automated-test";
+import { runPutawayBoxScanAutomatedTest } from "../utils/putaway-scan-automated-test";
 import { testAllCartonsInASN } from "../utils/test-all-cartons";
 import { runASNFormatCorrectionTest } from "../utils/test-asn-format-correction";
 import { dataService } from "../services/data.service";
 import { normalizeASN } from "../utils/asn";
+import { getAppVersionDetails } from "../utils/appVersion";
 
 export default function HomeScreen() {
   const navigation = useNavigation();
@@ -149,7 +151,7 @@ export default function HomeScreen() {
           <Text style={styles.menuItemText}>Relocation / Bin Transfer</Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
-        {settings?.demo_mode === 1 && (
+        {(settings?.demo_mode === 1 || __DEV__) && (
           <>
             <TouchableOpacity
               style={[styles.menuItem, { borderLeftColor: "#FF5722" }]}
@@ -229,6 +231,57 @@ export default function HomeScreen() {
                   <Text style={styles.menuItemArrow}>→</Text>
                 </>
               )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.menuItem, { borderLeftColor: "#E65100" }]}
+              onPress={() => {
+                if (runningTest) {
+                  Alert.alert(
+                    "Test Running",
+                    "Another test is running. Please wait..."
+                  );
+                  return;
+                }
+                Alert.alert(
+                  "Putaway scan test",
+                  "Requires an active inbound session (ASN + session in settings).\n\nCreates a test PAW-* box, writes one scanned_items row + events (same as Receive + Sort DB path). Use this to verify the device accepts putaway data.\n\nContinue?",
+                  [
+                    { text: "Cancel", style: "cancel" },
+                    {
+                      text: "Run",
+                      onPress: async () => {
+                        setRunningTest(true);
+                        try {
+                          const steps = await runPutawayBoxScanAutomatedTest();
+                          const lines = steps
+                            .map((s) => `${s.status === "completed" ? "✅" : "❌"} ${s.step}: ${s.message}`)
+                            .join("\n");
+                          const failed = steps.some((s) => s.status === "failed");
+                          Alert.alert(
+                            failed ? "Putaway test: issues" : "Putaway test",
+                            lines || "No steps recorded.",
+                            [{ text: "OK" }]
+                          );
+                          await refreshSettings();
+                        } catch (error: any) {
+                          Alert.alert(
+                            "Putaway test failed",
+                            error?.message ?? String(error)
+                          );
+                        } finally {
+                          setRunningTest(false);
+                        }
+                      },
+                    },
+                  ]
+                );
+              }}
+              disabled={runningTest}
+            >
+              <Text style={styles.menuItemText}>
+                🧪 Test Putaway box scan (DB)
+              </Text>
+              <Text style={styles.menuItemArrow}>→</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.menuItem, { borderLeftColor: "#9C27B0" }]}
@@ -378,6 +431,7 @@ export default function HomeScreen() {
         {settings?.device_id && (
           <Text style={styles.infoText}>Device: {settings.device_id}</Text>
         )}
+        <Text style={styles.infoText}>Version: {getAppVersionDetails()}</Text>
       </View>
 
       <View style={styles.dangerZone}>

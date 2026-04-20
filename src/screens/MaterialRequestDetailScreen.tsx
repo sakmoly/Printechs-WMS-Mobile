@@ -1425,59 +1425,88 @@ export default function MaterialRequestDetailScreen() {
         materialRequest.from_warehouse
       );
 
-      // Handle 404 (endpoint not found) gracefully
+      // Handle 404 (endpoint not found) gracefully - try alternative endpoint
+      let responseToUse: any = response;
       if (response === null) {
         console.log(
-          `ℹ️ Stock item endpoint not found (404) for ${itemCode} - this endpoint may not be implemented yet`
+          `ℹ️ Stock item endpoint not found (404) for ${itemCode}, trying getItemLocations...`
         );
-        // Continue with empty stock data - will show mock data if needed
-        setStockData([]);
-        return;
+        const altResponse = await apiService.getItemLocations(
+          materialRequest.from_warehouse,
+          itemCode
+        );
+        if (Array.isArray(altResponse) && altResponse.length > 0) {
+          responseToUse = altResponse;
+          console.log(`📦 getItemLocations returned ${altResponse.length} entries`);
+        } else if (altResponse && typeof altResponse === "object") {
+          const arr = (altResponse as any).data ?? (altResponse as any).locations ?? (altResponse as any).stock;
+          if (Array.isArray(arr) && arr.length > 0) {
+            responseToUse = arr;
+            console.log(`📦 getItemLocations (wrapped) returned ${arr.length} entries`);
+          }
+        }
+        if (responseToUse === null) {
+          setStockData([]);
+          setLoadingStock(false);
+          return;
+        }
       }
 
       console.log(`📦 Stock API response for ${itemCode}:`, {
-        responseType: typeof response,
-        isArray: Array.isArray(response),
+        responseType: typeof responseToUse,
+        isArray: Array.isArray(responseToUse),
         responseKeys:
-          response && typeof response === "object" ? Object.keys(response) : [],
-        responsePreview: JSON.stringify(response).substring(0, 200),
+          responseToUse && typeof responseToUse === "object" ? Object.keys(responseToUse) : [],
+        responsePreview: JSON.stringify(responseToUse).substring(0, 200),
       });
 
-      // Handle different response formats
+      // Handle different response formats (support all known backend shapes so no locations/cartons are missed)
       let stockEntries: any[] = [];
-      if (Array.isArray(response)) {
-        stockEntries = response;
+      if (Array.isArray(responseToUse)) {
+        stockEntries = responseToUse;
         console.log(`📦 Response is array with ${stockEntries.length} entries`);
-      } else if (response && typeof response === "object") {
-        if (Array.isArray(response.data)) {
-          stockEntries = response.data;
-          console.log(
-            `📦 Found stock in response.data: ${stockEntries.length} entries`
+      } else if (responseToUse && typeof responseToUse === "object") {
+        const data = responseToUse.data;
+        if (Array.isArray(responseToUse.data)) {
+          stockEntries = responseToUse.data;
+        } else if (Array.isArray(responseToUse.stock)) {
+          stockEntries = responseToUse.stock;
+        } else if (Array.isArray(responseToUse.locations)) {
+          stockEntries = responseToUse.locations;
+        } else if (Array.isArray(responseToUse.stock_ledger)) {
+          stockEntries = responseToUse.stock_ledger;
+        } else if (Array.isArray(responseToUse.items)) {
+          stockEntries = responseToUse.items;
+        } else if (Array.isArray(responseToUse.entries)) {
+          stockEntries = responseToUse.entries;
+        } else if (data && typeof data === "object") {
+          if (Array.isArray(data.locations)) stockEntries = data.locations;
+          else if (Array.isArray(data.stock)) stockEntries = data.stock;
+          else if (Array.isArray(data.items)) stockEntries = data.items;
+          else if (Array.isArray(data)) stockEntries = data;
+        }
+        if (stockEntries.length === 0 && (responseToUse.location_id || responseToUse.bin_location)) {
+          stockEntries = [responseToUse];
+        }
+        console.log(
+          `📦 Extracted stock entries: ${stockEntries.length} (keys checked: data, stock, locations, stock_ledger, items, entries, data.locations, data.stock, data.items)`
+        );
+        if (stockEntries.length === 0) {
+          console.warn(`⚠️ No array found in response, keys:`, Object.keys(responseToUse));
+          const altResponse = await apiService.getItemLocations(
+            materialRequest.from_warehouse,
+            itemCode
           );
-        } else if (Array.isArray(response.stock)) {
-          stockEntries = response.stock;
-          console.log(
-            `📦 Found stock in response.stock: ${stockEntries.length} entries`
-          );
-        } else if (Array.isArray(response.locations)) {
-          stockEntries = response.locations;
-          console.log(
-            `📦 Found stock in response.locations: ${stockEntries.length} entries`
-          );
-        } else if (Array.isArray(response.stock_ledger)) {
-          stockEntries = response.stock_ledger;
-          console.log(
-            `📦 Found stock in response.stock_ledger: ${stockEntries.length} entries`
-          );
-        } else if (response.location_id || response.bin_location) {
-          // Single location response
-          stockEntries = [response];
-          console.log(`📦 Response is single location object`);
-        } else {
-          console.warn(
-            `⚠️ Unknown response format, keys:`,
-            Object.keys(response)
-          );
+          if (Array.isArray(altResponse) && altResponse.length > 0) {
+            stockEntries = altResponse;
+            console.log(`📦 Fallback getItemLocations: ${stockEntries.length} entries`);
+          } else if (altResponse && typeof altResponse === "object") {
+            const arr = (altResponse as any).data ?? (altResponse as any).locations ?? (altResponse as any).stock;
+            if (Array.isArray(arr) && arr.length > 0) {
+              stockEntries = arr;
+              console.log(`📦 Fallback getItemLocations (wrapped): ${stockEntries.length} entries`);
+            }
+          }
         }
       } else {
         console.warn(`⚠️ Unexpected response type:`, typeof response);
@@ -1501,14 +1530,41 @@ export default function MaterialRequestDetailScreen() {
         );
       }
 
+      // Helper: get quantity from entry (backend may use balance_qty, in_qty/out_qty, qty, etc.)
+      const getQty = (entry: any): number => {
+        const balance = entry.balance_qty ?? entry.balance_Qty ?? entry.Balance_Qty;
+        if (balance !== undefined && balance !== null && !Number.isNaN(Number(balance))) {
+          return Number(balance);
+        }
+        const inQty = entry.in_qty ?? entry.in_Qty ?? entry.In_Qty ?? 0;
+        const outQty = entry.out_qty ?? entry.out_Qty ?? entry.Out_Qty ?? 0;
+        if (inQty !== undefined || outQty !== undefined) {
+          return (Number(inQty) || 0) - (Number(outQty) || 0);
+        }
+        return (
+          entry.qty ??
+          entry.quantity ??
+          entry.available_qty ??
+          entry.Available_Qty ??
+          entry.stock_qty ??
+          entry.stock_quantity ??
+          entry.available_quantity ??
+          entry.total_qty ??
+          0
+        );
+      };
+
       // Check format: grouped (has cartons array) vs flat (has carton_id directly)
-      const isGroupedFormat = stockEntries.length > 0 && 
-        stockEntries[0].bin_location && 
+      const hasCartonId = (e: any) =>
+        !!(e.carton_id || e.carton_ID || e.Carton_ID || e.cartonId);
+      const isGroupedFormat =
+        stockEntries.length > 0 &&
+        stockEntries[0].bin_location &&
         Array.isArray(stockEntries[0].cartons) &&
-        stockEntries[0].total_qty !== undefined;
-      
-      const isFlatFormatWithCartonId = stockEntries.length > 0 && 
-        (stockEntries[0].carton_id || stockEntries[0].carton_ID || stockEntries[0].Carton_ID);
+        (stockEntries[0].total_qty !== undefined || (Array.isArray(stockEntries[0].cartons) && stockEntries[0].cartons.length > 0));
+
+      const isFlatFormatWithCartonId =
+        stockEntries.length > 0 && stockEntries.some((e: any) => hasCartonId(e));
 
       console.log(`📦 Detected format: ${isGroupedFormat ? "Grouped (bin_location + cartons)" : isFlatFormatWithCartonId ? "Flat (location_id + carton_id)" : "Legacy (location_id + qty)"}`);
 
@@ -1530,8 +1586,17 @@ export default function MaterialRequestDetailScreen() {
           })
           .map((entry) => {
             const locationId = entry.bin_location || "Unknown";
-            const totalQty = entry.total_qty || 0;
-            const cartons = Array.isArray(entry.cartons) ? entry.cartons : [];
+            const totalQty =
+              entry.total_qty ?? getQty(entry) ??
+              (Array.isArray(entry.cartons)
+                ? entry.cartons.reduce((s: number, c: any) => s + (c.qty ?? c.quantity ?? 0), 0)
+                : 0);
+            const cartons = Array.isArray(entry.cartons)
+              ? entry.cartons.map((c: any) => ({
+                  carton_id: c.carton_id ?? c.carton_ID ?? c.Carton_ID ?? "",
+                  qty: c.qty ?? c.quantity ?? getQty(c) ?? 0,
+                }))
+              : [];
 
             console.log(
               `📦 Processing grouped entry:`,
@@ -1587,17 +1652,7 @@ export default function MaterialRequestDetailScreen() {
             entry.cartonId ||
             null;
 
-          // Try multiple field names for quantity
-          const qty =
-            entry.qty ||
-            entry.quantity ||
-            entry.available_qty ||
-            entry.Available_Qty ||
-            entry.stock_qty ||
-            entry.stock_quantity ||
-            entry.available_quantity ||
-            entry.total_qty ||
-            0;
+          const qty = getQty(entry);
 
           if (!locationId || locationId === "Unknown") {
             console.warn(`⚠️ Entry missing location:`, entry);
@@ -1605,11 +1660,10 @@ export default function MaterialRequestDetailScreen() {
           }
 
           if (qty <= 0) {
-            console.warn(`⚠️ Entry has zero qty:`, entry);
+            console.warn(`⚠️ Entry has zero qty (skipping):`, entry);
             return;
           }
 
-          // Get or create location entry
           if (!locationMap.has(locationId)) {
             locationMap.set(locationId, {
               location_id: locationId,
@@ -1619,20 +1673,13 @@ export default function MaterialRequestDetailScreen() {
           }
 
           const locationEntry = locationMap.get(locationId)!;
-          
-          // Add carton if carton_id exists
           if (cartonId) {
-            locationEntry.cartons.push({
-              carton_id: cartonId,
-              qty: qty,
-            });
+            locationEntry.cartons.push({ carton_id: cartonId, qty });
           }
-          
-          // Add to total qty
           locationEntry.qty += qty;
 
           console.log(
-            `📦 Processing flat entry with carton_id: location=${locationId}, carton_id=${cartonId}, qty=${qty}`
+            `📦 Processing flat entry: location=${locationId}, carton_id=${cartonId || "N/A"}, qty=${qty}`
           );
         });
 
@@ -1661,16 +1708,7 @@ export default function MaterialRequestDetailScreen() {
                 : null) ||
               "Unknown";
 
-            // Try multiple field names for quantity
-            const qty =
-              entry.qty ||
-              entry.quantity ||
-              entry.available_qty ||
-              entry.stock_qty ||
-              entry.stock_quantity ||
-              entry.available_quantity ||
-              entry.total_qty ||
-              0;
+            const qty = getQty(entry);
 
             console.log(
               `📦 Processing legacy entry: location=${locationId}, qty=${qty}`
@@ -2163,6 +2201,12 @@ export default function MaterialRequestDetailScreen() {
                 <Text style={styles.modalEmptyText}>
                   No stock available for this item
                 </Text>
+                <TouchableOpacity
+                  style={styles.modalRefreshButton}
+                  onPress={() => selectedItemCode && handleViewStock(selectedItemCode)}
+                >
+                  <Text style={styles.modalRefreshButtonText}>Refresh</Text>
+                </TouchableOpacity>
               </View>
             ) : (
               <ScrollView style={styles.modalContent}>
@@ -2213,6 +2257,12 @@ export default function MaterialRequestDetailScreen() {
                   }}
                   scrollEnabled={false}
                 />
+                <TouchableOpacity
+                  style={styles.modalRefreshButton}
+                  onPress={() => selectedItemCode && handleViewStock(selectedItemCode)}
+                >
+                  <Text style={styles.modalRefreshButtonText}>Refresh</Text>
+                </TouchableOpacity>
               </ScrollView>
             )}
           </View>
@@ -2531,6 +2581,19 @@ const styles = StyleSheet.create({
   modalEmptyText: {
     fontSize: 14,
     color: "#666",
+  },
+  modalRefreshButton: {
+    marginTop: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    backgroundColor: "#FF9800",
+    borderRadius: 8,
+    alignSelf: "center",
+  },
+  modalRefreshButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#FFF",
   },
   stockListHeader: {
     flexDirection: "row",
