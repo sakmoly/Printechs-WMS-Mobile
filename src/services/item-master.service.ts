@@ -49,7 +49,7 @@ export const resolveItemFromBarcode = async (
       return {
         item_code: barcodeMap.item_code,
         barcode: barcodeMap.barcode,
-        item_name: null,
+        item_name: undefined,
       };
     }
 
@@ -93,7 +93,7 @@ export const resolveItemFromBarcode = async (
       const { fetchAllItemMasterRowsForLookup } = await import(
         "./item-master-sync.service"
       );
-      const response = await fetchAllItemMasterRowsForLookup().catch((error: any) => {
+      const response: unknown = await fetchAllItemMasterRowsForLookup().catch((error: any) => {
         // Check if it's a network error (expected when offline or server unavailable)
         const isNetworkError =
           error?.message?.includes("Network") ||
@@ -126,15 +126,17 @@ export const resolveItemFromBarcode = async (
       } else {
         // Handle different response formats
         let items: any[] = [];
-        if (Array.isArray(response)) {
-          items = response;
-        } else if (response && typeof response === "object") {
-          if (Array.isArray(response.data)) {
-            items = response.data;
-          } else if (Array.isArray(response.items)) {
-            items = response.items;
-          } else if (Array.isArray(response.result)) {
-            items = response.result;
+        const r = response as Record<string, unknown> | unknown[] | null;
+        if (Array.isArray(r)) {
+          items = r;
+        } else if (r && typeof r === "object") {
+          const obj = r as Record<string, unknown>;
+          if (Array.isArray(obj.data)) {
+            items = obj.data as any[];
+          } else if (Array.isArray(obj.items)) {
+            items = obj.items as any[];
+          } else if (Array.isArray(obj.result)) {
+            items = obj.result as any[];
           }
         }
 

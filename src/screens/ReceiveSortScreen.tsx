@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from "react";
 import {
   View,
   Text,
@@ -10,6 +16,7 @@ import {
   Modal,
   Dimensions,
   TextInput,
+  Switch,
 } from "react-native";
 import {
   useNavigation,
@@ -22,10 +29,36 @@ import { StatusBadge } from "../components/StatusBadge";
 import { addEvent } from "../services/event-queue.service";
 import { dataService } from "../services/data.service";
 import { apiService } from "../services/api.service";
+import {
+  pushReceivingCartonStatusServerThenLocal,
+  pushReceivedCartonStatusServerThenLocal,
+} from "../services/carton-status-sync.service";
 import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { resolveItemFromBarcode } from "../services/item-master.service";
 import { normalizeASN } from "../utils/asn";
+import { getServerUnloadLineForCarton } from "../utils/inbound-unload-server-check";
+import {
+  fetchBackendCartonLockFromASN,
+  isOtherScannerLock,
+  parseAsnPayloadForCartonLock,
+} from "../utils/inbound-carton-lock-from-asn";
+import { parseAsnPayloadForReceiveSortServerBlock } from "../utils/asn-carton-receive-server-gate";
+import {
+  storeCodesMatchForTO,
+  compactStoreCodeKey,
+  parseBoxIdStoreSlug,
+} from "../utils/box-id";
+import {
+  itemCodesMatchForAllocation,
+  storeFieldFromAllocationRow,
+  itemCodeFromAllocationRow,
+} from "../utils/allocation-row-fields";
+import {
+  qtyKeyForScannedState,
+  scannedQtyLookup,
+} from "../utils/scanned-qty-lookup";
+import { canonicalStoreForToLine } from "../utils/to-store-master";
 import { normalizeItemMasterBarcode } from "../utils/itemMasterBarcode";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import {
@@ -34,18 +67,114 @@ import {
   clearWorkflowState,
 } from "../services/workflow-state.service";
 import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
+import { settingsMatchUnloadedActor } from "../utils/unload-actor-match";
+import { createdByFromSettings } from "../utils/box-created-by";
+import { isDeviceOnline } from "../utils/network-check";
+
+const RECEIVED_WITH_SHORTAGE_STATUS = "Received with Shortage";
+
+const isCompletedCartonStatus = (status?: string | null) => {
+  const normalized = String(status || "").trim().toUpperCase();
+  return normalized === "RECEIVED" || normalized === "RECEIVED WITH SHORTAGE";
+};
+
+/**
+ * Some backends return HTTP 200 with { locked: false, message: "... by <user>" }
+ * when the carton is already active for that same user (resume / duplicate lock).
+ * Local DB may still show Unloaded — do not treat that as "another user" blocking.
+ * Match either user_id or user_code — ERP often uses one in lock text and the other on unload lines.
+ */
+function cartonLockResponseMeansCurrentUserAlreadyHolds(
+  lockResponse: unknown,
+  identity:
+    | { user_id?: string | null; user_code?: string | null }
+    | string
+    | null
+    | undefined
+): boolean {
+  const lr: any = lockResponse;
+  if (!lr || typeof lr !== "object") return false;
+
+  let ids: string[];
+  if (identity && typeof identity === "object" && !Array.isArray(identity)) {
+    ids = [
+      String(identity.user_id ?? "").trim(),
+      String(identity.user_code ?? "").trim(),
+    ].filter(Boolean);
+  } else {
+    const s = String(identity ?? "").trim();
+    ids = s ? [s] : [];
+  }
+  if (!ids.length) return false;
+
+  const message = String(
+    lr?.data?.message ?? lr?.message ?? lr?.error?.message ?? lr?.error ?? ""
+  );
+
+  const fromFields = String(
+    lr?.data?.locked_by ??
+      lr?.locked_by ??
+      lr?.data?.existing_user ??
+      lr?.existing_user ??
+      lr?.data?.locked_user ??
+      ""
+  ).trim();
+
+  const processedBy = message.match(
+    /(?:being\s+)?processed\s+by\s+(\S+)/i
+  );
+  const fromMessage = processedBy ? processedBy[1].replace(/[.,;]+$/, "") : "";
+
+  const holder = fromFields || fromMessage;
+  if (!holder) return false;
+  const h = holder.toLowerCase();
+  return ids.some((id) => id.toLowerCase() === h);
+}
+
+async function requireOnlineForReceiving(): Promise<boolean> {
+  const online = await isDeviceOnline();
+  if (online) return true;
+  Alert.alert(
+    "Network Required",
+    "Receiving requires a live server connection.\n\nPlease connect WiFi/mobile data, make sure the backend is reachable, then try again.",
+  );
+  return false;
+}
+
+function normalizeLockOwner(value: unknown): string {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function settingsMatchCartonLockOwner(
+  settings: { user_id?: string | null; user_code?: string | null },
+  lockedBy: unknown
+): boolean {
+  const owner = normalizeLockOwner(lockedBy);
+  if (!owner) return false;
+
+  return [settings.user_id, settings.user_code]
+    .map(normalizeLockOwner)
+    .filter(Boolean)
+    .includes(owner);
+}
 
 type WorkflowState = "SELECT_CARTON" | "SCAN_ITEM" | "SCAN_BOX";
 
 export default function ReceiveSortScreen() {
-  console.log("🔄 ReceiveSortScreen RENDERED - NEW UI VERSION 2.0");
   const navigation = useNavigation();
   const route = useRoute();
   const { activeASN, activeSession, refreshSettings } = useApp();
   const [workflowState, setWorkflowState] =
     useState<WorkflowState>("SELECT_CARTON");
   const [lockedCarton, setLockedCarton] = useState<string | null>(null);
+  const [scannerFocusSignal, setScannerFocusSignal] = useState(0);
   const [cartonItems, setCartonItems] = useState<any[]>([]);
+  /** True while `loadCartonItems` is reading local `asn_carton_map` (per-device DB). */
+  const [cartonLinesLoading, setCartonLinesLoading] = useState(false);
+  const [cartonLinesLoadError, setCartonLinesLoadError] = useState<
+    string | null
+  >(null);
+  const cartonLoadSeqRef = useRef(0);
   const [scannedItems, setScannedItems] = useState<any[]>([]);
   const [scannedQuantities, setScannedQuantities] = useState<
     Record<string, number>
@@ -158,6 +287,16 @@ export default function ReceiveSortScreen() {
   const [filteredAvailableBoxes, setFilteredAvailableBoxes] = useState<any[]>(
     []
   );
+  /** When on, carton lists only show rows whose `created_by` matches Settings (user_id / user_code). */
+  const [onlyMySortBoxes, setOnlyMySortBoxes] = useState(true);
+  const [sortBoxUser, setSortBoxUser] = useState<{
+    user_id?: string;
+    user_code?: string;
+  }>({});
+  const onlyMySortBoxesRef = useRef(true);
+  useEffect(() => {
+    onlyMySortBoxesRef.current = onlyMySortBoxes;
+  }, [onlyMySortBoxes]);
   // Track item quantities in each box for the current item being edited
   const [boxItemQuantities, setBoxItemQuantities] = useState<
     Record<string, number>
@@ -176,14 +315,42 @@ export default function ReceiveSortScreen() {
     putawayQty?: number; // Putaway quantity for this item
     remainingQty: number;
     asnQty?: number; // ASN quantity for this item
-    allocations: Array<{
+    allocations: {
       store: string;
       allocatedQty: number;
       scannedQty: number;
       boxes: string[];
-    }>;
+    }[];
   } | null>(null);
   const [lastScannedItem, setLastScannedItem] = useState<string | null>(null);
+  /** Inline feedback after scans (success/errors that would otherwise be silent). */
+  const [scanFeedback, setScanFeedback] = useState<{
+    kind: "ok" | "err";
+    text: string;
+  } | null>(null);
+  const scanFeedbackClearRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+
+  const showScanFeedback = useCallback((kind: "ok" | "err", text: string) => {
+    if (scanFeedbackClearRef.current) {
+      clearTimeout(scanFeedbackClearRef.current);
+      scanFeedbackClearRef.current = null;
+    }
+    setScanFeedback({ kind, text });
+    scanFeedbackClearRef.current = setTimeout(() => {
+      setScanFeedback(null);
+      scanFeedbackClearRef.current = null;
+    }, 3200);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scanFeedbackClearRef.current) {
+        clearTimeout(scanFeedbackClearRef.current);
+      }
+    };
+  }, []);
   const [showExpectedItemsModal, setShowExpectedItemsModal] = useState(false);
   const [showScannedItemsModal, setShowScannedItemsModal] = useState(false);
   const [expectedItemsSearchQuery, setExpectedItemsSearchQuery] = useState("");
@@ -194,22 +361,22 @@ export default function ReceiveSortScreen() {
   const [toBreakdownModal, setToBreakdownModal] = useState<{
     visible: boolean;
     itemCode: string;
-    breakdown: Array<{
+    breakdown: {
       store: string;
       toQty: number;
       scannedQty: number;
       remainingQty: number;
       scannedByCarton?: Map<string, number>; // Add carton breakdown per store
-    }>;
+    }[];
     scannedByCarton: Map<string, number>;
     totalScanned?: number; // Total scanned from database (for comparison)
     unmatchedScanned?: number; // Scanned items that don't match any TO allocation
-    unmatchedItems?: Array<{
+    unmatchedItems?: {
       box_id: string | null;
       store: string | null;
       carton_id: string | null;
       scanned_qty: number;
-    }>; // Details of unmatched items
+    }[]; // Details of unmatched items
   } | null>(null);
   const [editQtyModal, setEditQtyModal] = useState<{
     visible: boolean;
@@ -259,8 +426,23 @@ export default function ReceiveSortScreen() {
         setWarehousesAndStores(storesList);
       } catch (error: any) {
         console.warn("⚠️ Could not fetch warehouses/stores:", error);
-        // Fallback to empty array - will use legacy "WAREHOUSE" check
-        setWarehousesAndStores([]);
+        try {
+          const db = await getDatabase();
+          if (db) {
+            const cached = await db.getAllAsync<{
+              code: string;
+              name: string;
+              warehouse_type: string;
+            }>(
+              "SELECT code, name, warehouse_type FROM warehouse_store_cache ORDER BY code"
+            );
+            setWarehousesAndStores(cached || []);
+          } else {
+            setWarehousesAndStores([]);
+          }
+        } catch {
+          setWarehousesAndStores([]);
+        }
       }
     };
 
@@ -317,6 +499,73 @@ export default function ReceiveSortScreen() {
     }
   }, [activeASN, activeSession, route.params, lockedCarton, savedStateLoaded]);
 
+  /** Source of truth for on-screen scan counts — never replace with stale workflow file alone. */
+  const refreshScannedStateFromDb = useCallback(async () => {
+    if (!activeASN || !activeSession) return;
+    try {
+      const db = await getDatabase();
+      const na = normalizeASN(activeASN);
+      const scannedItemsFromDB = await db.getAllAsync<{
+        item_code: string;
+        box_id: string | null;
+        scanned_qty: number;
+        carton_id: string | null;
+      }>(
+        `SELECT item_code, box_id, scanned_qty, carton_id 
+         FROM scanned_items 
+         WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?`,
+        [activeASN, na, activeSession]
+      );
+
+      const lock = lockedCarton?.trim() ?? "";
+      const rowsForUi =
+        lock.length > 0
+          ? scannedItemsFromDB.filter(
+              (row) =>
+                String(row.carton_id ?? "").trim() !== "" &&
+                String(row.carton_id).trim().toUpperCase() === lock.toUpperCase()
+            )
+          : scannedItemsFromDB;
+
+      // List + per-item totals for the current supplier carton only (same BOX across cartons must not mix counts)
+      setScannedItemsWithLog(rowsForUi);
+
+      const scannedQtyMap = new Map<string, number>();
+      rowsForUi.forEach((row) => {
+        const code = qtyKeyForScannedState(row.item_code);
+        if (!code) return;
+        const current = scannedQtyMap.get(code) || 0;
+        scannedQtyMap.set(code, current + (row.scanned_qty || 0));
+      });
+      const newScannedQuantities: Record<string, number> = {};
+      scannedQtyMap.forEach((qty, code) => {
+        newScannedQuantities[code] = qty;
+      });
+      setScannedQuantitiesWithLog(newScannedQuantities);
+
+      // Session-wide totals (all supplier cartons) — used where a global view is needed
+      const totalScannedItemsFromDB = await db.getAllAsync<{
+        item_code: string;
+        scanned_qty: number;
+      }>(
+        `SELECT item_code, SUM(scanned_qty) as scanned_qty 
+         FROM scanned_items 
+         WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?
+         GROUP BY item_code`,
+        [activeASN, na, activeSession]
+      );
+      const quantitiesMap: Record<string, number> = {};
+      totalScannedItemsFromDB.forEach((row) => {
+        const code = qtyKeyForScannedState(row.item_code);
+        if (!code) return;
+        quantitiesMap[code] = row.scanned_qty || 0;
+      });
+      setTotalScannedQuantities(quantitiesMap);
+    } catch (e: any) {
+      console.warn("refreshScannedStateFromDb failed:", e?.message);
+    }
+  }, [activeASN, activeSession, lockedCarton]);
+
   const loadSavedState = useCallback(async () => {
     if (!activeASN || !activeSession) return;
     const normalizedASN = normalizeASN(activeASN);
@@ -343,8 +592,15 @@ export default function ReceiveSortScreen() {
         });
         setLockedCartonWithLog(savedState.locked_carton);
         setCurrentItemWithLog(savedState.current_item);
-        setScannedItemsWithLog(savedState.scanned_items || []);
-        setScannedQuantitiesWithLog(savedState.scanned_quantities || {});
+        await refreshScannedStateFromDb();
+        const restoredScanned = savedState.scanned_items || [];
+        const lastFromSaved =
+          restoredScanned.length > 0
+            ? String(
+                restoredScanned[restoredScanned.length - 1]?.item_code ?? ""
+              ).trim()
+            : "";
+        setLastScannedItem(lastFromSaved || null);
         // Always start with SCAN_ITEM if there's no currentItem
         // This ensures the flow is: Scan Item → Scan Box → Scan Item → Scan Box
         if (!savedState.current_item) {
@@ -355,10 +611,22 @@ export default function ReceiveSortScreen() {
 
         // Load carton items if carton is locked
         if (savedState.locked_carton) {
-          const items = await dataService.getCartonItems(
+          let items = await dataService.getCartonItems(
             activeASN, // Use original format (cartons are stored with original format)
             savedState.locked_carton
           );
+          if (items.length === 0) {
+            const hydrated = await dataService.hydrateCartonLinesFromAsnApi(
+              activeASN,
+              savedState.locked_carton
+            );
+            if (hydrated.ok) {
+              items = await dataService.getCartonItems(
+                activeASN,
+                savedState.locked_carton
+              );
+            }
+          }
           setCartonItemsWithLog(items);
 
           // Verify carton is still locked by current user (in case app was restarted)
@@ -370,28 +638,48 @@ export default function ReceiveSortScreen() {
           );
 
           if (cartonStatus && cartonStatus.status === "Receiving") {
-            // Carton is Receiving - allow resuming work regardless of user_id
-            // (user_id may have changed between sessions, but carton is still in progress)
-            const isSameUser = cartonStatus.locked_by === settings.user_id;
+            const isSameUser = settingsMatchCartonLockOwner(
+              settings,
+              cartonStatus.locked_by
+            );
             if (!isSameUser) {
-              // Different user_id but carton is Receiving - allow resume in demo mode or if carton is in progress
-              // This handles cases where user_id was regenerated
               console.log(
-                "⚠️ Carton locked by different user_id, but Receiving - allowing resume",
+                "⚠️ Carton locked by another user/device; not restoring ReceiveSort state",
                 {
                   carton: savedState.locked_carton,
                   locked_by: cartonStatus.locked_by,
                   current_user: settings.user_id,
+                  current_user_code: settings.user_code,
                 }
               );
+              setLockedCartonWithLog(null);
+              setWorkflowStateWithLog("SELECT_CARTON");
+              setScannedItemsWithLog([]);
+              setScannedQuantitiesWithLog({});
+              setCurrentItemWithLog(null);
+              cartonLoadSeqRef.current += 1;
+              setCartonLinesLoading(false);
+              setCartonLinesLoadError(null);
+              setCartonItemsWithLog([]);
+              setLastScannedItem(null);
+              await clearWorkflowState(
+                normalizedASN,
+                activeSession,
+                "ReceiveSort"
+              );
+              Alert.alert(
+                "Carton Already Locked",
+                `Carton ${savedState.locked_carton} is locked by ${
+                  cartonStatus.locked_by || "another user"
+                }.\n\nYou cannot continue this carton from this device.`
+              );
+              return;
             }
-            // Restore lock info and allow resuming
             setLockInfo({
               locked_by: cartonStatus.locked_by,
               locked_on: cartonStatus.locked_on,
             });
-            // Carton restored successfully - user can continue work
-          } else if (cartonStatus && cartonStatus.status === "Received") {
+          } else if (cartonStatus && isCompletedCartonStatus(cartonStatus.status)) {
             // Carton already completed - clear the saved state
             logStateChange("CLEAR_STATE_CARTON_COMPLETED", {
               carton: savedState.locked_carton,
@@ -401,7 +689,11 @@ export default function ReceiveSortScreen() {
             setScannedItemsWithLog([]);
             setScannedQuantitiesWithLog({});
             setCurrentItemWithLog(null);
+            cartonLoadSeqRef.current += 1;
+            setCartonLinesLoading(false);
+            setCartonLinesLoadError(null);
             setCartonItemsWithLog([]);
+            setLastScannedItem(null);
             await clearWorkflowState(
               normalizedASN,
               activeSession,
@@ -413,7 +705,7 @@ export default function ReceiveSortScreen() {
         // Skipping saved state restore - carton already locked
       }
     }
-  }, [activeASN, activeSession, lockedCarton]);
+  }, [activeASN, activeSession, lockedCarton, refreshScannedStateFromDb]);
 
   // Save workflow state whenever it changes (with debounce to avoid too many saves)
   useEffect(() => {
@@ -438,8 +730,15 @@ export default function ReceiveSortScreen() {
     total: number;
     unloaded: number;
     inReceiving: number;
+    inReceivingByCurrentUser: number;
     received: number;
-  }>({ total: 0, unloaded: 0, inReceiving: 0, received: 0 });
+  }>({
+    total: 0,
+    unloaded: 0,
+    inReceiving: 0,
+    inReceivingByCurrentUser: 0,
+    received: 0,
+  });
 
   const loadAvailableCartons = async () => {
     if (!activeASN || !activeSession) return;
@@ -481,12 +780,20 @@ export default function ReceiveSortScreen() {
       validCartonIdSet.has(status.carton_id.toUpperCase())
     );
 
+    const settings = await getSettings();
+
+    const isReceivingByCurrentUser = (c: any) =>
+      c.status === "Receiving" &&
+      settingsMatchCartonLockOwner(settings, c.locked_by);
+
     // Calculate status counts from valid statuses only
     const statusCounts = {
       total: validStatuses.length,
       unloaded: validStatuses.filter((c) => c.status === "Unloaded").length,
       inReceiving: validStatuses.filter((c) => c.status === "Receiving").length,
-      received: validStatuses.filter((c) => c.status === "Received").length,
+      inReceivingByCurrentUser: validStatuses.filter(isReceivingByCurrentUser)
+        .length,
+      received: validStatuses.filter((c) => isCompletedCartonStatus(c.status)).length,
     };
     setAllCartonsStatus(statusCounts);
 
@@ -494,20 +801,17 @@ export default function ReceiveSortScreen() {
     // 1. Unloaded (available to start)
     // 2. Receiving and locked by current user (in-progress cartons to resume)
     // 3. Pending (can be scanned to start - will be unloaded automatically)
-    const settings = await getSettings();
-    const currentUserId = settings.user_id
-      ? String(settings.user_id).trim()
-      : "";
-
     const available = validStatuses.filter((c) => {
-      if (c.status === "Unloaded") return true;
+      if (c.status === "Unloaded") {
+        const unloadedBy = String(c.unloaded_by || "").trim();
+        return (
+          unloadedBy.length > 0 &&
+          settingsMatchUnloadedActor(settings, unloadedBy)
+        );
+      }
       if (c.status === "Pending") return true; // Show pending cartons - can be scanned to start
       if (c.status === "Receiving") {
-        const lockedBy = c.locked_by ? String(c.locked_by).trim() : "";
-        // Show if locked by current user OR if no lock (for demo mode compatibility)
-        return (
-          lockedBy === currentUserId || (!lockedBy && settings.demo_mode === 1)
-        );
+        return isReceivingByCurrentUser(c);
       }
       return false;
     });
@@ -518,13 +822,14 @@ export default function ReceiveSortScreen() {
       unloaded: statusCounts.unloaded,
       pending: statuses.filter((c) => c.status === "Pending").length,
       inReceiving: statusCounts.inReceiving,
-      inReceivingByUser: available.filter((c) => c.status === "Receiving")
-        .length,
-      currentUserId,
+      inReceivingByUser: statusCounts.inReceivingByCurrentUser,
+      currentUserId: settings.user_id,
+      currentUserCode: settings.user_code,
       allStatuses: statuses.map((c) => ({
         carton: c.carton_id,
         status: c.status,
         locked_by: c.locked_by,
+        unloaded_by: c.unloaded_by,
       })),
     });
 
@@ -646,6 +951,12 @@ export default function ReceiveSortScreen() {
   // Also check for saved state when returning to screen after app restart
   useFocusEffect(
     React.useCallback(() => {
+      void getSettings().then((s) =>
+        setSortBoxUser({
+          user_id: s.user_id ? String(s.user_id).trim() : undefined,
+          user_code: s.user_code ? String(s.user_code).trim() : undefined,
+        })
+      );
       // ✅ Get updated received qty from backend when screen gains focus
       if (activeASN && activeSession) {
         refreshASNReceivedQtyFromBackend();
@@ -678,6 +989,9 @@ export default function ReceiveSortScreen() {
           setScannedItemsWithLog([]);
           setScannedQuantitiesWithLog({});
           setCurrentItemWithLog(null);
+          cartonLoadSeqRef.current += 1;
+          setCartonLinesLoading(false);
+          setCartonLinesLoadError(null);
           setCartonItemsWithLog([]);
           setSavedStateLoaded(false); // Allow saved state to be reloaded
 
@@ -708,14 +1022,11 @@ export default function ReceiveSortScreen() {
                       ),
                     },
                   });
-                  setScannedItemsWithLog(savedState.scanned_items || []);
-                  setScannedQuantitiesWithLog(
-                    savedState.scanned_quantities || {}
-                  );
                   setCurrentItemWithLog(savedState.current_item);
                   setWorkflowStateWithLog(
                     savedState.workflow_state as WorkflowState
                   );
+                  void refreshScannedStateFromDb();
                 }
               }
             );
@@ -743,6 +1054,7 @@ export default function ReceiveSortScreen() {
       savedStateLoaded,
       loadSavedState,
       refreshASNReceivedQtyFromBackend,
+      refreshScannedStateFromDb,
     ])
   );
 
@@ -768,6 +1080,9 @@ export default function ReceiveSortScreen() {
         setScannedItemsWithLog([]);
         setScannedQuantitiesWithLog({});
         setCurrentItemWithLog(null);
+        cartonLoadSeqRef.current += 1;
+        setCartonLinesLoading(false);
+        setCartonLinesLoadError(null);
         setCartonItemsWithLog([]);
         // Wait a bit for state to clear, then continue - trigger the useEffect again
         setTimeout(() => {
@@ -791,9 +1106,7 @@ export default function ReceiveSortScreen() {
             "ReceiveSort"
           );
           if (savedState && savedState.locked_carton === cartonIdFromParams) {
-            // Restoring saved state for already-locked carton
-            setScannedItemsWithLog(savedState.scanned_items || []);
-            setScannedQuantitiesWithLog(savedState.scanned_quantities || {});
+            // Restoring saved state for already-locked carton (counts from DB, not workflow file)
             setCurrentItemWithLog(savedState.current_item);
             // Always start with SCAN_ITEM if there's no currentItem
             // This ensures the flow is: Scan Item → Scan Box → Scan Item → Scan Box
@@ -804,6 +1117,7 @@ export default function ReceiveSortScreen() {
                 savedState.workflow_state as WorkflowState
               );
             }
+            await refreshScannedStateFromDb();
           }
         })();
         // Clear route params to prevent re-processing
@@ -829,7 +1143,11 @@ export default function ReceiveSortScreen() {
               status: status?.status,
               locked_by: status?.locked_by,
               current_user: settings.user_id,
-              is_same_user: status?.locked_by === settings.user_id,
+              current_user_code: settings.user_code,
+              is_same_user: settingsMatchCartonLockOwner(
+                settings,
+                status?.locked_by
+              ),
             }
           );
 
@@ -837,7 +1155,7 @@ export default function ReceiveSortScreen() {
           if (
             status &&
             status.status === "Receiving" &&
-            status.locked_by === settings.user_id
+            settingsMatchCartonLockOwner(settings, status.locked_by)
           ) {
             console.log(
               `✅ Carton ${cartonIdFromParams} already locked by current user in DB, restoring state`
@@ -871,8 +1189,6 @@ export default function ReceiveSortScreen() {
                   })),
                 },
               });
-              setScannedItemsWithLog(savedState.scanned_items || []);
-              setScannedQuantitiesWithLog(savedState.scanned_quantities || {});
               setCurrentItemWithLog(savedState.current_item);
               // Always start with SCAN_ITEM if there's no currentItem
               // This ensures the flow is: Scan Item → Scan Box → Scan Item → Scan Box
@@ -883,6 +1199,17 @@ export default function ReceiveSortScreen() {
                   savedState.workflow_state as WorkflowState
                 );
               }
+              // Counts from SQLite — never restore scanned_quantities from workflow file
+              // (file is debounced and can race async restore and wipe post-scan state).
+              await refreshScannedStateFromDb();
+              const restoredSi = savedState.scanned_items || [];
+              const lastFromSaved =
+                restoredSi.length > 0
+                  ? String(
+                      restoredSi[restoredSi.length - 1]?.item_code ?? ""
+                    ).trim()
+                  : "";
+              setLastScannedItem(lastFromSaved || null);
             } else {
               // No saved state, start fresh
               logStateChange("NO_SAVED_STATE_IN_CHECK_DATABASE", {
@@ -921,16 +1248,86 @@ export default function ReceiveSortScreen() {
             cartonIdFromParams
           );
 
-          // If carton is already Receiving (regardless of user), restore state immediately
-          // This handles the case where user IDs don't match but carton is already locked
+          // Receiving: only auto-restore when this user holds the lock (never hijack another session).
           if (dbStatus && dbStatus.status === "Receiving") {
-            const isSameUser = dbStatus.locked_by === settings.user_id;
+            const lockBy = String(dbStatus.locked_by || "").trim();
+            const me = String(settings.user_id || "").trim();
+            const isSameUser =
+              lockBy &&
+              me &&
+              (lockBy === me || lockBy.toUpperCase() === me.toUpperCase());
+
+            if (!isSameUser) {
+              if (settings.demo_mode !== 1 && settings.api_url) {
+                try {
+                  const asnRes = await apiService.getASN(activeASN.trim());
+                  const recv = parseAsnPayloadForReceiveSortServerBlock(
+                    asnRes,
+                    cartonIdFromParams
+                  );
+                  if (recv.blocked) {
+                    await dataService.updateCartonStatus({
+                      asn_no: normalizedASN,
+                      inbound_session: activeSession,
+                      carton_id: cartonIdFromParams,
+                      status: "Received",
+                      locked_by: "",
+                      locked_on: "",
+                      updated_on: new Date().toISOString(),
+                    });
+                    navigation.setParams({ cartonId: undefined } as never);
+                    Alert.alert(
+                      "Carton already completed",
+                      recv.reason ??
+                        "Server shows this carton as already received."
+                    );
+                    return;
+                  }
+                  const backendLock = parseAsnPayloadForCartonLock(
+                    asnRes,
+                    cartonIdFromParams
+                  );
+                  if (
+                    backendLock &&
+                    isOtherScannerLock(
+                      backendLock,
+                      settings.user_id || "",
+                      settings.device_id || ""
+                    )
+                  ) {
+                    navigation.setParams({ cartonId: undefined } as never);
+                    Alert.alert(
+                      "Carton in use",
+                      `Another device is receiving this carton (per server).\n\nUser: ${
+                        backendLock.locked_by || "?"
+                      }\n\nYou cannot open this session here.`
+                    );
+                    return;
+                  }
+                } catch (e: any) {
+                  navigation.setParams({ cartonId: undefined } as never);
+                  Alert.alert(
+                    "Could not verify with server",
+                    `${e?.message || "Unknown error"}\n\nCheck your connection.`
+                  );
+                  return;
+                }
+              }
+              navigation.setParams({ cartonId: undefined } as never);
+              Alert.alert(
+                "Carton in use",
+                `Carton ${cartonIdFromParams} is in receiving${
+                  lockBy ? ` (locked by ${lockBy})` : ""
+                }.\n\nUse Unload when it is free, or continue only on the device that holds the lock.`
+              );
+              return;
+            }
+
             console.log(
-              `✅ Database check: Carton ${cartonIdFromParams} is Receiving, restoring state`,
+              `✅ Database check: Carton ${cartonIdFromParams} is Receiving for current user, restoring state`,
               {
                 locked_by: dbStatus.locked_by,
                 current_user: settings.user_id,
-                is_same_user: isSameUser,
               }
             );
             logStateChange("DATABASE_CHECK_RESTORE", {
@@ -940,18 +1337,16 @@ export default function ReceiveSortScreen() {
                 locked_by: dbStatus.locked_by,
                 locked_on: dbStatus.locked_on,
               },
-              is_same_user: isSameUser,
+              is_same_user: true,
             });
             setLockedCartonWithLog(cartonIdFromParams);
 
-            // Load saved workflow state to restore scanned items
             const savedState = await loadWorkflowState(
               normalizedASN,
               activeSession,
               "ReceiveSort"
             );
             if (savedState && savedState.locked_carton === cartonIdFromParams) {
-              // Restoring saved state from database check
               logStateChange("RESTORE_FROM_DATABASE_CHECK", {
                 carton: cartonIdFromParams,
                 savedState: {
@@ -966,28 +1361,33 @@ export default function ReceiveSortScreen() {
                   })),
                 },
               });
-              setScannedItemsWithLog(savedState.scanned_items || []);
-              setScannedQuantitiesWithLog(savedState.scanned_quantities || {});
               setCurrentItemWithLog(savedState.current_item);
               setWorkflowStateWithLog(
                 savedState.workflow_state as WorkflowState
               );
+              await refreshScannedStateFromDb();
+              const restoredSiDb = savedState.scanned_items || [];
+              const lastFromSavedDb =
+                restoredSiDb.length > 0
+                  ? String(
+                      restoredSiDb[restoredSiDb.length - 1]?.item_code ?? ""
+                    ).trim()
+                  : "";
+              setLastScannedItem(lastFromSavedDb || null);
             } else {
-              // No saved state, start fresh
               logStateChange("NO_SAVED_STATE_START_FRESH", {
                 carton: cartonIdFromParams,
               });
               setWorkflowStateWithLog("SCAN_ITEM");
             }
 
-            // Pass cartonId directly to avoid race condition with state update
             if (cartonIdFromParams) {
               await loadCartonItems(cartonIdFromParams);
               await loadLockInfo();
             }
             navigation.setParams({ cartonId: undefined } as never);
             setSavedStateLoaded(true);
-            return; // Exit, don't proceed with locking
+            return;
           }
 
           // Carton is not Receiving - proceed with normal flow to lock it
@@ -1023,7 +1423,7 @@ export default function ReceiveSortScreen() {
                   if (
                     status &&
                     status.status === "Receiving" &&
-                    status.locked_by === settings.user_id
+                    settingsMatchCartonLockOwner(settings, status.locked_by)
                   ) {
                     logStateChange("RESTORE_IN_AUTO_LOCK_CHECK", {
                       carton: cartonId,
@@ -1057,14 +1457,20 @@ export default function ReceiveSortScreen() {
                           })),
                         },
                       });
-                      setScannedItemsWithLog(savedState.scanned_items || []);
-                      setScannedQuantitiesWithLog(
-                        savedState.scanned_quantities || {}
-                      );
                       setCurrentItemWithLog(savedState.current_item);
                       setWorkflowStateWithLog(
                         savedState.workflow_state as WorkflowState
                       );
+                      await refreshScannedStateFromDb();
+                      const restoredSiAl = savedState.scanned_items || [];
+                      const lastAl =
+                        restoredSiAl.length > 0
+                          ? String(
+                              restoredSiAl[restoredSiAl.length - 1]
+                                ?.item_code ?? ""
+                            ).trim()
+                          : "";
+                      setLastScannedItem(lastAl || null);
                     } else {
                       // No saved state, start fresh
                       logStateChange("NO_SAVED_STATE_IN_AUTO_LOCK", {
@@ -1119,7 +1525,7 @@ export default function ReceiveSortScreen() {
                   if (statusLower === "receiving") {
                     // Check if locked by current user - allow them to continue
                     // settings already declared above, reuse it
-                    if (status.locked_by === settings.user_id) {
+                    if (settingsMatchCartonLockOwner(settings, status.locked_by)) {
                       // Same user - restore their session
                       console.log(
                         `✅ Resuming work on carton ${cartonId} (locked by current user)`
@@ -1155,14 +1561,20 @@ export default function ReceiveSortScreen() {
                             ),
                           },
                         });
-                        setScannedItemsWithLog(savedState.scanned_items || []);
-                        setScannedQuantitiesWithLog(
-                          savedState.scanned_quantities || {}
-                        );
                         setCurrentItemWithLog(savedState.current_item);
                         setWorkflowStateWithLog(
                           savedState.workflow_state as WorkflowState
                         );
+                        await refreshScannedStateFromDb();
+                        const restoredSiRw = savedState.scanned_items || [];
+                        const lastRw =
+                          restoredSiRw.length > 0
+                            ? String(
+                                restoredSiRw[restoredSiRw.length - 1]
+                                  ?.item_code ?? ""
+                              ).trim()
+                            : "";
+                        setLastScannedItem(lastRw || null);
                       } else {
                         // No saved state, start fresh
                         logStateChange("NO_SAVED_STATE_IN_RESUME", {
@@ -1171,7 +1583,7 @@ export default function ReceiveSortScreen() {
                         setWorkflowStateWithLog("SCAN_ITEM");
                       }
 
-                      await loadCartonItems();
+                      await loadCartonItems(cartonIdFromParams);
                       await loadLockInfo();
                       // Clear route params to prevent re-processing
                       navigation.setParams({ cartonId: undefined } as never);
@@ -1183,9 +1595,7 @@ export default function ReceiveSortScreen() {
                       );
                       return;
                     } else {
-                      // Locked by different user - check if we can take over (if no work done)
-                      // For now, show error but allow user to force unlock if needed
-                      // settings already declared above, reuse it
+                      // Locked by a different owner: never allow resume/takeover from this device.
                       Alert.alert(
                         "Carton Already in Use",
                         `Carton ${cartonId} is currently being processed by another user.\n\nLocked by: ${
@@ -1193,143 +1603,7 @@ export default function ReceiveSortScreen() {
                         }\nStatus: ${
                           status.status
                         }\n\nPlease select a different carton.`,
-                        [
-                          {
-                            text: "OK",
-                            style: "cancel" as const,
-                          },
-                          // Only show "Force Unlock" in demo mode
-                          ...(settings.demo_mode === 1
-                            ? [
-                                {
-                                  text: "Force Unlock (Demo)",
-                                  style: "destructive" as const,
-                                  onPress: async () => {
-                                    console.log(
-                                      `🔓 Force unlocking carton ${cartonId} in demo mode`
-                                    );
-                                    // Force unlock in demo mode
-                                    await dataService.updateCartonStatus({
-                                      asn_no: normalizedASN,
-                                      inbound_session: activeSession,
-                                      carton_id: cartonId,
-                                      status: "Unloaded",
-                                      locked_by: undefined,
-                                      locked_on: undefined,
-                                      updated_on: new Date().toISOString(),
-                                    });
-                                    // Retry locking by calling the lock logic again
-                                    console.log(
-                                      `🔄 Retrying lock for carton ${cartonId}`
-                                    );
-                                    const retrySettings = await getSettings();
-
-                                    let lockResponse;
-                                    try {
-                                      lockResponse =
-                                        await apiService.lockCarton({
-                                          inbound_session: activeSession,
-                                          asn_no: activeASN, // Use original format from desktop
-                                          carton_id: cartonId,
-                                          user_id: retrySettings.user_id!,
-                                          device_id: retrySettings.device_id!,
-                                        });
-                                      console.log(
-                                        `📋 Retry lock carton API response:`,
-                                        lockResponse
-                                      );
-                                    } catch (error: any) {
-                                      console.error(
-                                        `❌ Retry lock carton API error:`,
-                                        error
-                                      );
-                                      Alert.alert(
-                                        "Error",
-                                        `Failed to lock carton: ${
-                                          error.message || "Unknown error"
-                                        }\n\nPlease check API connection and authentication.`
-                                      );
-                                      setLoading(false);
-                                      return;
-                                    }
-
-                                    // Handle nested response structure: { data: { locked: true } } or { locked: true }
-                                    const isLocked =
-                                      lockResponse?.data?.locked === true ||
-                                      lockResponse?.locked === true ||
-                                      lockResponse?.ok === true;
-                                    if (!isLocked) {
-                                      const errorMessage =
-                                        lockResponse?.data?.message ||
-                                        lockResponse?.message ||
-                                        lockResponse?.error?.message ||
-                                        "Failed to lock carton";
-                                      Alert.alert(
-                                        "Error",
-                                        `Failed to lock carton: ${errorMessage}`
-                                      );
-                                      setLoading(false);
-                                      return;
-                                    }
-
-                                    console.log(
-                                      `✅ Carton ${cartonId} locked successfully (retry)`
-                                    );
-
-                                    // Update local status
-                                    await dataService.updateCartonStatus({
-                                      asn_no: normalizedASN,
-                                      inbound_session: activeSession,
-                                      carton_id: cartonId,
-                                      status: "Receiving",
-                                      locked_by: retrySettings.user_id,
-                                      locked_on: new Date().toISOString(),
-                                      updated_on: new Date().toISOString(),
-                                    });
-
-                                    // Sync status change to backend
-                                    try {
-                                      await apiService.updateCartonStatus({
-                                        asn_no: activeASN, // Use original format from desktop
-                                        inbound_session: activeSession,
-                                        carton_id: cartonId,
-                                        status: "Receiving", // Backend expects "Receiving"
-                                        user_id: retrySettings.user_id,
-                                        device_id: retrySettings.device_id,
-                                      });
-                                      console.log(
-                                        `✅ Carton ${cartonId} status synced to backend: Receiving (retry lock)`
-                                      );
-                                    } catch (apiError: any) {
-                                      console.warn(
-                                        `⚠️ Failed to sync carton ${cartonId} status to backend:`,
-                                        apiError.message
-                                      );
-                                      // Don't block user flow if API sync fails
-                                    }
-
-                                    logStateChange("FORCE_UNLOCK_TAKEOVER", {
-                                      carton: cartonId,
-                                    });
-                                    setLockedCartonWithLog(cartonId);
-                                    setWorkflowStateWithLog("SCAN_ITEM");
-                                    setScannedItemsWithLog([]);
-                                    setScannedQuantitiesWithLog({});
-                                    setCartonItemsWithLog([]);
-
-                                    // Clear saved workflow state
-                                    await clearWorkflowState(
-                                      normalizedASN,
-                                      activeSession,
-                                      "ReceiveSort"
-                                    );
-                                    // Cleared saved workflow state for new carton
-                                    setLoading(false);
-                                  },
-                                },
-                              ]
-                            : []),
-                        ]
+                        [{ text: "OK", style: "cancel" as const }]
                       );
                       setLoading(false);
                       return;
@@ -1441,11 +1715,88 @@ export default function ReceiveSortScreen() {
                   }
 
                   // Handle nested response structure: { data: { locked: true } } or { locked: true }
-                  const isLocked =
+                  let isLocked =
                     lockResponse?.data?.locked === true ||
                     lockResponse?.locked === true ||
                     lockResponse?.ok === true;
-                  if (!isLocked) {
+                  let sameUserResume =
+                    !isLocked &&
+                    cartonLockResponseMeansCurrentUserAlreadyHolds(
+                      lockResponse,
+                      settings
+                    );
+                  let lockOk = isLocked || sameUserResume;
+
+                  if (!lockOk) {
+                    const stReclaim = await dataService.getCartonStatus(
+                      normalizedASN,
+                      activeSession,
+                      cartonId
+                    );
+                    const canReclaim =
+                      String(stReclaim?.status || "").toLowerCase() ===
+                        "unloaded" &&
+                      settingsMatchUnloadedActor(
+                        settings,
+                        stReclaim?.unloaded_by
+                      ) &&
+                      settings.user_id;
+                    if (canReclaim) {
+                      console.log(
+                        `ℹ️ Auto-lock denied — local unload actor is you; syncing Receiving then retrying lock once`
+                      );
+                      const reclaimSync =
+                        await pushReceivingCartonStatusServerThenLocal({
+                          asnNoOriginal: activeASN,
+                          inboundSession: activeSession,
+                          cartonId,
+                          userId: settings.user_id!,
+                          deviceId: settings.device_id,
+                          lockedOnIso: new Date().toISOString(),
+                        });
+                      if (reclaimSync.ok) {
+                        try {
+                          lockResponse = await apiService.lockCarton({
+                            inbound_session: activeSession,
+                            asn_no: activeASN,
+                            carton_id: cartonId,
+                            user_id: settings.user_id!,
+                            device_id: settings.device_id!,
+                          });
+                          console.log(
+                            `📋 Auto-lock carton API response (after reclaim):`,
+                            lockResponse
+                          );
+                        } catch (reErr: any) {
+                          console.error(
+                            `❌ Auto-lock retry after reclaim failed:`,
+                            reErr
+                          );
+                          Alert.alert(
+                            "Error",
+                            `Failed to lock carton: ${
+                              reErr.message || "Unknown error"
+                            }`
+                          );
+                          setLoading(false);
+                          return;
+                        }
+                        isLocked =
+                          lockResponse?.data?.locked === true ||
+                          lockResponse?.locked === true ||
+                          lockResponse?.ok === true;
+                        sameUserResume =
+                          !isLocked &&
+                          cartonLockResponseMeansCurrentUserAlreadyHolds(
+                            lockResponse,
+                            settings
+                          );
+                        lockOk = isLocked || sameUserResume;
+                      }
+                    }
+                  }
+
+                  if (!lockOk) {
                     const errorMessage =
                       lockResponse?.data?.message ||
                       lockResponse?.message ||
@@ -1466,56 +1817,35 @@ export default function ReceiveSortScreen() {
                     setLoading(false);
                     return;
                   }
+                  if (sameUserResume) {
+                    console.log(
+                      `ℹ️ Auto-lock: server reports carton already in use by you — syncing and continuing`
+                    );
+                  }
 
                   console.log(
                     `✅ Carton ${cartonId} locked successfully (auto-lock)`
                   );
 
-                  // Update local status
-                  await dataService.updateCartonStatus({
-                    asn_no: normalizedASN,
-                    inbound_session: activeSession,
-                    carton_id: cartonId,
-                    status: "Receiving",
-                    locked_by: settings.user_id,
-                    locked_on: new Date().toISOString(),
-                    updated_on: new Date().toISOString(),
-                  });
-
-                  // Sync status change to backend
-                  try {
-                    console.log(`📡 Syncing carton status to backend:`, {
-                      carton: cartonId,
-                      asn: activeASN,
-                      session: activeSession,
-                      status: "Receiving",
+                  const lockedOnAuto = new Date().toISOString();
+                  const syncAuto =
+                    await pushReceivingCartonStatusServerThenLocal({
+                      asnNoOriginal: activeASN,
+                      inboundSession: activeSession,
+                      cartonId,
+                      userId: settings.user_id!,
+                      deviceId: settings.device_id,
+                      lockedOnIso: lockedOnAuto,
                     });
-                    await apiService.updateCartonStatus({
-                      asn_no: activeASN, // Use original format from desktop
-                      inbound_session: activeSession,
-                      carton_id: cartonId,
-                      status: "Receiving", // Backend expects "Receiving" (or "Locked" if backend uses that)
-                      locked_by: settings.user_id, // Include locked_by when status is Receiving
-                      locked_on: new Date().toISOString(), // Include locked_on when status is Receiving
-                      user_id: settings.user_id,
-                      device_id: settings.device_id,
-                    });
-                    console.log(
-                      `✅ Carton ${cartonId} status synced to backend: Receiving`
+                  if (!syncAuto.ok) {
+                    setLoading(false);
+                    Alert.alert(
+                      syncAuto.kind === "network"
+                        ? "Server connection lost"
+                        : "Cannot update carton",
+                      syncAuto.message
                     );
-                  } catch (apiError: any) {
-                    console.warn(
-                      `⚠️ Failed to sync carton ${cartonId} status to backend:`,
-                      apiError.message
-                    );
-                    // 404 errors are expected if carton doesn't exist in backend yet
-                    // The mobile app will continue working locally and sync later
-                    if (apiError.message?.includes("404")) {
-                      console.log(
-                        `ℹ️ Carton ${cartonId} not found in backend (404). This is expected if the carton hasn't been created in the backend yet. Local status will be synced when the carton is created.`
-                      );
-                    }
-                    // Don't block user flow if API sync fails
+                    return;
                   }
 
                   logStateChange("LOCK_CARTON_SUCCESS", { carton: cartonId });
@@ -1549,16 +1879,20 @@ export default function ReceiveSortScreen() {
                         ),
                       },
                     });
-                    setScannedItemsWithLog(
-                      savedStateBeforeLock.scanned_items || []
-                    );
-                    setScannedQuantitiesWithLog(
-                      savedStateBeforeLock.scanned_quantities || {}
-                    );
                     setCurrentItemWithLog(savedStateBeforeLock.current_item);
                     setWorkflowStateWithLog(
                       savedStateBeforeLock.workflow_state as WorkflowState
                     );
+                    await refreshScannedStateFromDb();
+                    const restoredSiLock = savedStateBeforeLock.scanned_items || [];
+                    const lastLock =
+                      restoredSiLock.length > 0
+                        ? String(
+                            restoredSiLock[restoredSiLock.length - 1]
+                              ?.item_code ?? ""
+                          ).trim()
+                        : "";
+                    setLastScannedItem(lastLock || null);
                   } else {
                     // No saved state, start fresh
                     logStateChange("NO_SAVED_STATE_AFTER_LOCK", {
@@ -1621,6 +1955,7 @@ export default function ReceiveSortScreen() {
     lockedCarton,
     workflowState,
     navigation,
+    refreshScannedStateFromDb,
   ]);
 
   // Clear route params after processing to prevent re-processing
@@ -1706,15 +2041,32 @@ export default function ReceiveSortScreen() {
             // Save allocations to local database for future queries
             // Use original ASN format (matches how cartons are stored)
             const db = await getDatabase();
+            let masterRows: { code: string }[] = [];
+            try {
+              masterRows = await dataService.getWarehouseStoreMasterRows();
+            } catch {
+              masterRows = [];
+            }
             for (const allocation of apiAllocations) {
-              if (allocation.store && allocation.item_code) {
+              const rawStore = storeFieldFromAllocationRow(allocation);
+              const lineItem = itemCodeFromAllocationRow(allocation);
+              if (rawStore && lineItem) {
+                const resolved = canonicalStoreForToLine(rawStore, masterRows);
+                if (resolved.unknownInMaster && rawStore) {
+                  console.warn(
+                    `⚠️ ReceiveSort TO store "${rawStore}" not in warehouse master (item ${lineItem}). ` +
+                      (resolved.suggestions.length
+                        ? `Similar: ${resolved.suggestions.join(", ")}`
+                        : "Run master sync for Warehouses & Stores.")
+                  );
+                }
                 await db.runAsync(
                   `INSERT OR REPLACE INTO transfer_order_cache (to_no, asn_no, store, item_code, allocated_qty) VALUES (?, ?, ?, ?, ?)`,
                   [
                     toData.to_no || toData.transfer_order,
                     activeASN,
-                    allocation.store || allocation.store_code,
-                    allocation.item_code,
+                    resolved.storeToPersist || rawStore,
+                    lineItem,
                     allocation.allocated_qty || allocation.qty || 0,
                   ]
                 );
@@ -1723,7 +2075,12 @@ export default function ReceiveSortScreen() {
             uniqueStores = Array.from(
               new Set(
                 (apiAllocations as any[])
-                  .map((a: any) => a.store || a.store_code)
+                  .map((a: any) => {
+                    const raw = storeFieldFromAllocationRow(a);
+                    if (!raw) return null;
+                    const r = canonicalStoreForToLine(raw, masterRows);
+                    return r.storeToPersist || raw;
+                  })
                   .filter((s): s is string => Boolean(s))
               )
             ).sort();
@@ -1811,27 +2168,71 @@ export default function ReceiveSortScreen() {
       });
       return;
     }
+    const seq = ++cartonLoadSeqRef.current;
+    setCartonLinesLoadError(null);
+    setCartonLinesLoading(true);
     // Clear previous items first
     logStateChange("LOAD_CARTON_ITEMS", { carton: targetCartonId });
     setCartonItemsWithLog([]);
 
-    // Use original ASN format (cartons are stored with original format from desktop/API)
-    const items = await dataService.getCartonItems(activeASN, targetCartonId);
-    const itemsList = items
-      .map((i) => `${i.item_code} (${i.shipped_qty})`)
-      .join(", ");
-    console.log(
-      `✅ Loaded ${items.length} items for ${targetCartonId}:`,
-      itemsList
-    );
-
-    if (items.length === 0) {
-      console.error(
-        `❌ No items found for carton ${targetCartonId} in ASN ${activeASN}`
+    try {
+      // Use original ASN format (cartons are stored with original format from desktop/API)
+      let items = await dataService.getCartonItems(
+        activeASN,
+        targetCartonId
       );
-    }
+      if (seq !== cartonLoadSeqRef.current) {
+        return;
+      }
+      if (items.length === 0) {
+        const hydrated = await dataService.hydrateCartonLinesFromAsnApi(
+          activeASN,
+          targetCartonId
+        );
+        if (seq !== cartonLoadSeqRef.current) {
+          return;
+        }
+        if (hydrated.ok) {
+          items = await dataService.getCartonItems(activeASN, targetCartonId);
+          if (items.length > 0) {
+            console.log(
+              `✅ Carton lines restored from server for ${targetCartonId}`
+            );
+          }
+        }
+      }
+      if (seq !== cartonLoadSeqRef.current) {
+        return;
+      }
+      const itemsList = items
+        .map((i) => `${i.item_code} (${i.shipped_qty})`)
+        .join(", ");
+      console.log(
+        `✅ Loaded ${items.length} items for ${targetCartonId}:`,
+        itemsList
+      );
 
-    setCartonItems(items);
+      if (items.length === 0) {
+        console.error(
+          `❌ No items found for carton ${targetCartonId} in ASN ${activeASN}`
+        );
+      }
+
+      setCartonItemsWithLog(items);
+    } catch (e: any) {
+      if (seq !== cartonLoadSeqRef.current) {
+        return;
+      }
+      console.error("loadCartonItems failed:", e?.message || e);
+      setCartonLinesLoadError(
+        e?.message || "Could not load carton lines from this device."
+      );
+      setCartonItemsWithLog([]);
+    } finally {
+      if (seq === cartonLoadSeqRef.current) {
+        setCartonLinesLoading(false);
+      }
+    }
   };
 
   const loadAvailableBoxes = async () => {
@@ -1865,14 +2266,12 @@ export default function ReceiveSortScreen() {
       const db = await getDatabase();
       const normalizedASN = normalizeASN(activeASN);
 
-      // Get quantities of this item in each box from scanned_items
-      // Include items with carton_id = lockedCarton (old workflow) OR carton_id IS NULL (new BOX ID workflow)
-      // Check both ASN formats to ensure we get all records
+      // Quantities per box for this item — same supplier carton attribution as main Receive UI
       const cartonFilter = lockedCarton
-        ? "AND (carton_id = ? OR carton_id IS NULL)"
-        : "AND carton_id IS NULL";
+        ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+        : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
       const cartonParams = lockedCarton
-        ? [activeASN, normalizedASN, activeSession, lockedCarton, itemCode]
+        ? [activeASN, normalizedASN, activeSession, String(lockedCarton).trim(), itemCode]
         : [activeASN, normalizedASN, activeSession, itemCode];
 
       let quantities = await db.getAllAsync<{
@@ -1902,6 +2301,142 @@ export default function ReceiveSortScreen() {
       setBoxItemQuantities({});
     }
   };
+
+  const boxItemsPayloadItems = (response: any): any[] => {
+    const payload = response?.data || response;
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.items)) return payload.items;
+    if (Array.isArray(payload?.box_items)) return payload.box_items;
+    if (Array.isArray(payload?.boxItems)) return payload.boxItems;
+    if (Array.isArray(payload?.contents)) return payload.contents;
+    if (Array.isArray(payload?.lines)) return payload.lines;
+    return [];
+  };
+
+  const refreshLockedCartonScannedQtyFromBackend = useCallback(async (): Promise<boolean> => {
+    if (!activeASN || !lockedCarton) return true;
+
+    const settings = await getSettings();
+    if (!settings.api_url || settings.demo_mode === 1) return true;
+
+    if (!(await isDeviceOnline())) {
+      Alert.alert(
+        "Network Required",
+        "Cannot refresh latest scanned quantities.\n\nPlease connect WiFi/mobile data, make sure the backend is reachable, then try again."
+      );
+      return false;
+    }
+
+    const cartonKey = String(lockedCarton).trim().toUpperCase();
+    const boxesById = new Map<string, any>();
+    const localBoxes = await dataService.getBoxes(activeASN);
+    localBoxes.forEach((box) => {
+      const boxId = String(box?.box_id || "").trim();
+      if (boxId) boxesById.set(boxId, box);
+    });
+    availableBoxes.forEach((box) => {
+      const boxId = String(box?.box_id || "").trim();
+      if (boxId) boxesById.set(boxId, box);
+    });
+
+    const stores = Array.from(
+      new Set(
+        [
+          ...localBoxes.map((box) => box.store),
+          ...availableBoxes.map((box) => box.store),
+          ...(await dataService.getTransferOrderAllocations(activeASN)).map(
+            (allocation) => allocation.store
+          ),
+        ]
+          .map((store) => String(store || "").trim())
+          .filter(Boolean)
+      )
+    );
+
+    let refreshFailed = false;
+
+    for (const store of stores) {
+      try {
+        const response = await apiService.getBoxes({ asn: activeASN, store });
+        const rows = Array.isArray(response)
+          ? response
+          : Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response?.data?.boxes)
+              ? response.data.boxes
+              : Array.isArray(response?.boxes)
+                ? response.boxes
+                : Array.isArray(response?.items)
+                  ? response.items
+                  : [];
+        rows.forEach((row: any) => {
+          const boxId = String(row?.box_id || row?.name || "").trim();
+          if (boxId) boxesById.set(boxId, { ...row, box_id: boxId, store });
+        });
+      } catch (error: any) {
+        refreshFailed = true;
+        console.warn(
+          `⚠️ Could not load backend boxes for ${store}:`,
+          error?.message || error
+        );
+      }
+    }
+
+    const backendQtyByItem: Record<string, number> = {};
+    for (const box of Array.from(boxesById.values())) {
+      const boxId = String(box?.box_id || "").trim();
+      if (!boxId) continue;
+      try {
+        const response = await apiService.getBoxItems(boxId, {
+          asn: activeASN,
+          store: box.store || undefined,
+        });
+        for (const row of boxItemsPayloadItems(response)) {
+          const rowCarton = String(
+            row?.carton_id ||
+              row?.source_carton ||
+              row?.source_carton_id ||
+              row?.supplier_carton_id ||
+              ""
+          )
+            .trim()
+            .toUpperCase();
+          if (rowCarton !== cartonKey) continue;
+
+          const itemCode = qtyKeyForScannedState(
+            row?.item_code || row?.itemCode
+          );
+          if (!itemCode) continue;
+          const qty = Number(row?.scanned_qty ?? row?.qty ?? row?.quantity ?? 0);
+          backendQtyByItem[itemCode] =
+            (backendQtyByItem[itemCode] || 0) + (Number.isFinite(qty) ? qty : 0);
+        }
+      } catch (error: any) {
+        refreshFailed = true;
+        console.warn(
+          `⚠️ Could not load backend items for BOX ${boxId}:`,
+          error?.message || error
+        );
+      }
+    }
+
+    if (refreshFailed) {
+      Alert.alert(
+        "Network Required",
+        "Could not refresh latest scanned quantities from the backend.\n\nPlease connect WiFi/mobile data, make sure the backend is reachable, then try again."
+      );
+      return false;
+    }
+
+    if (Object.keys(backendQtyByItem).length === 0) return true;
+
+    setScannedQuantitiesWithLog({
+      ...scannedQuantities,
+      ...backendQtyByItem,
+    });
+
+    return true;
+  }, [activeASN, availableBoxes, lockedCarton, scannedQuantities]);
 
   // Helper function to get color for each store
   const getStoreColor = (store: string): string => {
@@ -1945,6 +2480,8 @@ export default function ReceiveSortScreen() {
   };
 
   const handleCartonScan = async (barcode: string) => {
+    if (!(await requireOnlineForReceiving())) return;
+
     // Ensure we have activeASN - restore from settings if lost
     let currentASN = activeASN;
     let currentSession = activeSession;
@@ -1991,6 +2528,44 @@ export default function ReceiveSortScreen() {
 
       // Get settings early for API calls
       const settings = await getSettings();
+
+      /** One GET /api/asn per scan (non-demo): block if server shows carton fully received, and reuse for lock parse. */
+      let asnResForReceiveGate: unknown = null;
+      if (settings.demo_mode !== 1 && settings.api_url) {
+        try {
+          asnResForReceiveGate = await apiService.getASN(currentASN.trim());
+          const recvGate = parseAsnPayloadForReceiveSortServerBlock(
+            asnResForReceiveGate,
+            cartonId
+          );
+          if (recvGate.blocked) {
+            await dataService.updateCartonStatus({
+              asn_no: normalizedASN,
+              inbound_session: currentSession,
+              carton_id: cartonId,
+              status: "Received",
+              locked_by: "",
+              locked_on: "",
+              updated_on: new Date().toISOString(),
+            });
+            setLoading(false);
+            await loadAvailableCartons();
+            Alert.alert(
+              "Carton already completed",
+              recvGate.reason ??
+                "This carton was already received on the server (another operator or desktop). Your list has been updated."
+            );
+            return;
+          }
+        } catch (e: any) {
+          setLoading(false);
+          Alert.alert(
+            "Could not verify with server",
+            `${e?.message || "Unknown error"}\n\nCheck your connection and try again before receiving this carton.`
+          );
+          return;
+        }
+      }
 
       // Check if carton status exists (normalize ASN for lookup)
       let status = await dataService.getCartonStatus(
@@ -2064,80 +2639,51 @@ export default function ReceiveSortScreen() {
       }
 
       if (statusLower === "receiving") {
+        if (settings.demo_mode !== 1 && settings.api_url && asnResForReceiveGate) {
+          const recvAgain = parseAsnPayloadForReceiveSortServerBlock(
+            asnResForReceiveGate,
+            cartonId
+          );
+          if (recvAgain.blocked) {
+            await dataService.updateCartonStatus({
+              asn_no: normalizedASN,
+              inbound_session: currentSession,
+              carton_id: cartonId,
+              status: "Received",
+              locked_by: "",
+              locked_on: "",
+              updated_on: new Date().toISOString(),
+            });
+            setLoading(false);
+            await loadAvailableCartons();
+            Alert.alert(
+              "Carton already completed",
+              recvAgain.reason ??
+                "Server shows this carton as fully received while your device still had it in progress. Your list has been updated."
+            );
+            return;
+          }
+        }
         // Check if locked by current user - allow them to continue
-        if (status.locked_by === settings.user_id) {
+        if (settingsMatchCartonLockOwner(settings, status.locked_by)) {
           // Same user - restore their session
           logStateChange("HANDLE_CARTON_SCAN_SAME_USER", { carton: cartonId });
           setLockedCartonWithLog(cartonId);
           setWorkflowStateWithLog("SCAN_ITEM");
-          await loadCartonItems();
+          await loadCartonItems(cartonId);
           await loadLockInfo();
           await loadAvailableCartons();
           setLoading(false);
           Alert.alert("Info", `Resuming work on carton ${cartonId}`);
           return;
         } else {
-          // Locked by different user - in demo mode, allow force unlock
+          // Locked by a different owner: never allow resume/takeover from this device.
           Alert.alert(
             "Carton Already in Use",
             `Carton ${cartonId} is currently being processed by another user.\n\nLocked by: ${
               status.locked_by || "Unknown"
             }\nStatus: ${status.status}\n\nPlease select a different carton.`,
-            [
-              {
-                text: "OK",
-                style: "cancel" as const,
-              },
-              // Only show "Force Unlock" in demo mode
-              ...(settings.demo_mode === 1
-                ? [
-                    {
-                      text: "Force Unlock (Demo)",
-                      style: "destructive" as const,
-                      onPress: async () => {
-                        console.log(
-                          `🔓 Force unlocking carton ${cartonId} in demo mode`
-                        );
-                        // Force unlock in demo mode
-                        await dataService.updateCartonStatus({
-                          asn_no: normalizedASN,
-                          inbound_session: currentSession,
-                          carton_id: cartonId,
-                          status: "Unloaded",
-                          locked_by: undefined,
-                          locked_on: undefined,
-                          updated_on: new Date().toISOString(),
-                        });
-
-                        // Sync status change to backend
-                        try {
-                          await apiService.updateCartonStatus({
-                            asn_no: currentASN, // Use original format from desktop
-                            inbound_session: currentSession,
-                            carton_id: cartonId,
-                            status: "Unloaded",
-                            user_id: settings.user_id,
-                            device_id: settings.device_id,
-                          });
-                          console.log(
-                            `✅ Carton ${cartonId} status synced to backend: Unloaded (force unlock)`
-                          );
-                        } catch (apiError: any) {
-                          console.warn(
-                            `⚠️ Failed to sync carton ${cartonId} status to backend:`,
-                            apiError.message
-                          );
-                          // Don't block user flow if API sync fails
-                        }
-
-                        // Retry locking
-                        console.log(`🔄 Retrying lock for carton ${cartonId}`);
-                        handleCartonScan(cartonId);
-                      },
-                    },
-                  ]
-                : []),
-            ]
+            [{ text: "OK", style: "cancel" as const }]
           );
           setLoading(false);
           await loadAvailableCartons(); // Refresh available cartons
@@ -2149,6 +2695,51 @@ export default function ReceiveSortScreen() {
       if (statusLower === "pending") {
         console.log(`📦 Carton ${cartonId} is Pending, auto-unloading...`);
         const pendingSettings = await getSettings();
+
+        if (pendingSettings.demo_mode !== 1 && pendingSettings.api_url) {
+          try {
+            const { line } = await getServerUnloadLineForCarton(
+              currentSession,
+              cartonId
+            );
+            if (line) {
+              const scannedBy =
+                line.scanned_by != null && String(line.scanned_by).trim() !== ""
+                  ? String(line.scanned_by).trim()
+                  : "";
+              const scannedOnRaw =
+                line.scanned_on || line.created_at || line.modified || "";
+              const scannedOn =
+                typeof scannedOnRaw === "string" && scannedOnRaw.length > 10
+                  ? scannedOnRaw.slice(0, 19)
+                  : "";
+              await dataService.updateCartonStatus({
+                asn_no: normalizedASN,
+                inbound_session: currentSession,
+                carton_id: cartonId,
+                status: "Unloaded",
+                updated_on: new Date().toISOString(),
+              });
+              setLoading(false);
+              await loadAvailableCartons();
+              Alert.alert(
+                scannedBy ? `Already unloaded by ${scannedBy}` : "Already unloaded",
+                scannedOn
+                  ? `Recorded at ${scannedOn}.\n\nYour list has been updated.`
+                  : "Your list has been updated."
+              );
+              return;
+            }
+          } catch (e: any) {
+            setLoading(false);
+            Alert.alert(
+              "Could not verify with server",
+              `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+            );
+            return;
+          }
+        }
+
         // Create unload event
         await addEvent({
           event_type: "UNLOAD_SCAN",
@@ -2211,6 +2802,51 @@ export default function ReceiveSortScreen() {
         return;
       }
 
+      // Backend: carton may already be in Receiving on another handset (GET ASN is authoritative)
+      if (settings.demo_mode !== 1 && settings.api_url) {
+        try {
+          const backendLock = asnResForReceiveGate
+            ? parseAsnPayloadForCartonLock(asnResForReceiveGate, cartonId)
+            : await fetchBackendCartonLockFromASN(currentASN, cartonId);
+          if (
+            backendLock &&
+            isOtherScannerLock(
+              backendLock,
+              settings.user_id || "",
+              settings.device_id || ""
+            )
+          ) {
+            const whoUser =
+              backendLock.locked_by?.trim() || "(unknown user)";
+            const whoDev =
+              backendLock.device_id?.trim() || "(unknown device)";
+            await dataService.updateCartonStatus({
+              asn_no: normalizedASN,
+              inbound_session: currentSession,
+              carton_id: cartonId,
+              status: "Receiving",
+              locked_by: backendLock.locked_by || undefined,
+              locked_on: new Date().toISOString(),
+              updated_on: new Date().toISOString(),
+            });
+            setLoading(false);
+            await loadAvailableCartons();
+            Alert.alert(
+              "Carton already in use",
+              `This carton is already being received on another device (per server).\n\nUser: ${whoUser}\nDevice: ${whoDev}\n\nWait for them to finish or ask them to release the carton.`
+            );
+            return;
+          }
+        } catch (e: any) {
+          setLoading(false);
+          Alert.alert(
+            "Could not verify lock on server",
+            `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+          );
+          return;
+        }
+      }
+
       // Lock carton
       console.log(`🔒 Attempting to lock carton ${cartonId}...`, {
         inbound_session: currentSession,
@@ -2243,87 +2879,153 @@ export default function ReceiveSortScreen() {
       }
 
       // Check response format - handle nested { data: { locked: true } }, { locked: true }, or { ok: true } formats
-      const isLocked =
+      let isLocked =
         lockResponse?.data?.locked === true ||
         lockResponse?.locked === true ||
         lockResponse?.ok === true;
 
-      if (!isLocked) {
+      let sameUserResume =
+        !isLocked &&
+        cartonLockResponseMeansCurrentUserAlreadyHolds(
+          lockResponse,
+          settings
+        );
+      let lockOk = isLocked || sameUserResume;
+
+      if (!lockOk) {
+        const stReclaim = await dataService.getCartonStatus(
+          normalizedASN,
+          currentSession,
+          cartonId
+        );
+        const canReclaim =
+          String(stReclaim?.status || "").toLowerCase() === "unloaded" &&
+          settingsMatchUnloadedActor(settings, stReclaim?.unloaded_by) &&
+          settings.user_id;
+        if (canReclaim) {
+          console.log(
+            `ℹ️ Lock denied — local unload actor is you; syncing Receiving then retrying lock once`
+          );
+          const reclaimSync = await pushReceivingCartonStatusServerThenLocal({
+            asnNoOriginal: currentASN,
+            inboundSession: currentSession,
+            cartonId,
+            userId: settings.user_id!,
+            deviceId: settings.device_id,
+            lockedOnIso: new Date().toISOString(),
+          });
+          if (reclaimSync.ok) {
+            try {
+              lockResponse = await apiService.lockCarton({
+                inbound_session: currentSession,
+                asn_no: currentASN,
+                carton_id: cartonId,
+                user_id: settings.user_id!,
+                device_id: settings.device_id!,
+              });
+              console.log(
+                `📋 Lock carton API response (after reclaim):`,
+                lockResponse
+              );
+            } catch (reErr: any) {
+              console.error(`❌ Lock retry after reclaim failed:`, reErr);
+              Alert.alert(
+                "Error",
+                `Failed to lock carton: ${reErr.message || "Unknown error"}`
+              );
+              setLoading(false);
+              return;
+            }
+            isLocked =
+              lockResponse?.data?.locked === true ||
+              lockResponse?.locked === true ||
+              lockResponse?.ok === true;
+            sameUserResume =
+              !isLocked &&
+              cartonLockResponseMeansCurrentUserAlreadyHolds(
+                lockResponse,
+                settings
+              );
+            lockOk = isLocked || sameUserResume;
+          }
+        }
+      }
+
+      if (!lockOk) {
+        const lr: any = lockResponse;
         const errorMessage =
-          lockResponse?.data?.message ||
-          lockResponse?.message ||
-          lockResponse?.error?.message ||
-          lockResponse?.error ||
+          lr?.data?.message ||
+          lr?.message ||
+          lr?.error?.message ||
+          lr?.error ||
           JSON.stringify(lockResponse) ||
           "Failed to lock carton";
+        const holderUser = String(
+          lr?.data?.locked_by ??
+            lr?.locked_by ??
+            lr?.data?.existing_user ??
+            lr?.existing_user ??
+            lr?.data?.locked_user ??
+            ""
+        ).trim();
+        const holderDevice = String(
+          lr?.data?.device_id ??
+            lr?.device_id ??
+            lr?.data?.locked_device_id ??
+            lr?.locked_device_id ??
+            ""
+        ).trim();
+        const holderLine =
+          holderUser || holderDevice
+            ? `\n\nAlready scanning:\nUser: ${holderUser || "(unknown)"}\nDevice: ${holderDevice || "(unknown)"}`
+            : "";
         console.error(`❌ Lock carton failed:`, {
           response: lockResponse,
           errorMessage,
         });
+        const debugTail = __DEV__
+          ? `\n\n${JSON.stringify(lockResponse).substring(0, 200)}`
+          : "";
         Alert.alert(
-          "Error",
-          `Failed to lock carton: ${errorMessage}\n\nResponse: ${JSON.stringify(
-            lockResponse
-          ).substring(0, 200)}`
+          "Cannot lock carton",
+          `Failed to lock carton: ${errorMessage}${holderLine}${debugTail}`
         );
         setLoading(false);
         return;
       }
+      if (sameUserResume) {
+        console.log(
+          `ℹ️ Lock carton: server says already in use by you — treating as success and syncing local state`
+        );
+      }
 
       console.log(`✅ Carton ${cartonId} locked successfully`);
 
-      // Update local status
-      await dataService.updateCartonStatus({
-        asn_no: normalizedASN,
-        inbound_session: currentSession,
-        carton_id: cartonId,
-        status: "Receiving",
-        locked_by: settings.user_id,
-        locked_on: new Date().toISOString(),
-        updated_on: new Date().toISOString(),
+      const lockedOnSelect = new Date().toISOString();
+      const syncSelect = await pushReceivingCartonStatusServerThenLocal({
+        asnNoOriginal: currentASN,
+        inboundSession: currentSession,
+        cartonId,
+        userId: settings.user_id!,
+        deviceId: settings.device_id,
+        lockedOnIso: lockedOnSelect,
       });
-
-      // Sync status change to backend
-      try {
-        console.log(`📡 Syncing carton status to backend:`, {
-          carton: cartonId,
-          asn: currentASN,
-          session: currentSession,
-          status: "Receiving",
-        });
-        await apiService.updateCartonStatus({
-          asn_no: currentASN, // Use original format from desktop
-          inbound_session: currentSession,
-          carton_id: cartonId,
-          status: "Receiving", // Backend expects "Receiving" (or "Locked" if backend uses that)
-          locked_by: settings.user_id, // Include locked_by when status is Receiving
-          locked_on: new Date().toISOString(), // Include locked_on when status is Receiving
-          user_id: settings.user_id,
-          device_id: settings.device_id,
-        });
-        console.log(
-          `✅ Carton ${cartonId} status synced to backend: Receiving`
+      if (!syncSelect.ok) {
+        setLoading(false);
+        Alert.alert(
+          syncSelect.kind === "network"
+            ? "Server connection lost"
+            : "Cannot update carton",
+          syncSelect.message
         );
-      } catch (apiError: any) {
-        console.warn(
-          `⚠️ Failed to sync carton ${cartonId} status to backend:`,
-          apiError.message
-        );
-        // 404 errors are expected if carton doesn't exist in backend yet
-        // The mobile app will continue working locally and sync later
-        if (apiError.message?.includes("404")) {
-          console.log(
-            `ℹ️ Carton ${cartonId} not found in backend (404). This is expected if the carton hasn't been created in the backend yet. Local status will be synced when the carton is created.`
-          );
-        }
-        // Don't block user flow if API sync fails
+        return;
       }
 
       logStateChange("SELECT_CARTON_LOCK", { carton: cartonId });
       setLockedCartonWithLog(cartonId);
 
       // Load carton items FIRST before setting workflow state
-      await loadCartonItems();
+      await loadCartonItems(cartonId);
 
       // Check if there's saved state for this carton before clearing
       const savedStateBeforeLock = await loadWorkflowState(
@@ -2354,10 +3056,15 @@ export default function ReceiveSortScreen() {
             current_item: savedStateBeforeLock.current_item,
           },
         });
-        setScannedItemsWithLog(savedStateBeforeLock.scanned_items || []);
-        setScannedQuantitiesWithLog(
-          savedStateBeforeLock.scanned_quantities || {}
-        );
+        await refreshScannedStateFromDb();
+        const restoredSi = savedStateBeforeLock.scanned_items || [];
+        const lastFromLockRestore =
+          restoredSi.length > 0
+            ? String(
+                restoredSi[restoredSi.length - 1]?.item_code ?? ""
+              ).trim()
+            : "";
+        setLastScannedItem(lastFromLockRestore || null);
 
         // Only restore currentItem if it exists, otherwise start fresh
         const restoredCurrentItem = savedStateBeforeLock.current_item || null;
@@ -2389,11 +3096,11 @@ export default function ReceiveSortScreen() {
         setScannedItemsWithLog([]);
         setScannedQuantitiesWithLog({});
         setCurrentItemWithLog(null);
+        setLastScannedItem(null);
       }
 
       await loadLockInfo();
       await loadAvailableCartons(); // Refresh available cartons
-      Alert.alert("Success", `Carton ${cartonId} locked`);
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to lock carton");
     } finally {
@@ -2403,24 +3110,21 @@ export default function ReceiveSortScreen() {
 
   const handleItemScan = async (barcode: string) => {
     if (!activeASN || !activeSession) return;
+    if (!(await requireOnlineForReceiving())) return;
 
     const scannedValue = barcode.trim();
 
     console.log(`🔍 handleItemScan: Scanned item code: "${scannedValue}"`);
 
-    // Always prompt for BOX ID when scanning an item
-    // This allows users to scan items directly to destination boxes
-    setPendingItemScan(scannedValue);
-    setCtnIdPromptValue("");
-    setShowCTNIdPrompt(true);
-    console.log(
-      `✅ handleItemScan: Showing BOX ID prompt for item: "${scannedValue}"`
-    );
+    if (!lockedCarton) {
+      Alert.alert(
+        "Carton Required",
+        "Please scan or select a supplier carton before scanning items."
+      );
+      return;
+    }
 
-    // Focus the input after modal opens
-    setTimeout(() => {
-      ctnIdPromptInputRef.current?.focus();
-    }, 100);
+    await processItemScan(scannedValue, lockedCarton);
   };
 
   const handleCTNIdPromptSubmit = async (providedBoxId?: string) => {
@@ -2428,6 +3132,10 @@ export default function ReceiveSortScreen() {
     if (isProcessingScan) {
       console.warn(
         `⚠️ handleCTNIdPromptSubmit: Already processing a scan, ignoring duplicate submission`
+      );
+      showScanFeedback(
+        "err",
+        "Still saving the last scan — wait a moment, then confirm the BOX again."
       );
       return;
     }
@@ -2439,7 +3147,10 @@ export default function ReceiveSortScreen() {
       Alert.alert(
         "BOX ID Required",
         "Please enter a valid BOX ID.\n\n" +
-          'BOX IDs start with "BOX-" (e.g., BOX-STORE001-267199) or "PAW-" for Putaway boxes (e.g., PAW-ASN365425473-1767306266073).'
+          "Use a box that exists in Box Management for this ASN:\n" +
+          '• "BOX-…" or "PAW-…" (generated), or\n' +
+          "• A custom distribution box id you created for this ASN (Open).\n\n" +
+          "Do not use the vendor carton barcode as the destination BOX."
       );
       return;
     }
@@ -2449,99 +3160,146 @@ export default function ReceiveSortScreen() {
       setCtnIdPromptValue(providedBoxId);
     }
 
-    let normalizedBoxId = boxId.toUpperCase();
+    let normalizedBoxId = boxId.trim().toUpperCase();
 
-    // Validate BOX ID format - accept both regular BOX IDs and Putaway BOX IDs
-    const isRegularBox = normalizedBoxId.startsWith("BOX-");
-    const isPutawayBox = normalizedBoxId.startsWith("PAW-");
+    const isPrefixedBoxId =
+      normalizedBoxId.startsWith("BOX-") ||
+      normalizedBoxId.startsWith("PAW-");
 
-    if (!isRegularBox && !isPutawayBox) {
-      Alert.alert(
-        "Invalid BOX ID",
-        `"${normalizedBoxId}" is not a valid BOX ID.\n\n` +
-          `BOX IDs must start with "BOX-" (e.g., BOX-STORE001-267199) or "PAW-" for Putaway boxes (e.g., PAW-ASN365425473-1767306266073).\n\n` +
-          `Please enter a valid BOX ID.`
-      );
-      return;
-    }
-
-    // Validate BOX exists and is active
-    if (activeASN && activeSession) {
-      try {
-        const boxes = await dataService.getBoxes(activeASN);
-
-        // Try exact match first (with trimmed values)
-        let box = boxes.find((b) => {
-          const bBoxId = String(b.box_id || "").trim();
-          const normalized = normalizedBoxId.trim();
-          return bBoxId === normalized;
-        });
-
-        if (!box) {
-          // Try case-insensitive match (with trimmed values)
-          const boxCaseInsensitive = boxes.find((b) => {
-            const bBoxId = String(b.box_id || "")
-              .trim()
-              .toUpperCase();
-            const normalized = normalizedBoxId.trim().toUpperCase();
-            return bBoxId === normalized;
-          });
-          if (boxCaseInsensitive) {
-            box = boxCaseInsensitive;
-            // Update normalizedBoxId to use correct case
-            normalizedBoxId = String(boxCaseInsensitive.box_id || "").trim();
-          } else {
-            // Try partial match (in case of extra characters)
-            const boxPartial = boxes.find((b) => {
-              const bBoxId = String(b.box_id || "")
-                .trim()
-                .toUpperCase();
-              const normalized = normalizedBoxId.trim().toUpperCase();
-              return bBoxId.includes(normalized) || normalized.includes(bBoxId);
-            });
-            if (boxPartial) {
-              box = boxPartial;
-              normalizedBoxId = String(boxPartial.box_id || "").trim();
-            } else {
-              Alert.alert(
-                "BOX Not Found",
-                `BOX "${boxId}" not found.\n\n` +
-                  `Please enter a valid BOX ID that exists in Box Management.\n\n` +
-                  `Make sure the BOX is created and has status "Open".\n\n` +
-                  `Available boxes: ${boxes
-                    .slice(0, 5)
-                    .map((b) => b.box_id)
-                    .join(", ")}${boxes.length > 5 ? "..." : ""}`
-              );
-              return;
-            }
-          }
-        }
-
-        const boxStatus = String(box.status || "").trim();
-        const isOpen =
-          boxStatus === "Open" ||
-          boxStatus === "OPEN" ||
-          boxStatus === "open" ||
-          boxStatus === "";
-        if (!isOpen) {
-          Alert.alert(
-            "BOX Not Active",
-            `BOX "${normalizedBoxId}" is not active.\n\n` +
-              `Current status: "${boxStatus}"\n\n` +
-              `Please use an active (Open) BOX.`
-          );
-          return;
-        }
-      } catch (error: any) {
-        Alert.alert("Error", `Failed to validate BOX ID: ${error.message}`);
-        return;
-      }
-    } else {
+    if (!activeASN || !activeSession) {
       Alert.alert(
         "Error",
         "Missing active ASN or session. Please restart the receiving process."
       );
+      return;
+    }
+
+    try {
+      const db = await getDatabase();
+      const na = normalizeASN(activeASN);
+      const scannedUp = normalizedBoxId.trim().toUpperCase();
+
+      // User often scans the supplier carton (e.g. CNWH63179) here — that is not a destination BOX
+      if (
+        lockedCarton &&
+        scannedUp === String(lockedCarton).trim().toUpperCase()
+      ) {
+        Alert.alert(
+          "Wrong scan — supplier carton",
+          `You scanned the carton you are receiving from ("${normalizedBoxId}").\n\n` +
+            `Use a destination BOX only — never the vendor carton barcode.\n\n` +
+            `Reprint or use a distribution label: BOX-…, PAW-…, or a custom id created in Box Management for this ASN (Open).`
+        );
+        return;
+      }
+
+      const supplierCartonHit = await db.getFirstAsync<{ one: number }>(
+        `SELECT 1 AS one FROM asn_carton_map WHERE (asn_no = ? OR asn_no = ?) AND UPPER(TRIM(carton_id)) = ? LIMIT 1`,
+        [activeASN, na, scannedUp]
+      );
+
+      const boxes = await dataService.getBoxes(activeASN);
+
+      // Try exact match first (with trimmed values)
+      let box = boxes.find((b) => {
+        const bBoxId = String(b.box_id || "").trim();
+        const normalized = normalizedBoxId.trim();
+        return bBoxId === normalized;
+      });
+
+      if (!box) {
+        // Try case-insensitive match (with trimmed values)
+        const boxCaseInsensitive = boxes.find((b) => {
+          const bBoxId = String(b.box_id || "")
+            .trim()
+            .toUpperCase();
+          const normalized = normalizedBoxId.trim().toUpperCase();
+          return bBoxId === normalized;
+        });
+        if (boxCaseInsensitive) {
+          box = boxCaseInsensitive;
+          normalizedBoxId = String(boxCaseInsensitive.box_id || "").trim();
+        } else if (isPrefixedBoxId) {
+          // Partial match only for long BOX-/PAW- ids (avoid matching wrong open box for short custom ids)
+          const boxPartial = boxes.find((b) => {
+            const bBoxId = String(b.box_id || "")
+              .trim()
+              .toUpperCase();
+            const normalized = normalizedBoxId.trim().toUpperCase();
+            return bBoxId.includes(normalized) || normalized.includes(bBoxId);
+          });
+          if (boxPartial) {
+            box = boxPartial;
+            normalizedBoxId = String(boxPartial.box_id || "").trim();
+          }
+        }
+      }
+
+      // Never use a vendor / ASN carton_id as the destination BOX, even if someone duplicated it in Box Management
+      if (supplierCartonHit) {
+        Alert.alert(
+          "Vendor carton barcode — not allowed",
+          `"${normalizedBoxId}" matches a supplier carton ID on this shipment.\n\n` +
+            `Destination scans must use a distribution BOX only — never reuse the vendor carton barcode.\n\n` +
+            `Reprint or scan a BOX-…, PAW-…, or another custom id created only in Box Management (Open) for this ASN.`
+        );
+        return;
+      }
+
+      if (!box) {
+        const openBoxesForHint = boxes.filter(
+          (b) =>
+            b.status === "Open" ||
+            b.status === "OPEN" ||
+            b.status === "open"
+        );
+        const openHint = openBoxesForHint
+          .slice(0, 5)
+          .map((b) => b.box_id)
+          .join(", ");
+        if (isPrefixedBoxId) {
+          Alert.alert(
+            "BOX Not Found",
+            `BOX "${boxId}" not found.\n\n` +
+              `Please enter a valid BOX ID that exists in Box Management.\n\n` +
+              `Make sure the BOX is created and has status "Open".\n\n` +
+              (openHint
+                ? `Open boxes (sample): ${openHint}${
+                    openBoxesForHint.length > 5 ? "…" : ""
+                  }`
+                : "No open boxes found for this ASN yet — create one in Box Management.")
+          );
+        } else {
+          Alert.alert(
+            "Invalid BOX ID",
+            `"${normalizedBoxId}" is not registered as an Open box for this ASN.\n\n` +
+              `Custom ids (not starting with BOX- or PAW-) are accepted only when that id exists in Box Management for this shipment with status Open.\n\n` +
+              (openHint
+                ? `Open boxes (sample): ${openHint}${
+                    openBoxesForHint.length > 5 ? "…" : ""
+                  }`
+                : "No open boxes found for this ASN yet — create or sync the box in Box Management.")
+          );
+        }
+        return;
+      }
+
+      const boxStatus = String(box.status || "").trim();
+      const isOpen =
+        boxStatus === "Open" ||
+        boxStatus === "OPEN" ||
+        boxStatus === "open";
+      if (!isOpen) {
+        Alert.alert(
+          "BOX Not Active",
+          `BOX "${normalizedBoxId}" is not active.\n\n` +
+            `Current status: "${boxStatus}"\n\n` +
+            `Please use an active (Open) BOX.`
+        );
+        return;
+      }
+    } catch (error: any) {
+      Alert.alert("Error", `Failed to validate BOX ID: ${error.message}`);
       return;
     }
 
@@ -2579,6 +3337,10 @@ export default function ReceiveSortScreen() {
     } else {
       console.warn(
         `⚠️ handleCTNIdPromptSubmit: No pendingItemScan or pendingBoxScan! pendingItemScan="${pendingItemScan}", pendingBoxScan="${pendingBoxScan}"`
+      );
+      Alert.alert(
+        "Nothing to submit",
+        "Scan an item barcode first, then scan or enter the destination BOX when prompted."
       );
     }
   };
@@ -2731,11 +3493,8 @@ export default function ReceiveSortScreen() {
         setLockedCartonWithLog(targetCartonId);
       }
 
+      setLastScannedItem(targetItemCode);
       await loadAvailableBoxes();
-      Alert.alert(
-        "Success",
-        `Item ${targetItemCode} from carton ${targetCartonId} sorted to ${boxId}`
-      );
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to process box scan");
     } finally {
@@ -2751,6 +3510,10 @@ export default function ReceiveSortScreen() {
     if (isProcessingScan) {
       console.warn(
         `⚠️ processItemScanWithBox: Already processing a scan, ignoring duplicate: "${barcode}" to BOX ${boxId}`
+      );
+      showScanFeedback(
+        "err",
+        "Still saving the last scan — wait a moment, then try again."
       );
       return;
     }
@@ -2769,13 +3532,22 @@ export default function ReceiveSortScreen() {
 
       // Validate BOX exists and is active
       const boxes = await dataService.getBoxes(activeASN);
-      const box = boxes.find((b) => b.box_id === boxId);
+      let box = boxes.find((b) => b.box_id === boxId);
+      if (!box) {
+        box = boxes.find(
+          (b) =>
+            String(b.box_id || "").trim().toUpperCase() ===
+            String(boxId || "").trim().toUpperCase()
+        );
+      }
 
       if (!box) {
         Alert.alert("BOX Not Found", `BOX "${boxId}" not found.`);
         setLoading(false);
         return;
       }
+
+      const canonicalBoxId = String(box.box_id || "").trim();
 
       if (
         box.status !== "Open" &&
@@ -2784,161 +3556,239 @@ export default function ReceiveSortScreen() {
       ) {
         Alert.alert(
           "BOX Not Active",
-          `BOX "${boxId}" is not active. Current status: ${box.status}`
+          `BOX "${canonicalBoxId}" is not active. Current status: ${box.status}`
         );
         setLoading(false);
         return;
       }
 
-      // Resolve item from barcode
+      // Resolve item from barcode. If item master is not synced, currentItem is
+      // already the validated ASN item_code, so allow it to proceed.
       const resolvedItem = await resolveItemFromBarcode(scannedValue);
-      if (!resolvedItem) {
-        Alert.alert(
-          "Item Not Found",
-          `Item "${scannedValue}" not found in item master.`
-        );
+      const itemCode = String(resolvedItem?.item_code ?? scannedValue).trim();
+      if (!itemCode) {
+        Alert.alert("Item Not Found", `Item "${scannedValue}" not found.`);
         setLoading(false);
         return;
       }
-
-      const itemCode = resolvedItem.item_code;
       const settings = await getSettings();
+
+      // Shipped qty on this carton line (used for carton cap + TO messaging)
+      let shippedOnLockedCartonLine = 0;
+      // Cap scans by this carton's shipped line — count only rows attributed to THIS supplier carton
+      // (same basis as refreshScannedStateFromDb / Expected Items; do NOT add NULL carton_id or other cartons)
+      if (lockedCarton) {
+        const lockCtn = String(lockedCarton).trim();
+        const cartonLine = await db.getFirstAsync<{ shipped_qty: number }>(
+          `SELECT COALESCE(SUM(shipped_qty), 0) AS shipped_qty
+           FROM asn_carton_map
+           WHERE UPPER(TRIM(carton_id)) = UPPER(TRIM(?))
+             AND (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?)))
+             AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))`,
+          [lockCtn, activeASN, normalizedASN, String(itemCode).trim()]
+        );
+        const shippedCap = cartonLine?.shipped_qty ?? 0;
+        shippedOnLockedCartonLine = shippedCap;
+        if (shippedCap <= 0) {
+          Alert.alert(
+            "Item Not on Carton",
+            `Item ${itemCode} is not expected on carton ${lockedCarton} for this ASN (no shipped quantity on file).`
+          );
+          setLoading(false);
+          return;
+        }
+        const cartonScannedRow = await db.getFirstAsync<{ total_qty: number }>(
+          `SELECT COALESCE(SUM(scanned_qty), 0) AS total_qty
+           FROM scanned_items
+           WHERE (asn_no = ? OR asn_no = ?)
+             AND inbound_session = ?
+             AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))
+             AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))`,
+          [
+            activeASN,
+            normalizedASN,
+            activeSession,
+            String(itemCode).trim(),
+            lockCtn,
+          ]
+        );
+        const currentOnCarton = cartonScannedRow?.total_qty ?? 0;
+        if (currentOnCarton + 1 > shippedCap) {
+          Alert.alert(
+            "Carton Quantity Exceeded",
+            `Cannot scan more of ${itemCode} for carton ${lockedCarton}.\n\n` +
+              `Shipped on this carton: ${shippedCap}\n` +
+              `Already scanned (counted for this carton): ${currentOnCarton}\n\n` +
+              `Transfer Order limits apply per store, but you cannot sort more units than this carton line.`
+          );
+          showScanFeedback(
+            "err",
+            `Carton limit: ${itemCode} — max ${shippedCap} on ${lockedCarton}.`
+          );
+          setLoading(false);
+          return;
+        }
+      }
 
       // Validate quantity against TO allocation before saving
       const allocations = await dataService.getTransferOrderAllocations(
         activeASN
       );
-      
-      // ✅ PERMANENT FIX: Check if ALL TO-allocated items are already scanned
-      // If yes, block ALL further scanning (including non-TO items and Putaway)
-      if (allocations.length > 0) {
-        let allTOItemsScanned = true;
-        for (const alloc of allocations) {
-          if (alloc.allocated_qty > 0) {
-            // Get current scanned quantity for this item/store combination
-            // Count ONLY items scanned to STORE boxes (not Putaway boxes)
-            // TO items must be scanned to store boxes, Putaway is for remaining items only
-            const scannedQtyResult = await db.getFirstAsync<{ total_qty: number }>(
-              `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty
-               FROM scanned_items
-               WHERE (asn_no = ? OR asn_no = ?)
-                 AND inbound_session = ?
-                 AND item_code = ?
-                 AND store = ?
-                 AND (box_id NOT LIKE 'PAW-%' OR box_id IS NULL)`,
-              [activeASN, normalizedASN, activeSession, alloc.item_code, alloc.store]
+
+      const normToStore = (s: string | null | undefined) =>
+        String(s ?? "").trim().toUpperCase();
+
+      const isPutawayBoxRecord = (b: { box_id?: string; purpose?: string }) => {
+        const id = String(b?.box_id || "").trim().toUpperCase();
+        const pur = String((b as any)?.purpose || "").trim().toUpperCase();
+        return id.startsWith("PAW-") || pur === "PUTAWAY";
+      };
+
+      // Do not block scanning when TO lines are fulfilled globally across cartons.
+      // Same item_code often appears in multiple cartons; later cartons may still need
+      // sorting (e.g. overflow to Putaway). Per-scan TO / store-box checks below are enough.
+
+      const isPutawayBox = isPutawayBoxRecord(box);
+
+      const findAllocForItemAndStore = (storeVal: string | null | undefined) =>
+        allocations.find(
+          (alloc) =>
+            itemCodesMatchForAllocation(alloc.item_code, itemCode) &&
+            storeCodesMatchForTO(alloc.store, storeVal)
+        );
+
+      let itemAllocation = findAllocForItemAndStore(box.store);
+      if (!itemAllocation && !isPutawayBox) {
+        const slug = parseBoxIdStoreSlug(canonicalBoxId);
+        if (slug) {
+          itemAllocation = findAllocForItemAndStore(slug);
+          if (itemAllocation) {
+            console.warn(
+              `📌 TO match: used BOX id slug "${slug}" (box.store="${box.store}" did not match a TO line for this item).`
             );
-            const currentScannedQtyForStore = scannedQtyResult?.total_qty || 0;
-            
-            console.log(
-              `🔍 TO Completion Check: Item=${alloc.item_code}, Store=${alloc.store}, ` +
-              `Allocated=${alloc.allocated_qty}, Scanned to Store=${currentScannedQtyForStore}`
-            );
-            
-            // Check if this allocation is fully scanned (only count store boxes, not putaway)
-            if (currentScannedQtyForStore < alloc.allocated_qty) {
-              allTOItemsScanned = false;
-              break; // Found at least one incomplete allocation
-            }
           }
         }
-        
-        if (allTOItemsScanned) {
-          console.warn(
-            `⚠️ All TO-allocated items are already scanned - blocking ALL further scanning (including Putaway)`
-          );
-          Alert.alert(
-            "All TO Items Scanned",
-            `All Transfer Order allocated items have been scanned.\n\n` +
-            `No further scanning is allowed.\n\n` +
-            `Please finish the current carton to complete the process.`
-          );
-          setLoading(false);
-          setIsProcessingScan(false);
-          return;
-        }
       }
-      
-      const itemAllocation = allocations.find(
-        (alloc) => alloc.item_code === itemCode && alloc.store === box.store
-      );
+
+      // Persist store string aligned with TO line when matched (Putaway keeps BOX.store)
+      const storeForToPersistence = isPutawayBox
+        ? String(box.store || "").trim()
+        : itemAllocation && String(itemAllocation.store || "").trim()
+          ? String(itemAllocation.store).trim()
+          : String(box.store || "").trim();
 
       console.log(
         `🔍 TO Validation check: Item=${itemCode}, Store=${
           box.store
-        }, Allocation found=${!!itemAllocation}, Allocated Qty=${
+        } (normalized=${normToStore(
+          box.store
+        )}), Allocation found=${!!itemAllocation}, Allocated Qty=${
           itemAllocation?.allocated_qty || 0
         }`
       );
 
       // ✅ PERMANENT FIX: Only allow scanning items that have TO allocation
       // Block items that are not in TO allocation (unless it's a Putaway box)
-      const isPutawayBox = boxId.startsWith("PAW-");
       if (!isPutawayBox && !itemAllocation) {
         console.error(
           `❌ TO Validation FAILED: Item=${itemCode} has no TO allocation for ${box.store}`
         );
+        const storeKeys = Array.from(
+          new Set(
+            allocations
+              .filter((a) => itemCodesMatchForAllocation(a.item_code, itemCode))
+              .map((a) => `${a.store} → ${normToStore(a.store)}`)
+          )
+        );
+        const hintStores =
+          storeKeys.length > 0
+            ? `\n\nTransfer Order has this item for store(s):\n${storeKeys
+                .slice(0, 6)
+                .join("\n")}${storeKeys.length > 6 ? "\n…" : ""}`
+            : "";
         Alert.alert(
           "Item Not in Transfer Order",
-          `Item ${itemCode} is not allocated to ${box.store} in the Transfer Order.\n\n` +
-          `Only items with TO allocation can be scanned to store boxes.\n\n` +
-          `Items without TO allocation should be scanned to Putaway boxes (PAW-*).`
+          `Item ${itemCode} is not allocated to ${box.store} in the Transfer Order lines on this device.${hintStores}\n\n` +
+            `Often this is a store code mismatch (spacing/case) between the BOX and the synced TO, or the TO was not synced yet (tap "Sync receive data").\n\n` +
+            `Store codes must match Warehouses & Stores on the ERP (e.g. 004-Alras), not shorthand like "004-RAS".\n\n` +
+            `Only items with TO allocation can be scanned to store boxes.\n\n` +
+            `Items without TO allocation should be scanned to Putaway boxes (PAW-* or any box with purpose Putaway in Box Management).`
         );
         setLoading(false);
         return;
       }
 
-      if (itemAllocation && itemAllocation.allocated_qty > 0) {
+      const allocatedCap =
+        itemAllocation != null
+          ? Math.max(0, Math.floor(Number(itemAllocation.allocated_qty) || 0))
+          : 0;
+
+      if (itemAllocation && allocatedCap > 0) {
         // Get all boxes for this store
+        const storeKeyForBoxes = itemAllocation
+          ? String(itemAllocation.store || "").trim()
+          : String(box.store || "").trim();
         const storeBoxIds = boxes
-          .filter((b) => b.store === box.store)
+          .filter((b) => storeCodesMatchForTO(b.store, storeKeyForBoxes))
           .map((b) => b.box_id);
 
-        let currentScannedQtyForStore = 0;
-        // Get current scanned quantity for this item/store combination
-        // Count ALL scanned items for this store, regardless of box_id or carton_id
-        // This ensures we catch all scanned quantities, including items in closed boxes or from different workflows
-        const scannedQtyResult = await db.getFirstAsync<{ total_qty: number }>(
-          `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty
-           FROM scanned_items
+        // Sum scanned qty for this item + TO store using same store matching as allocations
+        // (SQL UPPER(TRIM(store)) = ? misses e.g. "004-ALRAS" vs "004ALRAS" from BOX id slug / cache)
+        const scannedRowsForTo = await db.getAllAsync<{
+          scanned_qty: number;
+          store: string | null;
+        }>(
+          `SELECT scanned_qty, store FROM scanned_items
            WHERE (asn_no = ? OR asn_no = ?)
              AND inbound_session = ?
-             AND item_code = ?
-             AND store = ?`,
-          [activeASN, normalizedASN, activeSession, itemCode, box.store]
+             AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))`,
+          [
+            activeASN,
+            normalizedASN,
+            activeSession,
+            String(itemCode).trim(),
+          ]
         );
-        currentScannedQtyForStore = scannedQtyResult?.total_qty || 0;
+        let currentScannedQtyForStore = 0;
+        for (const r of scannedRowsForTo) {
+          if (storeCodesMatchForTO(r.store, storeForToPersistence)) {
+            currentScannedQtyForStore += Number(r.scanned_qty) || 0;
+          }
+        }
 
         console.log(
-          `🔍 TO Validation: Item=${itemCode}, Store=${box.store}, Allocated=${
-            itemAllocation.allocated_qty
-          }, Current Scanned=${currentScannedQtyForStore}, After scan=${
+          `🔍 TO Validation: Item=${itemCode}, Store=${box.store}, Allocated=${allocatedCap}, Current Scanned=${currentScannedQtyForStore}, After scan=${
             currentScannedQtyForStore + 1
           }`
         );
 
         // Check if adding 1 more would exceed TO allocation
         // Use strict check: current + 1 > allocated (not >=)
-        const wouldExceed =
-          currentScannedQtyForStore + 1 > itemAllocation.allocated_qty;
+        const wouldExceed = currentScannedQtyForStore + 1 > allocatedCap;
 
         if (wouldExceed) {
           console.error(
             `❌ TO Validation FAILED: Item=${itemCode}, Store=${
               box.store
-            }, Allocated=${
-              itemAllocation.allocated_qty
-            }, Current=${currentScannedQtyForStore}, After scan=${
+            }, Allocated=${allocatedCap}, Current=${currentScannedQtyForStore}, After scan=${
               currentScannedQtyForStore + 1
             }`
           );
+          const cartonHint =
+            lockedCarton && shippedOnLockedCartonLine > allocatedCap
+              ? `\n\nThis carton line shows ${shippedOnLockedCartonLine} units, but the Transfer Order only allocates ${allocatedCap} to this store for ${itemCode}. Put the remaining units into a Putaway box (PAW-* or purpose Putaway), or increase the TO in ERP and tap "Sync receive data".`
+              : "";
           Alert.alert(
             "Transfer Order Quantity Exceeded",
             `Cannot scan item ${itemCode} to ${box.store}.\n\n` +
-              `Allocated quantity: ${itemAllocation.allocated_qty}\n` +
-              `Currently scanned: ${currentScannedQtyForStore}\n` +
+              `Allocated quantity: ${allocatedCap}\n` +
+              `Currently scanned (this store, all boxes): ${currentScannedQtyForStore}\n` +
               `After scanning: ${currentScannedQtyForStore + 1}\n\n` +
-              `Please ensure scanned quantity does not exceed allocated quantity.`
+              `Scanned quantity cannot exceed the TO line for this store.${cartonHint}`
+          );
+          showScanFeedback(
+            "err",
+            `TO limit for ${itemCode} at this store: ${allocatedCap} (already ${currentScannedQtyForStore}).`
           );
           setLoading(false);
           return;
@@ -2947,13 +3797,11 @@ export default function ReceiveSortScreen() {
         console.log(
           `✅ TO Validation passed: Item=${itemCode}, Store=${
             box.store
-          }, Allocated=${
-            itemAllocation.allocated_qty
-          }, Current=${currentScannedQtyForStore}, After scan=${
+          }, Allocated=${allocatedCap}, Current=${currentScannedQtyForStore}, After scan=${
             currentScannedQtyForStore + 1
           }`
         );
-      } else if (itemAllocation && itemAllocation.allocated_qty === 0) {
+      } else if (itemAllocation && allocatedCap === 0) {
         console.warn(
           `⚠️ TO Validation: Item=${itemCode} has allocation with 0 quantity for ${box.store} - allowing scan`
         );
@@ -2963,45 +3811,48 @@ export default function ReceiveSortScreen() {
       // ✅ PUTAWAY BOX VALIDATION: Restrict Putaway scanning to (ASN - TO) quantity
       if (isPutawayBox) {
         console.log(
-          `🔍 Putaway BOX Validation: Item=${itemCode}, BOX=${boxId}`
+          `🔍 Putaway BOX Validation: Item=${itemCode}, BOX=${canonicalBoxId}`
         );
 
-        // 1. Get ASN quantity for this item
-        const asnItems = await db.getAllAsync<{
-          item_code: string;
-          shipped_qty: number;
+        // 1. Get total ASN quantity for this item across all supplier cartons.
+        // Do not use DISTINCT here: the same item can appear in multiple cartons with qty 1.
+        const asnQtyResult = await db.getFirstAsync<{
+          total_qty: number;
         }>(
-          `SELECT DISTINCT item_code, shipped_qty 
-           FROM asn_carton_map 
-           WHERE (asn_no = ? OR asn_no = ?) AND item_code = ?`,
+          `SELECT COALESCE(SUM(shipped_qty), 0) as total_qty
+           FROM asn_carton_map
+           WHERE (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?)))
+             AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))
+             AND UPPER(TRIM(item_code)) <> 'PLACEHOLDER'`,
           [activeASN, normalizedASN, itemCode]
         );
-
-        // Sum all ASN quantities for this item (in case item appears in multiple cartons)
-        const asnQty = asnItems.reduce(
-          (sum, item) => sum + (item.shipped_qty || 0),
-          0
-        );
+        const asnQty = asnQtyResult?.total_qty || 0;
         console.log(`📦 ASN Quantity for ${itemCode}: ${asnQty}`);
 
         // 2. Get total TO allocated quantity for this item (sum across all stores)
         const totalTOQty = allocations
-          .filter((alloc) => alloc.item_code === itemCode)
+          .filter((alloc) =>
+            itemCodesMatchForAllocation(alloc.item_code, itemCode)
+          )
           .reduce((sum, alloc) => sum + (alloc.allocated_qty || 0), 0);
         console.log(
           `📋 Total TO Allocated Quantity for ${itemCode}: ${totalTOQty}`
         );
 
-        // 3. Calculate max allowed for Putaway = ASN - TO
-        const maxAllowedPutaway = asnQty - totalTOQty;
+        // 3. Calculate max allowed for Putaway.
+        // If the item has no TO allocation, the full ASN quantity can go to Putaway.
+        // If TO allocation exists, only ASN - TO is allowed; never allow a negative quantity.
+        const maxAllowedPutaway =
+          totalTOQty > 0 ? Math.max(asnQty - totalTOQty, 0) : asnQty;
         console.log(
-          `📊 Max Allowed Putaway for ${itemCode}: ${maxAllowedPutaway} (ASN: ${asnQty} - TO: ${totalTOQty})`
+          `📊 Max Allowed Putaway for ${itemCode}: ${maxAllowedPutaway} (ASN: ${asnQty}, TO: ${totalTOQty})`
         );
 
         // 4. Get current Putaway scanned quantity (all Putaway boxes for this item)
         const putawayBoxes = boxes
-          .filter((b) => b.box_id && b.box_id.startsWith("PAW-"))
-          .map((b) => b.box_id);
+          .filter((b) => isPutawayBoxRecord(b))
+          .map((b) => String(b.box_id || "").trim())
+          .filter(Boolean);
         let currentPutawayScanned = 0;
         if (putawayBoxes.length > 0) {
           const placeholders = putawayBoxes.map(() => "?").join(",");
@@ -3034,13 +3885,15 @@ export default function ReceiveSortScreen() {
           );
           Alert.alert(
             "Putaway Quantity Exceeded",
-            `Cannot scan item ${itemCode} to Putaway BOX ${boxId}.\n\n` +
+            `Cannot scan item ${itemCode} to Putaway BOX ${canonicalBoxId}.\n\n` +
               `ASN Quantity: ${asnQty}\n` +
               `Transfer Order Allocated: ${totalTOQty}\n` +
-              `Max Allowed for Putaway: ${maxAllowedPutaway} (ASN - TO)\n` +
+              `Max Allowed for Putaway: ${maxAllowedPutaway}${
+                totalTOQty > 0 ? " (ASN - TO)" : " (full ASN qty; no TO)"
+              }\n` +
               `Currently scanned to Putaway: ${currentPutawayScanned}\n` +
               `After scanning: ${currentPutawayScanned + 1}\n\n` +
-              `Please ensure Putaway scanned quantity does not exceed (ASN - TO).`
+              `Please ensure Putaway scanned quantity does not exceed the allowed Putaway quantity.`
           );
           setLoading(false);
           setIsProcessingScan(false);
@@ -3054,136 +3907,116 @@ export default function ReceiveSortScreen() {
         );
       }
 
-      // Save to scanned_items (use null for carton_id since we're using BOX ID directly)
-      const existing = await db.getFirstAsync<{ scanned_qty: number }>(
-        `SELECT scanned_qty FROM scanned_items 
-         WHERE asn_no = ? AND inbound_session = ? AND box_id = ? AND item_code = ?`,
-        [normalizedASN, activeSession, boxId, itemCode]
+      // Save to scanned_items — single UPSERT on UNIQUE(asn_no, inbound_session, carton_id, item_code, box_id)
+      // so we never "miss" the prior row (case/format drift) and hit a duplicate INSERT that leaves qty stuck at 1.
+      const persistCartonId = lockedCarton
+        ? String(lockedCarton).trim()
+        : "";
+      const cartonForUnique =
+        persistCartonId.length > 0 ? persistCartonId : null;
+      const scannedOnIso = new Date().toISOString();
+      const itemForRow = String(itemCode).trim();
+      try {
+        if (
+          !activeASN ||
+          !canonicalBoxId ||
+          !lockedCarton ||
+          !itemForRow ||
+          !settings.user_id
+        ) {
+          Alert.alert(
+            isPutawayBox ? "Putaway Not Allowed" : "Sort Not Allowed",
+            "Missing scan context. Please scan the supplier carton, then scan the item, then scan the destination BOX."
+          );
+          setLoading(false);
+          setIsProcessingScan(false);
+          return;
+        }
+        if (!(await requireOnlineForReceiving())) {
+          setLoading(false);
+          setIsProcessingScan(false);
+          return;
+        }
+        await apiService.scanSortBox({
+          purpose: isPutawayBox ? "PUTAWAY" : "STORE",
+          asn_no: activeASN,
+          box_id: canonicalBoxId,
+          carton_id: lockedCarton ?? undefined,
+          item_code: itemForRow,
+          qty: 1,
+          user_id: settings.user_id ?? "",
+          device_id: settings.device_id ?? "",
+        });
+      } catch (error: any) {
+        const payload = error?.data || error?.response?.data || {};
+        const msg =
+          payload?.message ||
+          error?.message ||
+          "Backend rejected this sort scan.";
+        Alert.alert(isPutawayBox ? "Putaway Not Allowed" : "Sort Not Allowed", msg);
+        showScanFeedback("err", msg);
+        setLoading(false);
+        setIsProcessingScan(false);
+        return;
+      }
+      await db.runAsync(
+        `INSERT INTO scanned_items 
+           (asn_no, inbound_session, carton_id, item_code, box_id, store, scanned_qty, scanned_on, device_id, user_id)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+         ON CONFLICT(asn_no, inbound_session, carton_id, item_code, box_id) DO UPDATE SET
+           scanned_qty = scanned_items.scanned_qty + 1,
+           scanned_on = excluded.scanned_on,
+           device_id = excluded.device_id,
+           user_id = excluded.user_id,
+           carton_id = CASE WHEN excluded.carton_id IS NOT NULL AND TRIM(COALESCE(excluded.carton_id, '')) <> ''
+             THEN excluded.carton_id ELSE scanned_items.carton_id END,
+           store = CASE WHEN excluded.store IS NOT NULL AND TRIM(COALESCE(excluded.store, '')) <> ''
+             THEN excluded.store ELSE scanned_items.store END`,
+        [
+          normalizedASN,
+          activeSession,
+          cartonForUnique,
+          itemForRow,
+          canonicalBoxId,
+          storeForToPersistence,
+          scannedOnIso,
+          settings.device_id ?? "",
+          settings.user_id ?? "",
+        ]
       );
 
-      if (existing) {
-        const newQty = existing.scanned_qty + 1;
-        await db.runAsync(
-          `UPDATE scanned_items 
-           SET scanned_qty = ?, scanned_on = ?, device_id = ?, user_id = ?
-           WHERE asn_no = ? AND inbound_session = ? AND box_id = ? AND item_code = ?`,
-          [
-            newQty,
-            new Date().toISOString(),
-            settings.device_id ?? "",
-            settings.user_id ?? "",
-            normalizedASN,
-            activeSession,
-            boxId,
-            itemCode,
-          ]
-        );
-      } else {
-        await db.runAsync(
-          `INSERT INTO scanned_items 
-           (asn_no, inbound_session, carton_id, item_code, box_id, store, scanned_qty, scanned_on, device_id, user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            normalizedASN,
-            activeSession,
-            null as unknown as string,
-            itemCode,
-            boxId,
-            box.store,
-            1,
-            new Date().toISOString(),
-            settings.device_id ?? "",
-            settings.user_id ?? "",
-          ]
-        );
-      }
-
-      // Show success message immediately for better UX
-      Alert.alert("Success", `Item ${itemCode} sorted to ${boxId}`);
-
       // Update state
+      setLastScannedItem(itemCode);
       setCurrentItemWithLog(itemCode);
 
       // Clear currentItem to allow scanning next item
       setCurrentItemWithLog(null);
 
-      // Perform background operations after showing success message
-      // This improves perceived performance
-      Promise.all([
-        // Create event (non-blocking)
-        addEvent({
-          event_type: "SORT_TO_BOX",
-          asn_no: normalizedASN,
-          inbound_session: activeSession,
-          carton_id: undefined, // No carton tracking when using BOX ID directly
-          item_code: itemCode,
-          box_id: boxId,
-          store: box.store,
-          device_id: settings.device_id ?? "",
-          user_id: settings.user_id ?? "",
-        }).catch((err) => console.warn("Error creating event:", err)),
-
-        // Reload boxes in background
-        loadAvailableBoxes().catch((err) =>
+      // Reload after backend-controlled sort. Do not queue SORT_TO_BOX here:
+      // /api/sort-box/scan already wrote the server event transactionally.
+      try {
+        await loadAvailableBoxes().catch((err) =>
           console.warn("Error loading boxes:", err)
-        ),
+        );
 
-        // Reload scanned items and quantities from database to keep UI in sync
-        (async () => {
-          if (!activeASN || !activeSession) return;
-          try {
-            const db = await getDatabase();
-            const normalizedASN = normalizeASN(activeASN);
+        await refreshScannedStateFromDb();
 
-            // Reload scanned items (for scanned items modal)
-            const scannedItemsFromDB = await db.getAllAsync<{
-              item_code: string;
-              box_id: string | null;
-              scanned_qty: number;
-            }>(
-              `SELECT item_code, box_id, scanned_qty 
-               FROM scanned_items 
-               WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?`,
-              [activeASN, normalizedASN, activeSession]
-            );
-            setScannedItemsWithLog(scannedItemsFromDB);
-
-            // Recalculate scanned quantities by item_code (for scanned items modal)
-            const scannedQtyMap = new Map<string, number>();
-            scannedItemsFromDB.forEach((item) => {
-              const current = scannedQtyMap.get(item.item_code) || 0;
-              scannedQtyMap.set(
-                item.item_code,
-                current + (item.scanned_qty || 0)
-              );
-            });
-            const newScannedQuantities: Record<string, number> = {};
-            scannedQtyMap.forEach((qty, itemCode) => {
-              newScannedQuantities[itemCode] = qty;
-            });
-            setScannedQuantitiesWithLog(newScannedQuantities);
-
-            // Reload total scanned quantities (for Expected Items modal)
-            let totalScannedItemsFromDB = await db.getAllAsync<{
-              item_code: string;
-              scanned_qty: number;
-            }>(
-              `SELECT item_code, SUM(scanned_qty) as scanned_qty 
-               FROM scanned_items 
-               WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?
-               GROUP BY item_code`,
-              [activeASN, normalizedASN, activeSession]
-            );
-            const quantitiesMap: Record<string, number> = {};
-            totalScannedItemsFromDB.forEach((item) => {
-              quantitiesMap[item.item_code] = item.scanned_qty || 0;
-            });
-            setTotalScannedQuantities(quantitiesMap);
-          } catch (error: any) {
-            console.warn(`⚠️ Error reloading scanned items:`, error.message);
-          }
-        })(),
-      ]).catch((err) => console.warn("Error in background operations:", err));
+        showScanFeedback(
+          "ok",
+          `Sorted 1 × ${itemCode} → ${canonicalBoxId}`
+        );
+        setWorkflowStateWithLog("SCAN_ITEM");
+      } catch (reloadErr: any) {
+        console.warn(`⚠️ Post-scan reload failed:`, reloadErr?.message);
+        Alert.alert(
+          "Scan may be saved",
+          `Quantities could not be refreshed: ${reloadErr?.message || "Unknown error"}\n\nIf counts look wrong, use Sync receive data or reopen this screen.`
+        );
+        showScanFeedback(
+          "err",
+          "Saved sort but could not refresh counts — try Sync receive data."
+        );
+      }
     } catch (error: any) {
       console.error("❌ Error processing item scan with BOX:", error);
       Alert.alert("Error", error.message || "Failed to process item scan");
@@ -3210,20 +4043,47 @@ export default function ReceiveSortScreen() {
 
       // Get carton items for the target carton
       // Note: asn_carton_map doesn't have barcode column, only item_code and shipped_qty
-      const targetCartonItems = await db.getAllAsync<{
+      let targetCartonItems = await db.getAllAsync<{
         item_code: string;
         shipped_qty: number;
       }>(
-        `SELECT DISTINCT item_code, shipped_qty 
+        `SELECT item_code, COALESCE(SUM(shipped_qty), 0) AS shipped_qty
          FROM asn_carton_map 
-         WHERE asn_no = ? AND carton_id = ?`,
-        [normalizedASN, targetCartonId]
+         WHERE (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?)))
+           AND UPPER(TRIM(carton_id)) = UPPER(TRIM(?))
+           AND UPPER(TRIM(item_code)) <> 'PLACEHOLDER'
+         GROUP BY item_code`,
+        [activeASN, normalizedASN, targetCartonId]
       );
+
+      if (!targetCartonItems || targetCartonItems.length === 0) {
+        const hydrated = await dataService.hydrateCartonLinesFromAsnApi(
+          activeASN,
+          targetCartonId
+        );
+        if (hydrated.ok) {
+          targetCartonItems = await db.getAllAsync<{
+            item_code: string;
+            shipped_qty: number;
+          }>(
+            `SELECT item_code, COALESCE(SUM(shipped_qty), 0) AS shipped_qty
+             FROM asn_carton_map 
+             WHERE (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?)))
+               AND UPPER(TRIM(carton_id)) = UPPER(TRIM(?))
+               AND UPPER(TRIM(item_code)) <> 'PLACEHOLDER'
+             GROUP BY item_code`,
+            [activeASN, normalizedASN, targetCartonId]
+          );
+          if (targetCartonItems.length > 0) {
+            setCartonItemsWithLog(targetCartonItems as any[]);
+          }
+        }
+      }
 
       if (!targetCartonItems || targetCartonItems.length === 0) {
         Alert.alert(
           "Error",
-          `No items found for carton ${targetCartonId}.\n\nPlease verify the carton ID is correct.`
+          `No expected item lines found for carton ${targetCartonId}.\n\nTap "Sync receive data" and try again. If it is still empty, backend /api/asn must return carton line items for this carton.`
         );
         setLoading(false);
         return;
@@ -3751,8 +4611,11 @@ export default function ReceiveSortScreen() {
       }>(
         `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty 
        FROM scanned_items 
-       WHERE asn_no = ? AND inbound_session = ? AND carton_id = ? AND item_code = ?`,
-        [normalizedASN, activeSession, targetCartonId, matchedItemCode]
+       WHERE (UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?)))
+         AND inbound_session = ?
+         AND UPPER(TRIM(carton_id)) = UPPER(TRIM(?))
+         AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))`,
+        [activeASN, normalizedASN, activeSession, targetCartonId, matchedItemCode]
       );
 
       const currentScannedQty = currentScannedQtyResult?.total_qty || 0;
@@ -3780,10 +4643,7 @@ export default function ReceiveSortScreen() {
       if (targetCartonId !== lockedCarton) {
         setLockedCartonWithLog(targetCartonId);
       }
-      // Don't switch to SCAN_BOX automatically - allow user to scan more items first
-      // User can create a box via "Create Distribution CTN" button, then scan box barcode when ready
-      // Keep workflow in SCAN_ITEM mode to allow continuous item scanning
-      // setWorkflowStateWithLog("SCAN_BOX"); // Removed - allow scanning items without requiring box first
+      setWorkflowStateWithLog("SCAN_BOX");
       setLoading(false);
     } catch (error: any) {
       console.error("❌ Error processing item scan:", error);
@@ -3800,19 +4660,18 @@ export default function ReceiveSortScreen() {
       });
       return;
     }
+    if (!(await requireOnlineForReceiving())) return;
 
     const boxId = barcode.trim().toUpperCase();
     setLoading(true);
 
     try {
-      // Verify getDatabase is available
       if (typeof getDatabase !== "function") {
         throw new Error(
           "getDatabase is not a function. Please restart the app."
         );
       }
 
-      // Check if user accidentally scanned an item code instead of a BOX
       const scannedItem = await resolveItemFromBarcode(barcode);
       if (scannedItem) {
         Alert.alert(
@@ -3825,7 +4684,13 @@ export default function ReceiveSortScreen() {
 
       // Validate box exists and is active from Box Management
       const boxes = await dataService.getBoxes(activeASN);
-      const box = boxes.find((b) => b.box_id === boxId);
+      let box = boxes.find((b) => b.box_id === boxId);
+      if (!box) {
+        box = boxes.find(
+          (b) =>
+            String(b.box_id || "").trim().toUpperCase() === boxId
+        );
+      }
       if (!box) {
         // Reload boxes list
         await loadAvailableBoxes();
@@ -3837,7 +4702,8 @@ export default function ReceiveSortScreen() {
         return;
       }
 
-      // Validate box is active (Open status)
+      const canonicalBoxId = String(box.box_id || "").trim();
+
       if (
         box.status !== "Open" &&
         box.status !== "OPEN" &&
@@ -3845,345 +4711,22 @@ export default function ReceiveSortScreen() {
       ) {
         Alert.alert(
           "BOX Not Active",
-          `BOX "${boxId}" is not active.\n\nCurrent status: ${box.status}\n\nPlease use an active (Open) BOX.`
+          `BOX "${canonicalBoxId}" is not active.\n\nCurrent status: ${box.status}\n\nPlease use an active (Open) BOX.`
         );
         setLoading(false);
         return;
       }
 
-      // Get CTN from scanned_items for this box, or prompt for CTN
-      const db = await getDatabase();
-      const normalizedASN = normalizeASN(activeASN);
-
-      // Try to get CTN from scanned_items for this box
-      const scannedItemForBox = await db.getFirstAsync<{
-        carton_id: string;
-        item_code: string;
-      }>(
-        `SELECT DISTINCT carton_id, item_code 
-         FROM scanned_items 
-         WHERE asn_no = ? AND inbound_session = ? AND box_id = ?
-         LIMIT 1`,
-        [normalizedASN, activeSession, boxId]
-      );
-
-      let targetCartonId = scannedItemForBox?.carton_id || lockedCarton;
-      let targetItemCode = scannedItemForBox?.item_code || currentItem;
-
-      // If no CTN found in scanned_items, prompt for CTN
-      if (!targetCartonId) {
-        setPendingItemScan(null); // We're scanning a box, not an item
-        setCtnIdPromptValue("");
-        setShowCTNIdPrompt(true);
-        // Store box info for later processing
-        setPendingBoxScan(boxId);
-        setLoading(false);
-        return;
-      }
-
-      // For continuous flow: Scan Item → Scan Box → Scan Item → Scan Box
-      // We need both currentItem and lockedCarton to be set from the item scan
-      // If not set, prompt user to scan item first
       if (!currentItem || !lockedCarton) {
         Alert.alert(
           "Scan Item First",
-          `Please scan an item first (which will prompt for CTN), then scan the BOX barcode.\n\nFlow: Scan Item → Enter CTN → Scan Box → Scan Item → Enter CTN → Scan Box...`
+          "Please scan an item first, then scan the destination BOX."
         );
         setLoading(false);
         return;
       }
 
-      // Use currentItem and lockedCarton from the item scan
-      // This ensures we're using the correct CTN and item for this scan
-      targetItemCode = currentItem;
-      targetCartonId = lockedCarton;
-
-      // Validate allocation (hard validation - block if no allocation)
-      // Exception: Warehouse boxes (warehouse_type = "Warehouse") don't require allocations (for putaway items)
-      // Check warehouse_type from master data instead of hardcoded "WAREHOUSE" string
-      const boxStoreInfo = warehousesAndStores.find(
-        (ws: any) =>
-          ws.code.toUpperCase() === String(box.store).trim().toUpperCase()
-      );
-      const isWarehouseBox =
-        boxStoreInfo?.warehouse_type === "Warehouse" ||
-        String(box.store).trim().toUpperCase() === "WAREHOUSE"; // Fallback for legacy support
-
-      if (!isWarehouseBox) {
-        // For store boxes (SR-*), validate allocation
-        const allocations = await dataService.getTransferOrderAllocations(
-          activeASN,
-          box.store
-        );
-        const allocation = allocations.find(
-          (a) => a.item_code === targetItemCode
-        );
-        if (!allocation || allocation.allocated_qty <= 0) {
-          Alert.alert(
-            "Error",
-            `No allocation for ${targetItemCode} to ${box.store}.\n\nThis item cannot be sorted to this BOX.`
-          );
-          setLoading(false);
-          return;
-        }
-
-        // Check if adding 1 more item would exceed allocated quantity for this store
-        // Allocation is per store, so we need to check total scanned across ALL cartons for this store
-        // Get all boxes for this store
-        const storeBoxIds = boxes
-          .filter((b) => b.store === box.store)
-          .map((b) => b.box_id);
-
-        let currentScannedQtyForStore = 0;
-        if (storeBoxIds.length > 0) {
-          const placeholders = storeBoxIds.map(() => "?").join(",");
-          // Check total scanned across ALL cartons for this item/store combination
-          // Allocation is per store, not per carton
-          const scannedQtyResult = await db.getFirstAsync<{
-            total_qty: number;
-          }>(
-            `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty
-             FROM scanned_items
-             WHERE asn_no = ? 
-               AND inbound_session = ?
-               AND item_code = ?
-               AND box_id IN (${placeholders})
-               AND store = ?`,
-            [
-              normalizedASN,
-              activeSession,
-              targetItemCode,
-              ...storeBoxIds,
-              box.store,
-            ]
-          );
-          currentScannedQtyForStore = scannedQtyResult?.total_qty || 0;
-        }
-
-        // Check if adding 1 more would exceed allocation
-        // Only block if we're already at or above the allocation limit
-        if (currentScannedQtyForStore >= allocation.allocated_qty) {
-          Alert.alert(
-            "Quantity Exceeded",
-            `Cannot scan more items for ${targetItemCode} to ${box.store}.\n\n` +
-              `Allocated: ${allocation.allocated_qty}\n` +
-              `Already Scanned: ${currentScannedQtyForStore}\n\n` +
-              `Please use the TO Breakdown button to edit quantities if needed.`
-          );
-          setLoading(false);
-          return;
-        }
-      } else {
-        // For WAREHOUSE boxes, check if this is a Putaway box or regular warehouse box
-        // If Putaway boxes exist, prefer them over regular warehouse boxes
-        const isPutawayBox =
-          box.purpose === "PUTAWAY" || box.box_id.startsWith("PAW-");
-
-        if (!isPutawayBox) {
-          // This is a regular warehouse box (BOX-WHMAIN-*), check if Putaway boxes exist
-          const allBoxes = await dataService.getBoxes(activeASN);
-          const putawayBoxes = allBoxes.filter(
-            (b) =>
-              (b.purpose === "PUTAWAY" || b.box_id?.startsWith("PAW-")) &&
-              b.status === "Open" &&
-              (String(b.store).trim().toUpperCase() === "WAREHOUSE" ||
-                String(b.store).trim().toUpperCase().startsWith("WH-"))
-          );
-
-          if (putawayBoxes.length > 0) {
-            Alert.alert(
-              "Use Putaway Box",
-              `You scanned a regular warehouse box (${boxId}), but Putaway boxes are available.\n\n` +
-                `Please use a Putaway box (PAW-*) for items without TO allocation.\n\n` +
-                `Available Putaway boxes:\n${putawayBoxes
-                  .map((b) => `• ${b.box_id}`)
-                  .join("\n")}`,
-              [{ text: "OK" }]
-            );
-            setLoading(false);
-            return;
-          }
-        }
-
-        // For Putaway boxes or when no Putaway boxes exist, allow putaway items
-        console.log(
-          `✅ Allowing putaway item ${targetItemCode} to ${
-            isPutawayBox ? "Putaway" : "WAREHOUSE"
-          } box ${boxId} (no allocation required)`
-        );
-      }
-
-      const settings = await getSettings();
-
-      // Load carton items for validation if needed
-      if (!cartonItems || cartonItems.length === 0) {
-        await loadCartonItems(targetCartonId);
-      }
-
-      // Validate ASN quantity before saving - check if adding 1 more would exceed ASN quantity
-      const cartonItem = cartonItems.find(
-        (ci) => ci.item_code === targetItemCode
-      );
-      const asnQty = cartonItem?.shipped_qty || 0;
-
-      if (asnQty > 0) {
-        // Get current scanned quantity from database (sum across all boxes for this carton)
-        const currentScannedQtyResult = await db.getFirstAsync<{
-          total_qty: number;
-        }>(
-          `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty 
-           FROM scanned_items 
-           WHERE asn_no = ? AND inbound_session = ? AND carton_id = ? AND item_code = ?`,
-          [normalizedASN, activeSession, targetCartonId, targetItemCode]
-        );
-
-        const currentScannedQty = currentScannedQtyResult?.total_qty || 0;
-
-        // Check if adding 1 more would exceed ASN quantity
-        if (currentScannedQty + 1 > asnQty) {
-          Alert.alert(
-            "ASN Quantity Exceeded",
-            `Cannot scan more items.\n\n` +
-              `ASN Quantity: ${asnQty}\n` +
-              `Already Scanned: ${currentScannedQty}\n\n` +
-              `Scanning one more would exceed the ASN quantity for ${targetItemCode}.`
-          );
-          setLoading(false);
-          return;
-        }
-      }
-
-      // Create RECEIVE_ITEM_SCAN event
-      await addEvent({
-        event_type: "RECEIVE_ITEM_SCAN",
-        asn_no: normalizedASN,
-        inbound_session: activeSession,
-        carton_id: targetCartonId,
-        item_code: targetItemCode,
-        qty: 1,
-        device_id: settings.device_id,
-        user_id: settings.user_id,
-      });
-
-      // Create SORT_TO_BOX event
-      await addEvent({
-        event_type: "SORT_TO_BOX",
-        asn_no: normalizedASN,
-        inbound_session: activeSession,
-        carton_id: targetCartonId,
-        item_code: targetItemCode,
-        box_id: boxId,
-        store: box.store,
-        device_id: settings.device_id,
-        user_id: settings.user_id,
-      });
-
-      // Save scanned item to database permanently
-      // Increment quantity if item already exists in same box, otherwise insert new record
-      try {
-        // First, try to get existing record
-        const existing = await db.getFirstAsync<{ scanned_qty: number }>(
-          `SELECT scanned_qty FROM scanned_items 
-           WHERE asn_no = ? AND inbound_session = ? AND carton_id = ? AND item_code = ? AND box_id = ?`,
-          [normalizedASN, activeSession, targetCartonId, targetItemCode, boxId]
-        );
-
-        if (existing) {
-          // Update existing record: increment scanned_qty
-          const newQty = existing.scanned_qty + 1;
-          await db.runAsync(
-            `UPDATE scanned_items 
-             SET scanned_qty = ?, scanned_on = ?, device_id = ?, user_id = ?
-             WHERE asn_no = ? AND inbound_session = ? AND carton_id = ? AND item_code = ? AND box_id = ?`,
-            [
-              newQty,
-              new Date().toISOString(),
-              settings.device_id ?? "",
-              settings.user_id ?? "",
-              normalizedASN,
-              activeSession,
-              targetCartonId,
-              targetItemCode,
-              boxId,
-            ]
-          );
-          console.log(
-            `✅ Updated scanned item quantity in database: ${targetItemCode} -> ${boxId} (qty: ${existing.scanned_qty} + 1 = ${newQty})`
-          );
-        } else {
-          // Insert new record
-          await db.runAsync(
-            `INSERT INTO scanned_items 
-             (asn_no, inbound_session, carton_id, item_code, box_id, store, scanned_qty, scanned_on, device_id, user_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              normalizedASN,
-              activeSession,
-              targetCartonId,
-              targetItemCode,
-              boxId,
-              box.store,
-              1, // scanned_qty
-              new Date().toISOString(),
-              settings.device_id ?? "",
-              settings.user_id ?? "",
-            ]
-          );
-          console.log(
-            `✅ Saved scanned item to database: ${targetItemCode} -> ${boxId} (qty: 1)`
-          );
-        }
-      } catch (error: any) {
-        console.error("❌ Failed to save scanned item to database:", error);
-        // Don't fail the operation if saving to scanned_items fails
-      }
-
-      // Update scanned items list and quantities
-      const newScannedItems = [
-        ...scannedItems,
-        { item_code: targetItemCode, box_id: boxId },
-      ];
-      logStateChange("ITEM_SORTED_TO_BOX", {
-        item: targetItemCode,
-        box: boxId,
-        carton: targetCartonId,
-        previousScannedCount: scannedItems.length,
-        newScannedCount: newScannedItems.length,
-      });
-      setScannedItemsWithLog(newScannedItems);
-
-      // Increment scanned quantity for this item
-      const currentScannedQty = scannedQuantities[targetItemCode] || 0;
-      const newQuantities = {
-        ...scannedQuantities,
-        [targetItemCode]: currentScannedQty + 1,
-      };
-      logStateChange("UPDATE_SCANNED_QUANTITY", {
-        item: targetItemCode,
-        fromQty: currentScannedQty,
-        toQty: currentScannedQty + 1,
-      });
-      setScannedQuantitiesWithLog(newQuantities);
-
-      // Track last scanned item
-      setLastScannedItem(targetItemCode);
-
-      // Update lockedCarton if it changed
-      if (targetCartonId !== lockedCarton) {
-        setLockedCartonWithLog(targetCartonId);
-      }
-
-      // Clear currentItem after successful box scan to allow scanning next item
-      // This enables continuous flow: Scan Item → Scan Box → Scan Item → Scan Box
-      setCurrentItemWithLog(null);
-
-      const sortedItem = targetItemCode;
-      setWorkflowStateWithLog("SCAN_ITEM");
-      await loadAvailableBoxes(); // Refresh boxes list
-      Alert.alert(
-        "Success",
-        `Item ${sortedItem} from carton ${targetCartonId} sorted to ${boxId}`
-      );
+      await processItemScanWithBox(currentItem, canonicalBoxId);
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to sort item");
     } finally {
@@ -4191,13 +4734,78 @@ export default function ReceiveSortScreen() {
     }
   };
 
-  // Get incomplete items (items that haven't been fully scanned)
+  // Lines where sorted qty ≠ shipped (under- or over-scan). Same basis as Finish Carton.
   const incompleteItems = useMemo(() => {
     return cartonItems.filter((item) => {
-      const scannedQty = scannedQuantities[item.item_code] || 0;
-      return scannedQty < item.shipped_qty;
+      const scannedRaw = scannedQtyLookup(
+        scannedQuantities,
+        item.item_code
+      );
+      const sc = Number(scannedRaw);
+      const sh = Number(item.shipped_qty);
+      const scannedNum = Number.isFinite(sc) ? sc : 0;
+      const shippedNum = Number.isFinite(sh) ? sh : 0;
+      return scannedNum !== shippedNum;
     });
   }, [cartonItems, scannedQuantities]);
+
+  const shortageItems = useMemo(() => {
+    return cartonItems
+      .map((item) => {
+        const scannedRaw = scannedQtyLookup(scannedQuantities, item.item_code);
+        const scannedQty = Number.isFinite(Number(scannedRaw))
+          ? Number(scannedRaw)
+          : 0;
+        const shippedQty = Number.isFinite(Number(item.shipped_qty))
+          ? Number(item.shipped_qty)
+          : 0;
+        return {
+          item_code: item.item_code,
+          shipped_qty: shippedQty,
+          scanned_qty: scannedQty,
+          short_qty: Math.max(shippedQty - scannedQty, 0),
+        };
+      })
+      .filter((item) => item.short_qty > 0);
+  }, [cartonItems, scannedQuantities]);
+
+  const overageItems = useMemo(() => {
+    return cartonItems
+      .map((item) => {
+        const scannedRaw = scannedQtyLookup(scannedQuantities, item.item_code);
+        const scannedQty = Number.isFinite(Number(scannedRaw))
+          ? Number(scannedRaw)
+          : 0;
+        const shippedQty = Number.isFinite(Number(item.shipped_qty))
+          ? Number(item.shipped_qty)
+          : 0;
+        return {
+          item_code: item.item_code,
+          shipped_qty: shippedQty,
+          scanned_qty: scannedQty,
+          over_qty: Math.max(scannedQty - shippedQty, 0),
+        };
+      })
+      .filter((item) => item.over_qty > 0);
+  }, [cartonItems, scannedQuantities]);
+
+  const areAllItemsReceived = useMemo(() => {
+    if (!lockedCarton || cartonItems.length === 0) return false;
+    return incompleteItems.length === 0;
+  }, [lockedCarton, cartonItems.length, incompleteItems]);
+
+  const canFinishCarton = useMemo(() => {
+    if (!lockedCarton || cartonItems.length === 0) return false;
+    return overageItems.length === 0;
+  }, [lockedCarton, cartonItems.length, overageItems.length]);
+
+  const boxesFilteredForCreator = useMemo(() => {
+    if (!onlyMySortBoxes) return availableBoxes;
+    if (!sortBoxUser.user_id && !sortBoxUser.user_code) return availableBoxes;
+    return availableBoxes.filter((box) =>
+      settingsMatchUnloadedActor(sortBoxUser, (box as any).created_by)
+    );
+  }, [availableBoxes, onlyMySortBoxes, sortBoxUser]);
 
   // Check if current item is fully scanned
   const isCurrentItemComplete = useMemo(() => {
@@ -4206,7 +4814,7 @@ export default function ReceiveSortScreen() {
       (item) => item.item_code === currentItem
     );
     if (!cartonItem) return false;
-    const scannedQty = scannedQuantities[currentItem] || 0;
+    const scannedQty = scannedQtyLookup(scannedQuantities, currentItem);
     return scannedQty >= cartonItem.shipped_qty;
   }, [currentItem, cartonItems, scannedQuantities]);
 
@@ -4225,13 +4833,30 @@ export default function ReceiveSortScreen() {
       }
 
       try {
+        const settingsForBox = await getSettings();
+        const boxIdentity = {
+          user_id: settingsForBox.user_id
+            ? String(settingsForBox.user_id).trim()
+            : undefined,
+          user_code: settingsForBox.user_code
+            ? String(settingsForBox.user_code).trim()
+            : undefined,
+        };
+        const applyMyBoxesOnly = (list: any[]) => {
+          if (!onlyMySortBoxesRef.current) return list;
+          if (!boxIdentity.user_id && !boxIdentity.user_code) return list;
+          return list.filter((box) =>
+            settingsMatchUnloadedActor(boxIdentity, (box as any).created_by)
+          );
+        };
         // Get all allocations for the current item
         // Use original ASN format (allocations are stored with original format)
         const allAllocations = await dataService.getTransferOrderAllocations(
           activeASN
         );
-        const itemAllocations = allAllocations.filter(
-          (a) => a.item_code === currentItem
+        const itemAllocations = allAllocations.filter((a) =>
+          String(a.item_code).trim().toUpperCase() ===
+          String(currentItem).trim().toUpperCase()
         );
 
         // If no allocations, check if there are Putaway boxes (PAW-*) or warehouse boxes (for putaway items)
@@ -4264,7 +4889,7 @@ export default function ReceiveSortScreen() {
             console.log(
               `📦 No allocations for ${currentItem}, showing ${putawayBoxes.length} Putaway box(es) (PAW-*)`
             );
-            setFilteredAvailableBoxes(putawayBoxes);
+            setFilteredAvailableBoxes(applyMyBoxesOnly(putawayBoxes));
             return;
           }
 
@@ -4300,27 +4925,34 @@ export default function ReceiveSortScreen() {
             console.log(
               `📦 No allocations for ${currentItem}, showing ${warehouseBoxes.length} regular warehouse box(es) (no Putaway boxes available)`
             );
-            setFilteredAvailableBoxes(warehouseBoxes);
+            setFilteredAvailableBoxes(applyMyBoxesOnly(warehouseBoxes));
             return;
           } else {
             // No allocations and no warehouse/Putaway boxes
-            setFilteredAvailableBoxes([]);
+            setFilteredAvailableBoxes(applyMyBoxesOnly([]));
             return;
           }
         }
 
-        // Calculate scanned quantities per store for the current item
+        // Calculate scanned quantities per store for the current item (compact store key
+        // so TO "004-Alras" and scanned_items.store "004ALRAS" share one bucket)
         const scannedByStore: Record<string, number> = {};
         scannedItems
-          .filter((si) => si.item_code === currentItem)
+          .filter(
+            (si) =>
+              String(si.item_code).trim().toUpperCase() ===
+              String(currentItem).trim().toUpperCase()
+          )
           .forEach((si) => {
-            scannedByStore[si.store] = (scannedByStore[si.store] || 0) + 1;
+            const k = compactStoreCodeKey(si.store);
+            scannedByStore[k] = (scannedByStore[k] || 0) + 1;
           });
 
         // Get stores with remaining allocations
         const storesWithRemainingAllocation = itemAllocations
           .filter((alloc) => {
-            const scannedQty = scannedByStore[alloc.store] || 0;
+            const scannedQty =
+              scannedByStore[compactStoreCodeKey(alloc.store)] || 0;
             return scannedQty < alloc.allocated_qty;
           })
           .map((alloc) => alloc.store);
@@ -4345,8 +4977,8 @@ export default function ReceiveSortScreen() {
           const boxStore = String(box.store).trim().toUpperCase();
           const isWarehouse =
             boxStore === "WAREHOUSE" || boxStore.startsWith("WH-");
-          const hasRemainingAllocation = storesWithRemainingAllocation.includes(
-            box.store
+          const hasRemainingAllocation = storesWithRemainingAllocation.some(
+            (allocStore) => storeCodesMatchForTO(allocStore, box.store)
           );
 
           // Include boxes from stores with remaining allocations
@@ -4377,7 +5009,7 @@ export default function ReceiveSortScreen() {
           storesWithAllocation: storesWithRemainingAllocation,
         });
 
-        setFilteredAvailableBoxes(filtered);
+        setFilteredAvailableBoxes(applyMyBoxesOnly(filtered));
       } catch (error) {
         console.error("Error filtering boxes by allocation:", error);
         // Fallback: filter out null box_ids even on error
@@ -4390,7 +5022,23 @@ export default function ReceiveSortScreen() {
             box.status !== "CLOSED" &&
             box.status !== "closed"
         );
-        setFilteredAvailableBoxes(fallbackBoxes);
+        const settingsForBox = await getSettings();
+        const boxIdentity = {
+          user_id: settingsForBox.user_id
+            ? String(settingsForBox.user_id).trim()
+            : undefined,
+          user_code: settingsForBox.user_code
+            ? String(settingsForBox.user_code).trim()
+            : undefined,
+        };
+        const applyMyBoxesOnly = (list: any[]) => {
+          if (!onlyMySortBoxesRef.current) return list;
+          if (!boxIdentity.user_id && !boxIdentity.user_code) return list;
+          return list.filter((box) =>
+            settingsMatchUnloadedActor(boxIdentity, (box as any).created_by)
+          );
+        };
+        setFilteredAvailableBoxes(applyMyBoxesOnly(fallbackBoxes));
       }
     };
 
@@ -4401,6 +5049,7 @@ export default function ReceiveSortScreen() {
     availableBoxes,
     scannedItems,
     isCurrentItemComplete,
+    onlyMySortBoxes,
   ]);
 
   // Check if all items in the carton have been received
@@ -4456,69 +5105,23 @@ export default function ReceiveSortScreen() {
     }
   }, [lockedCarton, currentItem, workflowState]);
 
-  // Reload scanned quantities from database when carton is locked
-  // This ensures accuracy after manual quantity entry
   useEffect(() => {
-    const reloadScannedQuantities = async () => {
-      if (!activeASN || !activeSession) {
-        return;
+    if (lockedCarton && workflowState === "SCAN_ITEM" && !showCTNIdPrompt) {
+      setScannerFocusSignal((value) => value + 1);
+    }
+  }, [lockedCarton, workflowState, currentItem, showCTNIdPrompt]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (lockedCarton && workflowState === "SCAN_ITEM" && !showCTNIdPrompt) {
+        setScannerFocusSignal((value) => value + 1);
       }
+    }, [lockedCarton, workflowState, showCTNIdPrompt])
+  );
 
-      try {
-        const db = await getDatabase();
-        const normalizedASN = normalizeASN(activeASN);
-
-        // Get scanned quantities from database (sum scanned_qty by item_code)
-        // Include items with carton_id = lockedCarton (old workflow) OR carton_id IS NULL (new BOX ID workflow)
-        // Check both ASN formats to ensure we get all records
-        const cartonFilter = lockedCarton
-          ? "AND (carton_id = ? OR carton_id IS NULL)"
-          : "AND carton_id IS NULL";
-        const cartonParams = lockedCarton
-          ? [activeASN, normalizedASN, activeSession, lockedCarton]
-          : [activeASN, normalizedASN, activeSession];
-
-        let scannedItemsFromDB = await db.getAllAsync<{
-          item_code: string;
-          scanned_qty: number;
-        }>(
-          `SELECT item_code, SUM(scanned_qty) as scanned_qty 
-           FROM scanned_items 
-           WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ? ${cartonFilter}
-           GROUP BY item_code`,
-          cartonParams
-        );
-
-        // Convert to map
-        const quantitiesMap: Record<string, number> = {};
-        scannedItemsFromDB.forEach((item) => {
-          quantitiesMap[item.item_code] = item.scanned_qty || 0;
-        });
-
-        // Update state if values changed
-        const currentTotal = Object.values(scannedQuantities).reduce(
-          (sum, qty) => sum + (qty || 0),
-          0
-        );
-        const dbTotal = Object.values(quantitiesMap).reduce(
-          (sum, qty) => sum + (qty || 0),
-          0
-        );
-
-        if (currentTotal !== dbTotal) {
-          console.warn(`🔄 Reloading scanned quantities from database:`, {
-            currentTotal,
-            dbTotal,
-            quantitiesMap,
-          });
-          setScannedQuantitiesWithLog(quantitiesMap);
-        }
-      } catch (error: any) {
-        console.warn(`⚠️ Error reloading scanned quantities:`, error.message);
-      }
-    };
-
-    reloadScannedQuantities();
+  // When supplier carton (lock) changes, resync from DB — same rules as refreshScannedStateFromDb (per-carton UI)
+  useEffect(() => {
+    void refreshScannedStateFromDb();
 
     // Also reload total scanned quantities across all cartons/boxes
     const reloadTotalScannedQuantities = async () => {
@@ -4579,49 +5182,7 @@ export default function ReceiveSortScreen() {
     };
 
     reloadTotalScannedQuantities();
-  }, [activeASN, activeSession, lockedCarton]);
-
-  // Check if all TO-allocated items are received (remaining items go to putaway)
-  const areAllItemsReceived = useMemo(() => {
-    if (!lockedCarton || cartonItems.length === 0) return false;
-
-    // If no TO allocations found, fallback to original logic (check all items)
-    if (toAllocationsByItem.size === 0) {
-      console.warn(
-        `⚠️ No TO allocations found, using fallback: check all items`
-      );
-      for (const cartonItem of cartonItems) {
-        const scannedQty = scannedQuantities[cartonItem.item_code] || 0;
-        const expectedQty = cartonItem.shipped_qty || 0;
-        if (scannedQty < expectedQty) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Check if all TO-allocated items are scanned
-    for (const cartonItem of cartonItems) {
-      const itemCode = cartonItem.item_code;
-      const scannedQty = scannedQuantities[itemCode] || 0;
-      const toAllocatedQty = toAllocationsByItem.get(itemCode) || 0;
-
-      // If item has TO allocation, check if scanned qty >= allocated qty
-      if (toAllocatedQty > 0) {
-        if (scannedQty < toAllocatedQty) {
-          console.warn(
-            `⚠️ Item ${itemCode}: Scanned ${scannedQty} < TO Allocated ${toAllocatedQty}`
-          );
-          return false; // TO allocation not fulfilled
-        }
-      }
-      // If item has no TO allocation, it's a warehouse item (goes to putaway)
-      // We don't need to scan it here, so we don't block finishing
-    }
-
-    console.warn(`✅ All TO-allocated items are scanned`);
-    return true; // All TO-allocated items are scanned
-  }, [lockedCarton, cartonItems, scannedQuantities, toAllocationsByItem]);
+  }, [activeASN, activeSession, lockedCarton, refreshScannedStateFromDb]);
 
   // Calculate summary totals for display
   // Use database values for accuracy (handles manual quantity entry correctly)
@@ -4633,6 +5194,19 @@ export default function ReceiveSortScreen() {
     toAllocatedScanned: 0,
     toAllocatedRemaining: 0,
   });
+
+  /** Same basis as the orange TO card line: ASN remaining minus TO scan still owed (not-in-TO putaway). */
+  const putawayItemsNotInTO = useMemo(() => {
+    const {
+      totalRemainingForPutaway,
+      toAllocatedRemaining,
+      totalTOAllocatedQty,
+    } = summaryTotals;
+    if (totalTOAllocatedQty > 0) {
+      return Math.max(0, totalRemainingForPutaway - toAllocatedRemaining);
+    }
+    return totalRemainingForPutaway;
+  }, [summaryTotals]);
 
   // Calculate summary totals from database (async)
   useEffect(() => {
@@ -4735,15 +5309,20 @@ export default function ReceiveSortScreen() {
           [activeASN, normalizedASN, activeSession]
         );
 
-        // Create a map of item_code -> allocated stores
+        const itemKeyNorm = (c: string | null | undefined) =>
+          String(c ?? "").trim().toUpperCase();
+
+        // item_code (normalized) -> set of compact store keys for TO lines
         const itemAllocatedStores = new Map<string, Set<string>>();
         allocations.forEach((alloc) => {
-          if (!itemAllocatedStores.has(alloc.item_code)) {
-            itemAllocatedStores.set(alloc.item_code, new Set());
+          const ik = itemKeyNorm(alloc.item_code);
+          if (!ik) return;
+          if (!itemAllocatedStores.has(ik)) {
+            itemAllocatedStores.set(ik, new Set());
           }
           itemAllocatedStores
-            .get(alloc.item_code)!
-            .add(alloc.store.trim().toUpperCase());
+            .get(ik)!
+            .add(compactStoreCodeKey(alloc.store));
         });
 
         // Sum scanned quantities for items that are allocated to TO
@@ -4751,25 +5330,29 @@ export default function ReceiveSortScreen() {
         // ✅ When backend received qty is available, use it for TO allocated scanned
         if (backendReceivedByItem && Object.keys(backendReceivedByItem).length > 0) {
           allocations.forEach((alloc) => {
-            const recv = backendReceivedByItem[alloc.item_code] ?? 0;
+            const ik = itemKeyNorm(alloc.item_code);
+            const recv =
+              backendReceivedByItem[alloc.item_code] ??
+              backendReceivedByItem[ik] ??
+              0;
             toAllocatedScanned += Math.min(recv, alloc.allocated_qty || 0);
           });
         } else {
           scannedItemsWithStore.forEach((item) => {
             const itemCode = item.item_code;
-            const allocatedStores = itemAllocatedStores.get(itemCode);
+            const ik = itemKeyNorm(itemCode);
+            const allocatedStores = itemAllocatedStores.get(ik);
 
             if (allocatedStores && allocatedStores.size > 0) {
               const boxStore = item.box_id ? boxStoreMap.get(item.box_id) : null;
-              const itemStore = (item.store || boxStore || "")
-                .trim()
-                .toUpperCase();
+              const itemStoreRaw = item.store || boxStore || "";
+              const itemStoreCompact = compactStoreCodeKey(itemStoreRaw);
 
-              if (allocatedStores.has(itemStore)) {
+              if (itemStoreCompact && allocatedStores.has(itemStoreCompact)) {
                 const allocation = allocations.find(
                   (a) =>
-                    a.item_code === itemCode &&
-                    a.store.trim().toUpperCase() === itemStore
+                    itemCodesMatchForAllocation(a.item_code, itemCode) &&
+                    storeCodesMatchForTO(a.store, itemStoreRaw)
                 );
                 if (allocation) {
                   toAllocatedScanned += Math.min(
@@ -4943,20 +5526,26 @@ export default function ReceiveSortScreen() {
         return;
       }
 
-      Alert.alert(
-        "Success",
-        `Distribution CTN ${boxId} created for store ${store}`,
-        [
-          {
-            text: "OK",
-            onPress: () => {
-              setShowCreateCTNModal(false);
-              // Refresh boxes list
-              loadAvailableBoxes();
-            },
-          },
-        ]
-      );
+      try {
+        await dataService.saveBox({
+          box_id: boxId,
+          asn_no: String(activeASN),
+          to_no: toNo ?? "",
+          store: String(store).trim(),
+          status: "Open",
+          purpose: "STORE",
+          updated_on: new Date().toISOString(),
+          created_by: createdByFromSettings(settings) || null,
+        });
+      } catch (localErr: unknown) {
+        console.warn(
+          "Could not save Distribution CTN to local box_cache:",
+          localErr
+        );
+      }
+
+      setShowCreateCTNModal(false);
+      loadAvailableBoxes();
     } catch (error: any) {
       Alert.alert(
         "Error",
@@ -5016,24 +5605,13 @@ export default function ReceiveSortScreen() {
         status: "Open",
         purpose: "PUTAWAY" as const,
         updated_on: new Date().toISOString(),
+        created_by: createdByFromSettings(settings) || null,
       };
 
       await dataService.saveBox(putawayBox);
 
-      Alert.alert(
-        "Success",
-        `Putaway BOX ${putawayBoxId} created for ${remainingItemsQty} remaining item(s)`,
-        [
-          {
-            text: "OK",
-            onPress: () => {
-              setShowCreateCTNModal(false);
-              // Refresh boxes list
-              loadAvailableBoxes();
-            },
-          },
-        ]
-      );
+      setShowCreateCTNModal(false);
+      loadAvailableBoxes();
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to create Putaway BOX");
     } finally {
@@ -5043,15 +5621,18 @@ export default function ReceiveSortScreen() {
 
   const handleFinishCarton = async () => {
     if (!activeASN || !activeSession || !lockedCarton) return;
+    if (!(await requireOnlineForReceiving())) return;
 
-    // Validate all TO-allocated items are received before finishing
-    if (!areAllItemsReceived) {
-      const toRemaining = summaryTotals.toAllocatedRemaining;
+    if (overageItems.length > 0) {
       Alert.alert(
-        "Incomplete Carton",
-        toRemaining > 0
-          ? `Please scan all TO-allocated items before finishing.\n\nRemaining TO-allocated items: ${toRemaining}\n\nItems not in TO will automatically go to Putaway after finishing.`
-          : "Please receive all TO-allocated items in the carton before finishing. Check the Expected Items section to see what's remaining.",
+        "Over Quantity Found",
+        overageItems
+          .map(
+            (item) =>
+              `${item.item_code}: shipped ${item.shipped_qty}, scanned ${item.scanned_qty}, over ${item.over_qty}`
+          )
+          .join("\n") +
+          "\n\nOver quantity cannot be finished from mobile. Please correct the scan quantity or raise an overage approval.",
         [{ text: "OK" }]
       );
       return;
@@ -5242,7 +5823,9 @@ export default function ReceiveSortScreen() {
                       text: "OK",
                       onPress: () => {
                         // Continue with carton finishing
-                        handleFinishCartonInternal();
+                        handleFinishCartonInternal(
+                          shortageItems.length > 0 ? "SHORTAGE" : "NORMAL"
+                        );
                       },
                     },
                   ]
@@ -5262,11 +5845,34 @@ export default function ReceiveSortScreen() {
       return;
     }
 
+    if (shortageItems.length > 0) {
+      Alert.alert(
+        "Finish With Shortage?",
+        `This carton has short quantity:\n\n${shortageItems
+          .map(
+            (item) =>
+              `${item.item_code}: shipped ${item.shipped_qty}, scanned ${item.scanned_qty}, short ${item.short_qty}`
+          )
+          .join("\n")}\n\nThis will close the carton as "${RECEIVED_WITH_SHORTAGE_STATUS}" and send the shortage to the backend receive lines.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Finish With Shortage",
+            style: "destructive",
+            onPress: () => handleFinishCartonInternal("SHORTAGE"),
+          },
+        ]
+      );
+      return;
+    }
+
     // No remaining items - proceed normally
-    handleFinishCartonInternal();
+    handleFinishCartonInternal("NORMAL");
   };
 
-  const handleFinishCartonInternal = async () => {
+  const handleFinishCartonInternal = async (
+    finishMode: "NORMAL" | "SHORTAGE" = "NORMAL"
+  ) => {
     if (!activeASN || !activeSession || !lockedCarton) return;
 
     setLoading(true);
@@ -5303,7 +5909,7 @@ export default function ReceiveSortScreen() {
       }
 
       // Group scanned items by item_code and aggregate quantities
-      for (const scannedItem of scannedItemsFromDB as Array<{ item_code: string; scanned_qty?: number }>) {
+      for (const scannedItem of scannedItemsFromDB as { item_code: string; scanned_qty?: number }[]) {
         const itemCode = scannedItem.item_code;
         const qty = scannedItem.scanned_qty || 0;
 
@@ -5348,8 +5954,14 @@ export default function ReceiveSortScreen() {
         item_code: line.item_code,
         expected_qty: line.expected_qty,
         received_qty: line.received_qty,
-        condition: "Good" as const,
-        remarks: null as string | null,
+        condition:
+          finishMode === "SHORTAGE" && line.received_qty < line.expected_qty
+            ? "Short"
+            : ("Good" as const),
+        remarks:
+          finishMode === "SHORTAGE" && line.received_qty < line.expected_qty
+            ? `Short received from mobile. Expected ${line.expected_qty}, received ${line.received_qty}, shortage ${line.expected_qty - line.received_qty}.`
+            : (null as string | null),
       }));
 
       console.log(`📦 Building receive lines for carton ${lockedCarton}:`, {
@@ -5377,69 +5989,63 @@ export default function ReceiveSortScreen() {
             `⚠️ Failed to create receive lines for carton ${lockedCarton}:`,
             receiveLinesError.message
           );
-          // Don't block user flow if receive lines API fails - carton completion still proceeds
+          setLoading(false);
+          Alert.alert(
+            "Receive Lines Not Updated",
+            `The server did not accept receive lines for carton ${lockedCarton}.\n\nMobile will not mark this carton as Received until the backend is updated.\n\n${receiveLinesError?.message || "Unknown error"}`
+          );
+          return;
         }
       } else {
         console.warn(
           `⚠️ No scanned items found for carton ${lockedCarton}. Skipping receive lines creation.`
         );
-        // Show warning to user but allow carton completion to proceed
-        // This can happen if user completes carton without scanning any items
         Alert.alert(
           "No Items Scanned",
-          `No items were scanned for carton ${lockedCarton}.\n\nCarton will be marked as completed, but no receive lines will be created.`,
+          `No items were scanned for carton ${lockedCarton}.\n\nMobile will not mark this carton as Received because no receive lines can be sent to the backend.`,
           [{ text: "OK" }]
         );
+        setLoading(false);
+        return;
       }
 
-      await apiService.completeCarton({
-        inbound_session: activeSession,
-        asn_no: normalizedASN,
-        carton_id: lockedCarton,
-        user_id: settings.user_id!,
-        device_id: settings.device_id!,
-      });
+      if (finishMode === "NORMAL") {
+        await apiService.completeCarton({
+          inbound_session: activeSession,
+          asn_no: normalizedASN,
+          carton_id: lockedCarton,
+          user_id: settings.user_id!,
+          device_id: settings.device_id!,
+        });
+      }
 
-      // Update carton status to Received and clear lock info
-      const statusUpdate = {
-        asn_no: normalizedASN,
-        inbound_session: activeSession,
-        carton_id: lockedCarton,
-        status: "Received" as const,
-        locked_by: undefined, // Clear lock when carton is completed
-        locked_on: undefined, // Clear lock timestamp
-        updated_on: new Date().toISOString(),
-      };
+      const completedStatus =
+        finishMode === "SHORTAGE" ? RECEIVED_WITH_SHORTAGE_STATUS : "Received";
 
-      console.log(`💾 Updating carton status:`, {
+      console.log(`💾 Updating carton status to ${completedStatus} (server first, then local):`, {
         carton: lockedCarton,
         asn: normalizedASN,
         session: activeSession,
-        status: "Received",
-        updateData: statusUpdate,
+        status: completedStatus,
       });
 
-      await dataService.updateCartonStatus(statusUpdate);
-
-      // Sync status change to backend
-      try {
-        await apiService.updateCartonStatus({
-          asn_no: activeASN, // Use original format from desktop
-          inbound_session: activeSession,
-          carton_id: lockedCarton,
-          status: "Received",
-          user_id: settings.user_id,
-          device_id: settings.device_id,
-        });
-        console.log(
-          `✅ Carton ${lockedCarton} status synced to backend: Received`
+      const pushReceived = await pushReceivedCartonStatusServerThenLocal({
+        asnNoOriginal: activeASN,
+        inboundSession: activeSession,
+        cartonId: lockedCarton,
+        userId: settings.user_id!,
+        deviceId: settings.device_id,
+        status: completedStatus,
+      });
+      if (!pushReceived.ok) {
+        setLoading(false);
+        Alert.alert(
+          pushReceived.kind === "network"
+            ? "Server connection lost"
+            : "Cannot update carton status",
+          pushReceived.message
         );
-      } catch (apiError: any) {
-        console.warn(
-          `⚠️ Failed to sync carton ${lockedCarton} status to backend:`,
-          apiError.message
-        );
-        // Don't block user flow if API sync fails
+        return;
       }
 
       // Immediately verify the update was saved
@@ -5454,13 +6060,13 @@ export default function ReceiveSortScreen() {
         locked_by: verifyStatus?.locked_by,
         updated_on: verifyStatus?.updated_on,
         match:
-          verifyStatus?.status === "Received" &&
+          verifyStatus?.status === completedStatus &&
           verifyStatus?.inbound_session === activeSession,
       });
 
-      if (!verifyStatus || verifyStatus.status !== "Received") {
+      if (!verifyStatus || verifyStatus.status !== completedStatus) {
         console.error(
-          `❌ ERROR: Status update failed! Expected 'Received', got:`,
+          `❌ ERROR: Status update failed! Expected '${completedStatus}', got:`,
           verifyStatus
         );
         Alert.alert(
@@ -5477,7 +6083,7 @@ export default function ReceiveSortScreen() {
         );
         const totalCartons = allStatuses.length;
         const completedCartons = allStatuses.filter(
-          (s) => s.status === "Received"
+          (s) => isCompletedCartonStatus(s.status)
         ).length;
 
         // Update session with new completed cartons count
@@ -5527,58 +6133,51 @@ export default function ReceiveSortScreen() {
         // Don't block user flow if session update fails
       }
 
-      Alert.alert("Success", `Carton ${lockedCarton} completed`, [
+      const finishedCarton = lockedCarton;
+      logStateChange("FINISH_CARTON", {
+        carton: finishedCarton,
+        scannedItemsCount: scannedItems.length,
+        scannedQuantitiesKeys: Object.keys(scannedQuantities),
+      });
+      setLockedCartonWithLog(null);
+      setWorkflowStateWithLog("SELECT_CARTON");
+      setScannedItemsWithLog([]);
+      setScannedQuantitiesWithLog({});
+      setCurrentItemWithLog(null);
+      cartonLoadSeqRef.current += 1;
+      setCartonLinesLoading(false);
+      setCartonLinesLoadError(null);
+      setCartonItemsWithLog([]); // Clear carton items when finishing
+      setLastScannedItem(null);
+
+      if (activeASN && activeSession) {
+        await clearWorkflowState(
+          normalizedASN,
+          activeSession,
+          "ReceiveSort"
+        );
+        console.log(
+          `🧹 Cleared saved workflow state after completing carton: ${finishedCarton}`
+        );
+      }
+
+      await loadAvailableCartons();
+
+      const updatedStatus = await dataService.getCartonStatus(
+        normalizedASN,
+        activeSession,
+        finishedCarton
+      );
+      console.log(
+        `✅ Verified carton ${finishedCarton} status after completion:`,
         {
-          text: "OK",
-          onPress: async () => {
-            const finishedCarton = lockedCarton;
-            logStateChange("FINISH_CARTON", {
-              carton: finishedCarton,
-              scannedItemsCount: scannedItems.length,
-              scannedQuantitiesKeys: Object.keys(scannedQuantities),
-            });
-            setLockedCartonWithLog(null);
-            setWorkflowStateWithLog("SELECT_CARTON");
-            setScannedItemsWithLog([]);
-            setScannedQuantitiesWithLog({});
-            setCurrentItemWithLog(null);
-            setCartonItemsWithLog([]); // Clear carton items when finishing
+          status: updatedStatus?.status,
+          locked_by: updatedStatus?.locked_by,
+          updated_on: updatedStatus?.updated_on,
+        }
+      );
 
-            // Clear saved workflow state since carton is completed
-            if (activeASN && activeSession) {
-              const normalizedASN = normalizeASN(activeASN);
-              await clearWorkflowState(
-                normalizedASN,
-                activeSession,
-                "ReceiveSort"
-              );
-              console.log(
-                `🧹 Cleared saved workflow state after completing carton: ${finishedCarton}`
-              );
-            }
-
-            await loadAvailableCartons();
-
-            // Verify the status was updated correctly
-            const normalizedASN = normalizeASN(activeASN);
-            const updatedStatus = await dataService.getCartonStatus(
-              normalizedASN,
-              activeSession,
-              finishedCarton
-            );
-            console.log(
-              `✅ Verified carton ${finishedCarton} status after completion:`,
-              {
-                status: updatedStatus?.status,
-                locked_by: updatedStatus?.locked_by,
-                updated_on: updatedStatus?.updated_on,
-              }
-            );
-
-            // State will be saved automatically via useEffect
-          },
-        },
-      ]);
+      // State will be saved automatically via useEffect
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to complete carton");
     } finally {
@@ -5621,6 +6220,17 @@ export default function ReceiveSortScreen() {
         // In SCAN_ITEM mode, we expect an item barcode
         // If user scans a BOX ID, show error - they need to scan item first
         const scannedValue = barcode.trim().toUpperCase();
+
+        if (
+          lockedCarton &&
+          scannedValue === String(lockedCarton).trim().toUpperCase()
+        ) {
+          Alert.alert(
+            "Wrong scan",
+            "You scanned this carton's barcode. Scan an item barcode or item code from the carton contents, not the supplier carton id."
+          );
+          return;
+        }
 
         // Check if user mistakenly scanned a BOX ID instead of item code
         const isBoxBarcode =
@@ -5707,6 +6317,7 @@ export default function ReceiveSortScreen() {
         status: "Open",
         purpose: "STORE", // Explicitly set purpose
         updated_on: new Date().toISOString(),
+        created_by: createdByFromSettings(settings) || null,
       };
 
       console.log("💾 Creating box in ReceiveSortScreen:", newBox);
@@ -5714,7 +6325,6 @@ export default function ReceiveSortScreen() {
       await dataService.saveBox(newBox);
       await loadAvailableBoxes();
       setShowCreateBox(false);
-      Alert.alert("Success", `BOX ${boxId} created! You can now scan it.`);
     } catch (error: any) {
       console.error("❌ Failed to create box:", error);
       Alert.alert("Error", error.message || "Failed to create BOX");
@@ -5729,14 +6339,12 @@ export default function ReceiveSortScreen() {
     const db = await getDatabase();
     const normalizedASN = normalizeASN(activeASN);
 
-    // Get scanned quantity from database (more accurate than state)
-    // Include items with carton_id = lockedCarton (old workflow) OR carton_id IS NULL (new BOX ID workflow)
-    // Check both ASN formats to ensure we get all records
+    // Scanned qty for modal — same supplier carton scope as Expected Items list
     const scannedQtyCartonFilter = lockedCarton
-      ? "AND (carton_id = ? OR carton_id IS NULL)"
-      : "AND carton_id IS NULL";
+      ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+      : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
     const scannedQtyCartonParams = lockedCarton
-      ? [activeASN, normalizedASN, activeSession, lockedCarton, itemCode]
+      ? [activeASN, normalizedASN, activeSession, String(lockedCarton).trim(), itemCode]
       : [activeASN, normalizedASN, activeSession, itemCode];
 
     const scannedQtyResult = await db.getFirstAsync<{ total_qty: number }>(
@@ -5753,7 +6361,9 @@ export default function ReceiveSortScreen() {
     );
 
     // Find allocations for this item (may be multiple stores)
-    const itemAllocations = allocations.filter((a) => a.item_code === itemCode);
+    const itemAllocations = allocations.filter((a) =>
+      itemCodesMatchForAllocation(a.item_code, itemCode)
+    );
 
     // Calculate total TO quantity across all stores
     const totalTOQty = itemAllocations.reduce(
@@ -5769,14 +6379,11 @@ export default function ReceiveSortScreen() {
     const boxes = await dataService.getBoxes(activeASN);
     const boxStoreMap = new Map(boxes.map((b) => [b.box_id, b.store]));
 
-    // Get scanned quantities from database grouped by store (includes box_id for box mapping)
-    // Include items with carton_id = lockedCarton (old workflow) OR carton_id IS NULL (new BOX ID workflow)
-    // Check both ASN formats to ensure we get all records
     const cartonFilter = lockedCarton
-      ? "AND (carton_id = ? OR carton_id IS NULL)"
-      : "AND carton_id IS NULL";
+      ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+      : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
     const cartonParams = lockedCarton
-      ? [activeASN, normalizedASN, activeSession, lockedCarton, itemCode]
+      ? [activeASN, normalizedASN, activeSession, String(lockedCarton).trim(), itemCode]
       : [activeASN, normalizedASN, activeSession, itemCode];
 
     const scannedQtyByStore = await db.getAllAsync<{
@@ -5812,66 +6419,46 @@ export default function ReceiveSortScreen() {
     // This ensures remaining won't be negative when Putaway items are included
     const remainingQty = asnQty - scannedQty;
 
-    // Build store-to-boxes map: Include ALL boxes for each store, not just boxes with scanned items
+    // Build store-to-boxes map using compact store keys so "002 Unaizah 2" and "002-UNAIZAH-2" share one bucket
     const storeBoxMap = new Map<string, string[]>();
+    const boxListForStore = (storeLabel: string) => {
+      const k = compactStoreCodeKey(storeLabel);
+      if (!k) return null;
+      if (!storeBoxMap.has(k)) {
+        storeBoxMap.set(k, []);
+      }
+      return storeBoxMap.get(k)!;
+    };
 
-    // First, add all boxes for each store from box_cache (including Putaway boxes)
     boxes.forEach((box) => {
-      if (box.store) {
-        // Normalize store name for matching (case-insensitive)
-        const normalizedStore = box.store.trim().toUpperCase();
-        if (!storeBoxMap.has(normalizedStore)) {
-          storeBoxMap.set(normalizedStore, []);
-        }
-        const storeBoxes = storeBoxMap.get(normalizedStore)!;
-        if (box.box_id && !storeBoxes.includes(box.box_id)) {
-          storeBoxes.push(box.box_id);
-        }
+      if (box.store && box.box_id) {
+        const list = boxListForStore(box.store);
+        if (list && !list.includes(box.box_id)) list.push(box.box_id);
       }
     });
 
-    // Also add boxes from scanned_items (in case there are boxes not in box_cache)
-    // This ensures Putaway boxes are included even if they're not in box_cache yet
     scannedQtyByStore.forEach((row) => {
-      if (row.store) {
-        // Normalize store name for matching (case-insensitive)
-        const normalizedStore = row.store.trim().toUpperCase();
-        if (!storeBoxMap.has(normalizedStore)) {
-          storeBoxMap.set(normalizedStore, []);
-        }
-        const storeBoxes = storeBoxMap.get(normalizedStore)!;
-        if (row.box_id && !storeBoxes.includes(row.box_id)) {
-          storeBoxes.push(row.box_id);
-        }
+      if (row.store && row.box_id) {
+        const list = boxListForStore(row.store);
+        if (list && !list.includes(row.box_id)) list.push(row.box_id);
       }
     });
 
-    // Build scanned quantity map by store (sum up quantities)
-    // Use normalized store names for consistent matching
     const scannedQtyMap = new Map<string, number>();
     scannedQtyByStore.forEach((row) => {
-      const normalizedStore = (row.store || "").trim().toUpperCase();
-      const current = scannedQtyMap.get(normalizedStore) || 0;
-      scannedQtyMap.set(normalizedStore, current + (row.scanned_qty || 0));
-      // Also keep original store name mapping for backward compatibility
-      if (row.store && normalizedStore !== row.store) {
-        scannedQtyMap.set(row.store, current + (row.scanned_qty || 0));
-      }
+      const k = compactStoreCodeKey(row.store || "");
+      if (!k) return;
+      scannedQtyMap.set(k, (scannedQtyMap.get(k) || 0) + (row.scanned_qty || 0));
     });
 
     // Build allocation details - separate TO allocations from Putaway
     // Note: putawayBoxIds is already declared above and can be reused here
     const allocationDetails = itemAllocations
       .map((alloc) => {
-        // Get scanned quantity from database (more accurate)
-        // Normalize store name for matching (case-insensitive)
-        const normalizedStore = alloc.store.trim().toUpperCase();
+        const storeKey = compactStoreCodeKey(alloc.store);
 
         // Separate boxes into TO boxes and Putaway boxes
-        const allStoreBoxes =
-          storeBoxMap.get(normalizedStore) ||
-          storeBoxMap.get(alloc.store) ||
-          [];
+        const allStoreBoxes = storeBoxMap.get(storeKey) || [];
         const toBoxes = allStoreBoxes.filter(
           (boxId) => !putawayBoxIds.has(boxId)
         );
@@ -5886,8 +6473,8 @@ export default function ReceiveSortScreen() {
         let putawayScanned = 0;
 
         scannedQtyByStore.forEach((row) => {
-          const rowStoreUpper = (row.store || "").trim().toUpperCase();
-          if (rowStoreUpper === normalizedStore && row.box_id) {
+          const rk = compactStoreCodeKey(row.store || "");
+          if (rk === storeKey && row.box_id) {
             if (putawayBoxIds.has(row.box_id)) {
               putawayScanned += row.scanned_qty || 0;
             } else {
@@ -5896,9 +6483,9 @@ export default function ReceiveSortScreen() {
           }
         });
 
-        // If this is a warehouse store, create separate entries for TO and Putaway
+        const au = alloc.store.trim().toUpperCase();
         const isWarehouse =
-          normalizedStore === "WAREHOUSE" || normalizedStore.startsWith("WH-");
+          au === "WAREHOUSE" || au.startsWith("WH-");
 
         if (isWarehouse && (putawayScanned > 0 || putawayBoxes.length > 0)) {
           // Create two separate entries: TO Allocation and Putaway
@@ -5925,10 +6512,7 @@ export default function ReceiveSortScreen() {
           return result;
         } else {
           // Regular store (not warehouse) - show all boxes together
-          const storeScanned =
-            scannedQtyMap.get(normalizedStore) ||
-            scannedQtyMap.get(alloc.store) ||
-            0;
+          const storeScanned = scannedQtyMap.get(storeKey) || 0;
           return {
             store: alloc.store,
             allocatedQty: alloc.allocated_qty,
@@ -5952,8 +6536,8 @@ export default function ReceiveSortScreen() {
     // For each warehouse store with scanned items, add an allocation entry if not already present
     warehouseStores.forEach((warehouseStore) => {
       // Check if this warehouse store already has an allocation entry
-      const hasAllocation = itemAllocations.some(
-        (alloc) => alloc.store.trim().toUpperCase() === warehouseStore
+      const hasAllocation = itemAllocations.some((alloc) =>
+        storeCodesMatchForTO(alloc.store, warehouseStore)
       );
 
       if (!hasAllocation) {
@@ -6060,9 +6644,9 @@ export default function ReceiveSortScreen() {
         activeASN
       );
 
-      // Find allocations for this item
-      const itemAllocations = allocations.filter(
-        (a) => a.item_code === itemCode
+      // Find allocations for this item (ERP / SQLite may differ in case or type)
+      const itemAllocations = allocations.filter((a) =>
+        itemCodesMatchForAllocation(a.item_code, itemCode)
       );
 
       // Get boxes to find store for each scanned item
@@ -6072,11 +6656,11 @@ export default function ReceiveSortScreen() {
       // Get scanned quantities from database (more accurate than scannedItems array)
       // Since we now support BOX ID workflow (carton_id = null), we need to query by item_code
       // regardless of carton_id, then group by store from box_id
-      let scannedItemsFromDB: Array<{
+      let scannedItemsFromDB: {
         box_id: string | null;
         store: string | null;
         scanned_qty: number;
-      }> = [];
+      }[] = [];
 
       // Query for scanned items - handle both old workflow (with carton_id) and new workflow (carton_id = null)
       // Since we now support BOX ID workflow where carton_id is NULL, we need to query ALL scanned items
@@ -6092,7 +6676,8 @@ export default function ReceiveSortScreen() {
       }>(
         `SELECT box_id, store, carton_id, scanned_qty 
            FROM scanned_items 
-         WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ? AND item_code = ?`,
+         WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ? 
+           AND UPPER(TRIM(item_code)) = UPPER(TRIM(?))`,
         [activeASN, normalizedASN, activeSession, itemCode]
       );
 
@@ -6132,13 +6717,13 @@ export default function ReceiveSortScreen() {
       );
 
       // Build breakdown by store (with carton breakdown info)
-      const breakdown: Array<{
+      const breakdown: {
         store: string;
         toQty: number;
         scannedQty: number;
         remainingQty: number;
         scannedByCarton?: Map<string, number>; // Add carton breakdown per store
-      }> = [];
+      }[] = [];
 
       if (itemAllocations.length > 0) {
         // Has TO allocations - show breakdown by store
@@ -6148,12 +6733,7 @@ export default function ReceiveSortScreen() {
             // Get store from box_id if available, otherwise use store from scanned_items
             const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
             const itemStore = si.store || boxStore;
-            const allocStoreUpper = alloc.store.trim().toUpperCase();
-            const itemStoreUpper = itemStore
-              ? itemStore.trim().toUpperCase()
-              : "";
-
-            const matches = itemStoreUpper === allocStoreUpper;
+            const matches = storeCodesMatchForTO(alloc.store, itemStore || "");
             if (!matches && si.scanned_qty > 0) {
               console.warn(
                 `⚠️ TO Breakdown: Store mismatch for ${itemCode} - alloc.store="${alloc.store}", itemStore="${si.store}", boxStore="${boxStore}", box_id="${si.box_id}", scanned_qty=${si.scanned_qty}`
@@ -6198,65 +6778,6 @@ export default function ReceiveSortScreen() {
           });
         });
 
-        // Check if there are scanned items that don't match any TO allocation
-        const totalScannedInBreakdown = breakdown.reduce(
-          (sum, b) => sum + b.scannedQty,
-          0
-        );
-        const unmatchedScanned = totalScannedFromDB - totalScannedInBreakdown;
-
-        // Find which stores/boxes have unmatched items
-        let unmatchedItems: Array<{
-          box_id: string | null;
-          store: string | null;
-          carton_id: string | null;
-          scanned_qty: number;
-        }> = [];
-        if (unmatchedScanned > 0) {
-          console.warn(
-            `⚠️ TO Breakdown: Found ${unmatchedScanned} scanned item(s) for ${itemCode} that don't match any TO allocation (total scanned=${totalScannedFromDB}, in breakdown=${totalScannedInBreakdown})`
-          );
-          unmatchedItems = scannedWithCarton
-            .filter((si) => {
-              const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
-              const itemStore = si.store || boxStore;
-              const itemStoreUpper = itemStore
-                ? itemStore.trim().toUpperCase()
-                : "";
-              return !itemAllocations.some((alloc) => {
-                const allocStoreUpper = alloc.store.trim().toUpperCase();
-                return itemStoreUpper === allocStoreUpper;
-              });
-            })
-            .map((si) => ({
-              box_id: si.box_id,
-              store: si.store,
-              carton_id: si.carton_id ?? null,
-              scanned_qty: si.scanned_qty || 0,
-            }));
-          if (unmatchedItems.length > 0) {
-            console.warn(
-              `⚠️ Unmatched scanned items:`,
-              unmatchedItems.map((si) => ({
-                box_id: si.box_id,
-                store: si.store,
-                carton_id: si.carton_id,
-                scanned_qty: si.scanned_qty,
-              }))
-            );
-          }
-        }
-
-        setToBreakdownModal({
-          visible: true,
-          itemCode,
-          breakdown,
-          scannedByCarton,
-          totalScanned: totalScannedFromDB,
-          unmatchedScanned,
-          unmatchedItems:
-            unmatchedItems.length > 0 ? unmatchedItems : undefined,
-        });
       } else {
         // No TO - show warehouse name
         // Get warehouse from available warehouses/stores or use default
@@ -6277,7 +6798,7 @@ export default function ReceiveSortScreen() {
 
         // Calculate scanned by carton for warehouse
         const scannedByCartonForWarehouse = new Map<string, number>();
-        (scannedItemsFromDB as Array<{ carton_id?: string | null; scanned_qty?: number }>).forEach((si) => {
+        (scannedItemsFromDB as { carton_id?: string | null; scanned_qty?: number }[]).forEach((si) => {
           const cartonId = si.carton_id || "No Carton";
           const current = scannedByCartonForWarehouse.get(cartonId) || 0;
           scannedByCartonForWarehouse.set(
@@ -6295,13 +6816,63 @@ export default function ReceiveSortScreen() {
         });
       }
 
+      type UnmatchedRow = {
+        box_id: string | null;
+        store: string | null;
+        carton_id: string | null;
+        scanned_qty: number;
+      };
+
+      const unmatchedFromTo =
+        itemAllocations.length > 0
+          ? (() => {
+              const totalInBreakdown = breakdown.reduce(
+                (sum, b) => sum + b.scannedQty,
+                0
+              );
+              const unmatched = totalScannedFromDB - totalInBreakdown;
+              if (unmatched <= 0) {
+                return {
+                  unmatchedScanned: 0,
+                  unmatchedItems: undefined as UnmatchedRow[] | undefined,
+                };
+              }
+              console.warn(
+                `⚠️ TO Breakdown: Found ${unmatched} scanned unit(s) for ${itemCode} not attributed to a TO store line (total=${totalScannedFromDB}, in breakdown=${totalInBreakdown}).`
+              );
+              const items: UnmatchedRow[] = scannedWithCarton
+                .filter((si) => {
+                  const boxStore = si.box_id ? boxStoreMap.get(si.box_id) : null;
+                  const itemStore = si.store || boxStore;
+                  return !itemAllocations.some((alloc) =>
+                    storeCodesMatchForTO(alloc.store, itemStore || "")
+                  );
+                })
+                .map((si) => ({
+                  box_id: si.box_id,
+                  store: si.store,
+                  carton_id: si.carton_id ?? null,
+                  scanned_qty: si.scanned_qty || 0,
+                }));
+              if (items.length > 0) {
+                console.warn(`⚠️ Unmatched scanned rows:`, items);
+              }
+              return {
+                unmatchedScanned: unmatched,
+                unmatchedItems: items.length > 0 ? items : undefined,
+              };
+            })()
+          : { unmatchedScanned: 0, unmatchedItems: undefined };
+
       setToBreakdownModal({
         visible: true,
         itemCode,
         breakdown,
-        scannedByCarton: new Map(), // Empty map for warehouse case
+        scannedByCarton:
+          itemAllocations.length > 0 ? scannedByCarton : new Map(),
         totalScanned: totalScannedFromDB,
-        unmatchedScanned: 0, // No TO allocations, so no unmatched items
+        unmatchedScanned: unmatchedFromTo.unmatchedScanned,
+        unmatchedItems: unmatchedFromTo.unmatchedItems,
       });
     } catch (error: any) {
       console.error("❌ Error loading TO breakdown:", error);
@@ -6442,6 +7013,12 @@ export default function ReceiveSortScreen() {
         }
       }
 
+      const isBoxOpen = (b: (typeof storeBoxes)[0]) =>
+        b.status === "Open" ||
+        b.status === "OPEN" ||
+        b.status === "open";
+      const openStoreBoxes = storeBoxes.filter(isBoxOpen);
+
       if (storeBoxes.length === 0 && newQty > 0) {
         const boxType = editQtyModal.isPutaway ? "Putaway" : "regular";
         Alert.alert(
@@ -6452,19 +7029,16 @@ export default function ReceiveSortScreen() {
         return;
       }
 
-      // Get CURRENT scanned quantity from database for this item/store combination
-      // Use the same logic as TO Breakdown - count ALL items for this store/item, regardless of box
-      // Include items with carton_id = null (BOX ID workflow) or matching lockedCarton
-      // Check both ASN formats to ensure we get all records
+      // Current scanned qty for edit — same supplier carton attribution when a carton is locked
       const cartonFilter = lockedCarton
-        ? "AND (carton_id = ? OR carton_id IS NULL)"
-        : "AND carton_id IS NULL";
+        ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+        : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
       const cartonParams = lockedCarton
         ? [
             activeASN,
             normalizedASN,
             activeSession,
-            lockedCarton,
+            String(lockedCarton).trim(),
             editQtyModal.itemCode,
             editQtyModal.store,
           ]
@@ -6515,50 +7089,134 @@ export default function ReceiveSortScreen() {
         return;
       }
 
-      const targetBox = storeBoxes.length > 0 ? storeBoxes[0] : null;
+      const resolveTargetBoxForAdd = async (): Promise<
+        (typeof storeBoxes)[0] | null
+      > => {
+        if (openStoreBoxes.length === 0) return null;
+        const openIdsUpper = openStoreBoxes.map((b) =>
+          String(b.box_id || "").trim().toUpperCase()
+        );
+        const ph = openIdsUpper.map(() => "?").join(",");
+        const tailParams = [
+          editQtyModal.itemCode,
+          editQtyModal.store,
+          ...openIdsUpper,
+        ];
+        let hit: { box_id: string } | null = null;
+        if (lockedCarton) {
+          hit = await db.getFirstAsync<{ box_id: string }>(
+            `SELECT box_id FROM scanned_items
+             WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?
+               AND carton_id = ? AND item_code = ? AND store = ?
+               AND UPPER(TRIM(box_id)) IN (${ph})
+             ORDER BY scanned_on DESC LIMIT 1`,
+            [
+              activeASN,
+              normalizedASN,
+              activeSession,
+              lockedCarton,
+              ...tailParams,
+            ]
+          );
+        } else {
+          hit = await db.getFirstAsync<{ box_id: string }>(
+            `SELECT box_id FROM scanned_items
+             WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?
+               AND (carton_id IS NULL OR TRIM(carton_id) = '')
+               AND item_code = ? AND store = ?
+               AND UPPER(TRIM(box_id)) IN (${ph})
+             ORDER BY scanned_on DESC LIMIT 1`,
+            [activeASN, normalizedASN, activeSession, ...tailParams]
+          );
+        }
+        if (hit?.box_id) {
+          const found = openStoreBoxes.find(
+            (b) =>
+              String(b.box_id || "").trim().toUpperCase() ===
+              String(hit.box_id || "").trim().toUpperCase()
+          );
+          if (found) return found;
+        }
+        const sorted = [...openStoreBoxes].sort((a, b) =>
+          String(b.updated_on || "").localeCompare(String(a.updated_on || ""))
+        );
+        return sorted[0] ?? null;
+      };
+
       const timestamp = new Date().toISOString();
 
       if (qtyDifference > 0) {
-        // Need to add items
+        // Need to add items — never target closed/dispatched boxes (was storeBoxes[0])
+        const targetBox = await resolveTargetBoxForAdd();
         if (!targetBox) {
-          Alert.alert("Error", `No boxes found for ${editQtyModal.store}`);
+          Alert.alert(
+            "No Open Box",
+            `Cannot add quantity for ${editQtyModal.store}: there is no open ${
+              editQtyModal.isPutaway ? "Putaway" : "store"
+            } box.\n\nCreate a new open box in Box Management, then try again.`
+          );
           setLoading(false);
           return;
         }
 
-        // Create events and database entries for the difference
-        const eventsToAdd: any[] = [];
-        for (let i = 0; i < qtyDifference; i++) {
-          eventsToAdd.push({
-            receiveEvent: {
-              event_type: "RECEIVE_ITEM_SCAN",
-              asn_no: normalizedASN,
-              inbound_session: activeSession,
-              carton_id: lockedCarton,
-              item_code: editQtyModal.itemCode,
-              qty: 1,
-              device_id: settings.device_id,
-              user_id: settings.user_id,
-            },
-            sortEvent: {
-              event_type: "SORT_TO_BOX",
-              asn_no: normalizedASN,
-              inbound_session: activeSession,
-              carton_id: lockedCarton,
-              item_code: editQtyModal.itemCode,
-              box_id: targetBox.box_id,
-              store: editQtyModal.store,
-              qty: 1,
-              device_id: settings.device_id,
-              user_id: settings.user_id,
-            },
+        const targetCartonFilter = lockedCarton
+          ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+          : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
+        const targetCartonParams = lockedCarton
+          ? [
+              activeASN,
+              normalizedASN,
+              activeSession,
+              String(lockedCarton).trim(),
+              editQtyModal.itemCode,
+              targetBox.box_id,
+              editQtyModal.store,
+            ]
+          : [
+              activeASN,
+              normalizedASN,
+              activeSession,
+              editQtyModal.itemCode,
+              targetBox.box_id,
+              editQtyModal.store,
+            ];
+        const currentTargetBoxQtyRow = await db.getFirstAsync<{
+          total_qty: number;
+        }>(
+          `SELECT COALESCE(SUM(scanned_qty), 0) as total_qty
+           FROM scanned_items
+           WHERE (asn_no = ? OR asn_no = ?)
+             AND inbound_session = ?
+             ${targetCartonFilter}
+             AND item_code = ?
+             AND box_id = ?
+             AND store = ?`,
+          targetCartonParams,
+        );
+        try {
+          if (!(await requireOnlineForReceiving())) {
+            setLoading(false);
+            return;
+          }
+          await apiService.adjustSortBox({
+            purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
+            asn_no: activeASN,
+            box_id: targetBox.box_id,
+            carton_id: lockedCarton ?? undefined,
+            item_code: editQtyModal.itemCode,
+            new_qty: (currentTargetBoxQtyRow?.total_qty || 0) + qtyDifference,
+            user_id: settings.user_id ?? "",
+            device_id: settings.device_id ?? "",
           });
-        }
-
-        // Add all events
-        for (const eventPair of eventsToAdd) {
-          await addEvent(eventPair.receiveEvent);
-          await addEvent(eventPair.sortEvent);
+        } catch (error: any) {
+          const payload = error?.data || error?.response?.data || {};
+          const msg =
+            payload?.message ||
+            error?.message ||
+            "Backend rejected this quantity update.";
+          Alert.alert("Quantity Update Not Allowed", msg);
+          setLoading(false);
+          return;
         }
 
         // Update or insert in database
@@ -6665,19 +7323,15 @@ export default function ReceiveSortScreen() {
           `🗑️ Removing ${itemsToRemove} items. Current=${currentQty}, Target=${newQty}`
         );
 
-        // Get all scanned_items records for this item/store combination
-        // Handle both carton_id = null (BOX ID workflow) and carton_id = lockedCarton (old workflow)
-        // Check both ASN formats to find all records
-        // IMPORTANT: Use same filter as verification query to ensure we find all records
         const deleteCartonFilter = lockedCarton
-          ? "AND (carton_id = ? OR carton_id IS NULL)"
-          : "AND carton_id IS NULL";
+          ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+          : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
         const deleteCartonParams = lockedCarton
           ? [
               activeASN,
               normalizedASN,
               activeSession,
-              lockedCarton,
+              String(lockedCarton).trim(),
               editQtyModal.itemCode,
               editQtyModal.store,
             ]
@@ -6711,12 +7365,39 @@ export default function ReceiveSortScreen() {
           }))
         );
 
+        if (!(await requireOnlineForReceiving())) {
+          setLoading(false);
+          return;
+        }
+
         let remainingToRemove = itemsToRemove;
         let totalRemoved = 0;
         for (const item of itemsToDelete) {
           if (remainingToRemove <= 0) break;
 
           if (item.scanned_qty > remainingToRemove) {
+            const nextQty = item.scanned_qty - remainingToRemove;
+            try {
+              await apiService.adjustSortBox({
+                purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
+                asn_no: activeASN,
+                box_id: item.box_id,
+                carton_id: item.carton_id || lockedCarton || undefined,
+                item_code: editQtyModal.itemCode,
+                new_qty: nextQty,
+                user_id: settings.user_id ?? "",
+                device_id: settings.device_id ?? "",
+              });
+            } catch (error: any) {
+              const payload = error?.data || error?.response?.data || {};
+              const msg =
+                payload?.message ||
+                error?.message ||
+                "Backend rejected this quantity update.";
+              Alert.alert("Quantity Update Not Allowed", msg);
+              setLoading(false);
+              return;
+            }
             // Reduce quantity in this record
             // Use the ASN format and carton_id found in the database record
             const itemCartonFilter = item.carton_id
@@ -6765,6 +7446,27 @@ export default function ReceiveSortScreen() {
             totalRemoved += remainingToRemove;
             remainingToRemove = 0;
           } else {
+            try {
+              await apiService.adjustSortBox({
+                purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
+                asn_no: activeASN,
+                box_id: item.box_id,
+                carton_id: item.carton_id || lockedCarton || undefined,
+                item_code: editQtyModal.itemCode,
+                new_qty: 0,
+                user_id: settings.user_id ?? "",
+                device_id: settings.device_id ?? "",
+              });
+            } catch (error: any) {
+              const payload = error?.data || error?.response?.data || {};
+              const msg =
+                payload?.message ||
+                error?.message ||
+                "Backend rejected this quantity update.";
+              Alert.alert("Quantity Update Not Allowed", msg);
+              setLoading(false);
+              return;
+            }
             // Delete this entire record
             // Use the ASN format and carton_id found in the database record
             const itemCartonFilter = item.carton_id
@@ -6820,14 +7522,14 @@ export default function ReceiveSortScreen() {
         `🔍 Verifying save - querying database for updated quantity...`
       );
       const verifyCartonFilter = lockedCarton
-        ? "AND (carton_id = ? OR carton_id IS NULL)"
-        : "AND carton_id IS NULL";
+        ? "AND UPPER(TRIM(IFNULL(carton_id,''))) = UPPER(TRIM(?))"
+        : "AND (carton_id IS NULL OR TRIM(COALESCE(carton_id, '')) = '')";
       const verifyCartonParams = lockedCarton
         ? [
             activeASN,
             normalizedASN,
             activeSession,
-            lockedCarton,
+            String(lockedCarton).trim(),
             editQtyModal.itemCode,
             editQtyModal.store,
           ]
@@ -6875,7 +7577,7 @@ export default function ReceiveSortScreen() {
 
       // Recalculate scanned quantities by item_code
       const scannedQtyMap = new Map<string, number>();
-      (scannedItemsFromDB as Array<{ item_code: string; scanned_qty?: number }>).forEach((item) => {
+      (scannedItemsFromDB as { item_code: string; scanned_qty?: number }[]).forEach((item) => {
         const current = scannedQtyMap.get(item.item_code) || 0;
         scannedQtyMap.set(item.item_code, current + (item.scanned_qty || 0));
       });
@@ -6926,16 +7628,13 @@ export default function ReceiveSortScreen() {
         );
       }
 
-      Alert.alert(
-        "Success",
-        `Updated scanned quantity for ${editQtyModal.itemCode} in ${editQtyModal.store} to ${newQty}`
-      );
+      const savedEditItemCode = editQtyModal.itemCode;
       setEditQtyModal(null);
       setEditQtyValue("");
 
       // Refresh item details modal if it's open
       if (itemDetailsModal?.visible) {
-        await handleItemDetailsClick(editQtyModal.itemCode);
+        await handleItemDetailsClick(savedEditItemCode);
       }
     } catch (error: any) {
       console.error("❌ Error updating scanned quantity:", error);
@@ -6996,11 +7695,23 @@ export default function ReceiveSortScreen() {
         return;
       }
 
+      if (
+        box.status !== "Open" &&
+        box.status !== "OPEN" &&
+        box.status !== "open"
+      ) {
+        Alert.alert(
+          "BOX Not Active",
+          `BOX "${manualQtyBox}" is not open (status: ${box.status}).\n\nUse an open box or create a new one in Box Management.`
+        );
+        setLoading(false);
+        return;
+      }
+
       // Validate allocation (except for Warehouse boxes)
       // Check warehouse_type from master data instead of hardcoded "WAREHOUSE" string
-      const boxStoreInfo = warehousesAndStores.find(
-        (ws: any) =>
-          ws.code.toUpperCase() === String(box.store).trim().toUpperCase()
+      const boxStoreInfo = warehousesAndStores.find((ws: any) =>
+        storeCodesMatchForTO(ws.code, box.store)
       );
       const isWarehouseBox =
         boxStoreInfo?.warehouse_type === "Warehouse" ||
@@ -7012,7 +7723,9 @@ export default function ReceiveSortScreen() {
           box.store
         );
         const allocation = allocations.find(
-          (a) => a.item_code === manualQtyItem
+          (a) =>
+            String(a.item_code).trim().toUpperCase() ===
+            String(manualQtyItem).trim().toUpperCase()
         );
         if (!allocation || allocation.allocated_qty <= 0) {
           Alert.alert(
@@ -7026,7 +7739,11 @@ export default function ReceiveSortScreen() {
         // Check if adding this quantity would exceed allocated quantity for this store
         const itemScansForStore = scannedItems.filter((si) => {
           const siBox = boxes.find((b) => b.box_id === si.box_id);
-          return si.item_code === manualQtyItem && siBox?.store === box.store;
+          return (
+            String(si.item_code).trim().toUpperCase() ===
+              String(manualQtyItem).trim().toUpperCase() &&
+            storeCodesMatchForTO(siBox?.store, box.store)
+          );
         });
         const currentScannedQtyForStore = itemScansForStore.length;
         const newTotalScannedQty = currentScannedQtyForStore + qty;
@@ -7050,6 +7767,35 @@ export default function ReceiveSortScreen() {
       // Create events for the quantity - use batch approach for better performance
       // Create a single event with total quantity instead of multiple individual events
       // This is much faster than creating qty * 2 individual events
+      try {
+        if (!(await requireOnlineForReceiving())) {
+          setLoading(false);
+          return;
+        }
+        await apiService.scanSortBox({
+          purpose: isWarehouseBox ? "PUTAWAY" : "STORE",
+          asn_no: activeASN,
+          box_id: manualQtyBox,
+          carton_id: lockedCarton ?? undefined,
+          item_code: manualQtyItem,
+          qty,
+          user_id: settings.user_id ?? "",
+          device_id: settings.device_id ?? "",
+        });
+      } catch (error: any) {
+        const payload = error?.data || error?.response?.data || {};
+        const msg =
+          payload?.message ||
+          error?.message ||
+          "Backend rejected this quantity scan.";
+        Alert.alert(
+          isWarehouseBox ? "Putaway Not Allowed" : "Sort Not Allowed",
+          msg,
+        );
+        setLoading(false);
+        return;
+      }
+
       await addEvent({
         event_type: "RECEIVE_ITEM_SCAN",
         asn_no: normalizedASN,
@@ -7057,19 +7803,6 @@ export default function ReceiveSortScreen() {
         carton_id: lockedCarton,
         item_code: manualQtyItem,
         qty: qty, // Use total quantity instead of creating multiple events
-        device_id: settings.device_id,
-        user_id: settings.user_id,
-      });
-
-      await addEvent({
-        event_type: "SORT_TO_BOX",
-        asn_no: normalizedASN,
-        inbound_session: activeSession,
-        carton_id: lockedCarton,
-        item_code: manualQtyItem,
-        box_id: manualQtyBox,
-        store: box.store,
-        qty: qty, // Include quantity in SORT_TO_BOX event
         device_id: settings.device_id,
         user_id: settings.user_id,
       });
@@ -7207,12 +7940,6 @@ export default function ReceiveSortScreen() {
       setManualQtyItem(null);
       setManualQtyValue("");
       setManualQtyBox(null);
-
-      // Show success message immediately (don't wait for any async operations)
-      Alert.alert(
-        "Success",
-        `Added ${qty} units of ${manualQtyItem} to ${manualQtyBox}`
-      );
     } catch (error: any) {
       console.error("❌ Failed to add manual quantity:", error);
       Alert.alert("Error", error.message || "Failed to add quantity");
@@ -7224,15 +7951,15 @@ export default function ReceiveSortScreen() {
   // Memoized render functions for performance
   const renderExpectedItem = useCallback(
     ({ item }: { item: any }) => {
-      // Use totalScannedQuantities (across all cartons/boxes) instead of scannedQuantities (only for locked carton)
-      const scannedQty = totalScannedQuantities[item.item_code] || 0;
+      // cartonItems are for lockedCarton only — compare to this carton's scanned qty, not session-wide total
+      const scannedQty = scannedQtyLookup(scannedQuantities, item.item_code) || 0;
       const remainingQty = item.shipped_qty - scannedQty;
       const isComplete = remainingQty <= 0;
       const isEditing = manualQtyItem === item.item_code;
 
       // Get carton scanned quantity for display (from scannedQuantities which is for locked carton)
       const cartonScannedQty = lockedCarton
-        ? scannedQuantities[item.item_code] || 0
+        ? scannedQtyLookup(scannedQuantities, item.item_code) || 0
         : 0;
 
       // Debug logging
@@ -7330,7 +8057,7 @@ export default function ReceiveSortScreen() {
                   style={styles.manualQtyBoxSelector}
                   contentContainerStyle={styles.manualQtyBoxSelectorContent}
                 >
-                  {availableBoxes
+                  {boxesFilteredForCreator
                     .filter(
                       (box) =>
                         box.box_id != null &&
@@ -7487,6 +8214,7 @@ export default function ReceiveSortScreen() {
       );
     },
     [
+      lockedCarton,
       scannedQuantities,
       manualQtyItem,
       manualQtyValue,
@@ -7533,9 +8261,9 @@ export default function ReceiveSortScreen() {
   // Memoized scanned items data transformation
   const scannedItemsData = useMemo(() => {
     return Object.keys(scannedQuantities).map((itemCode) => {
-      // Get all BOXes this item was sorted into
+      // Get all BOXes this item was sorted into (rows already scoped to current supplier carton when locked)
       const itemBoxes = scannedItems
-        .filter((si) => si.item_code === itemCode)
+        .filter((si) => itemCodesMatchForAllocation(si.item_code, itemCode))
         .map((si) => si.box_id)
         .filter((boxId) => boxId && boxId !== "" && boxId !== null) // Filter out null/empty box_ids
         .filter((boxId, index, self) => self.indexOf(boxId) === index); // Unique BOXes
@@ -7615,6 +8343,10 @@ export default function ReceiveSortScreen() {
                 console.warn(
                   `⚠️ BarcodeScanner onScan: Already processing a scan, ignoring duplicate: "${barcode}"`
                 );
+                showScanFeedback(
+                  "err",
+                  "Still processing the last scan — wait a second."
+                );
                 return;
               }
 
@@ -7632,19 +8364,32 @@ export default function ReceiveSortScreen() {
               // Pass the barcode directly to avoid race condition with state update
               // Use longer delay (800ms) to ensure scanner has completely finished sending
               (global as any).ctnIdAutoSubmitTimeout = setTimeout(() => {
-                // Verify the barcode is complete (BOX IDs are typically 20+ characters)
                 const normalized = barcode.trim().toUpperCase();
                 if (
+                  lockedCarton &&
+                  normalized === String(lockedCarton).trim().toUpperCase()
+                ) {
+                  (global as any).ctnIdAutoSubmitTimeout = null;
+                  showScanFeedback(
+                    "err",
+                    "That is the supplier carton id — scan your open destination BOX id from Box Management."
+                  );
+                  return;
+                }
+                const isPrefixedLong =
                   (normalized.startsWith("BOX-") ||
                     normalized.startsWith("PAW-")) &&
-                  normalized.length >= 20
-                ) {
-                  // Clear the timeout reference
+                  normalized.length >= 20;
+                const isCustomOpenBoxId =
+                  normalized.length >= 6 &&
+                  normalized.length <= 48 &&
+                  /^[A-Z0-9._-]+$/.test(normalized) &&
+                  !normalized.startsWith("CTN-") &&
+                  !normalized.startsWith("TC-");
+                if (isPrefixedLong || isCustomOpenBoxId) {
                   (global as any).ctnIdAutoSubmitTimeout = null;
-                  // Simulate Enter key by calling handleCTNIdPromptSubmit
                   handleCTNIdPromptSubmit(barcode);
                 } else {
-                  // Clear timeout if barcode doesn't match format
                   (global as any).ctnIdAutoSubmitTimeout = null;
                 }
               }, 800);
@@ -7655,6 +8400,7 @@ export default function ReceiveSortScreen() {
           }}
           placeholder={getScannerPlaceholder()}
           title={getScannerTitle()}
+          focusSignal={scannerFocusSignal}
           scanType={
             workflowState === "SCAN_BOX"
               ? "box"
@@ -7663,6 +8409,34 @@ export default function ReceiveSortScreen() {
               : "carton"
           }
         />
+
+        {scanFeedback && (
+          <View
+            style={{
+              marginHorizontal: 12,
+              marginTop: 8,
+              marginBottom: 4,
+              padding: 12,
+              borderRadius: 8,
+              backgroundColor:
+                scanFeedback.kind === "ok" ? "#E8F5E9" : "#FFEBEE",
+              borderWidth: 1,
+              borderColor:
+                scanFeedback.kind === "ok" ? "#66BB6A" : "#EF5350",
+            }}
+          >
+            <Text
+              style={{
+                color: scanFeedback.kind === "ok" ? "#1B5E20" : "#B71C1C",
+                fontWeight: "600",
+                fontSize: 15,
+              }}
+            >
+              {scanFeedback.kind === "ok" ? "✓ " : "⚠ "}
+              {scanFeedback.text}
+            </Text>
+          </View>
+        )}
 
         {workflowState === "SCAN_BOX" && (
           <View style={styles.section}>
@@ -7681,6 +8455,23 @@ export default function ReceiveSortScreen() {
               </View>
             ) : (
               <>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    paddingHorizontal: 4,
+                    marginBottom: 8,
+                  }}
+                >
+                  <Text style={{ flex: 1, fontSize: 14, color: "#333" }}>
+                    Show only My Carton
+                  </Text>
+                  <Switch
+                    value={onlyMySortBoxes}
+                    onValueChange={setOnlyMySortBoxes}
+                  />
+                </View>
                 <TouchableOpacity
                   style={styles.toggleBoxesButton}
                   onPress={() => setShowAvailableBoxes(!showAvailableBoxes)}
@@ -7724,6 +8515,16 @@ export default function ReceiveSortScreen() {
                             <Text style={styles.boxItemStore}>
                               Store: {item.store}
                             </Text>
+                            {(item as any).created_by ? (
+                              <Text
+                                style={[
+                                  styles.boxItemStore,
+                                  { fontSize: 12, opacity: 0.85 },
+                                ]}
+                              >
+                                Created by: {(item as any).created_by}
+                              </Text>
+                            ) : null}
                             <Text style={styles.tapToSelect}>Tap to use →</Text>
                           </TouchableOpacity>
                         )}
@@ -7756,13 +8557,13 @@ export default function ReceiveSortScreen() {
                       You can proceed to the next step: BOX Management.
                     </Text>
                   </>
-                ) : allCartonsStatus.inReceiving > 0 ? (
+                ) : allCartonsStatus.inReceivingByCurrentUser > 0 ? (
                   <>
                     <Text style={styles.noCartonsTitle}>
                       ⚠️ Cartons In Progress
                     </Text>
                     <Text style={styles.noCartonsText}>
-                      You have {allCartonsStatus.inReceiving} carton(s)
+                      You have {allCartonsStatus.inReceivingByCurrentUser} carton(s)
                       currently being processed.
                     </Text>
                     <Text style={styles.noCartonsSubtext}>
@@ -7850,8 +8651,9 @@ export default function ReceiveSortScreen() {
                   backgroundColor: "#FFF9E6",
                 },
               ]}
-              onPress={() => {
+              onPress={async () => {
                 console.log("Expected Items clicked");
+                if (!(await refreshLockedCartonScannedQtyFromBackend())) return;
                 setShowExpectedItemsModal(true);
               }}
               activeOpacity={0.7}
@@ -7889,31 +8691,52 @@ export default function ReceiveSortScreen() {
                   fontWeight: "bold",
                 }}
               >
-                📋 Tap to view all items
+                📋 Tap for lines where sorted qty must match shipped qty
               </Text>
               <TouchableOpacity
                 style={styles.clickableSectionHeader}
-                onPress={() => {
+                onPress={async () => {
                   console.log("View All Items clicked");
+                  if (!(await refreshLockedCartonScannedQtyFromBackend())) return;
                   setShowExpectedItemsModal(true);
                 }}
                 activeOpacity={0.8}
               >
                 <Text style={styles.clickableSectionText}>
-                  View All Items ({incompleteItems.length})
+                  {cartonItems.length === 0
+                    ? "Carton lines"
+                    : incompleteItems.length === 0
+                      ? `All ${cartonItems.length} line${
+                          cartonItems.length !== 1 ? "s" : ""
+                        } match shipped qty — ready to finish`
+                      : `${incompleteItems.length} line${
+                          incompleteItems.length !== 1 ? "s" : ""
+                        } need qty = shipped · ${cartonItems.length} on carton`}
                 </Text>
                 <Text style={styles.clickableSectionArrow}>→</Text>
               </TouchableOpacity>
-              {cartonItems.length === 0 ? (
+              {cartonLinesLoading ? (
                 <Text style={styles.emptyText}>Loading items...</Text>
+              ) : cartonLinesLoadError ? (
+                <Text style={styles.emptyText}>{cartonLinesLoadError}</Text>
+              ) : cartonItems.length === 0 ? (
+                <Text style={styles.emptyText}>
+                  No expected lines for this carton. The app already tried loading
+                  them from the server when possible. If you are offline, or the
+                  server has no line data, open ASN list or Sync Center and
+                  refresh this ASN on this device, then return here.
+                </Text>
               ) : lastScannedItem ? (
                 (() => {
-                  const item = cartonItems.find(
-                    (ci) => ci.item_code === lastScannedItem
+                  const item = cartonItems.find((ci) =>
+                    itemCodesMatchForAllocation(ci.item_code, lastScannedItem)
                   );
                   if (!item)
                     return <Text style={styles.emptyText}>Item not found</Text>;
-                  const scannedQty = scannedQuantities[item.item_code] || 0;
+                  const scannedQty = scannedQtyLookup(
+                    scannedQuantities,
+                    item.item_code
+                  );
                   const remainingQty = item.shipped_qty - scannedQty;
                   const isComplete = remainingQty <= 0;
                   return (
@@ -7940,33 +8763,9 @@ export default function ReceiveSortScreen() {
                   );
                 })()
               ) : (
-                (() => {
-                  const firstItem = cartonItems[0];
-                  if (!firstItem)
-                    return <Text style={styles.emptyText}>No items</Text>;
-                  const scannedQty =
-                    scannedQuantities[firstItem.item_code] || 0;
-                  const remainingQty = firstItem.shipped_qty - scannedQty;
-                  return (
-                    <View style={styles.lastItemCard}>
-                      <Text style={styles.lastItemLabel}>First Item:</Text>
-                      <Text style={styles.lastItemCode}>
-                        {firstItem.item_code}
-                      </Text>
-                      <View style={styles.lastItemDetails}>
-                        <Text style={styles.lastItemDetail}>
-                          ASN: {firstItem.shipped_qty}
-                        </Text>
-                        <Text style={styles.lastItemDetail}>
-                          Scanned: {scannedQty}
-                        </Text>
-                        <Text style={styles.lastItemDetail}>
-                          Remaining: {remainingQty}
-                        </Text>
-                      </View>
-                    </View>
-                  );
-                })()
+                <Text style={styles.emptyText}>
+                  Your last sorted item appears here after each scan to a BOX.
+                </Text>
               )}
             </TouchableOpacity>
 
@@ -8018,10 +8817,16 @@ export default function ReceiveSortScreen() {
               </TouchableOpacity>
               {Object.keys(scannedQuantities).length === 0 ? (
                 <Text style={styles.emptyText}>No items scanned yet</Text>
-              ) : lastScannedItem && scannedQuantities[lastScannedItem] ? (
+              ) : lastScannedItem &&
+                scannedQtyLookup(scannedQuantities, lastScannedItem) > 0 ? (
                 (() => {
                   const itemBoxes = scannedItems
-                    .filter((si) => si.item_code === lastScannedItem)
+                    .filter((si) =>
+                      itemCodesMatchForAllocation(
+                        si.item_code,
+                        lastScannedItem
+                      )
+                    )
                     .map((si) => si.box_id)
                     .filter((boxId) => boxId && boxId !== "" && boxId !== null) // Filter out null/empty box_ids
                     .filter(
@@ -8033,7 +8838,8 @@ export default function ReceiveSortScreen() {
                       <Text style={styles.lastItemCode}>{lastScannedItem}</Text>
                       <View style={styles.lastItemDetails}>
                         <Text style={styles.lastItemDetail}>
-                          Qty: {scannedQuantities[lastScannedItem]}
+                          Qty:{" "}
+                          {scannedQtyLookup(scannedQuantities, lastScannedItem)}
                         </Text>
                         {itemBoxes.length > 0 && (
                           <Text style={styles.lastItemDetail}>
@@ -8186,30 +8992,48 @@ export default function ReceiveSortScreen() {
             <TouchableOpacity
               style={[
                 styles.button,
-                (loading || !areAllItemsReceived) && styles.buttonDisabled,
+                (loading || !canFinishCarton) && styles.buttonDisabled,
               ]}
               onPress={handleFinishCarton}
-              disabled={loading || !areAllItemsReceived}
+              disabled={loading || !canFinishCarton}
             >
               <Text style={styles.buttonText}>
-                {loading ? "Completing..." : "Finish Carton"}
+                {loading
+                  ? "Completing..."
+                  : shortageItems.length > 0
+                    ? "Finish With Shortage"
+                    : "Finish Carton"}
               </Text>
-              {!areAllItemsReceived && !loading && (
+              {overageItems.length > 0 && !loading && (
                 <Text style={styles.buttonSubtext}>
-                  Complete all TO-allocated items first
+                  Over quantity found. Correct scanned qty or raise overage
+                  approval before finishing.
                 </Text>
               )}
-              {areAllItemsReceived &&
-                summaryTotals.totalRemainingForPutaway > 0 &&
-                !loading && (
+              {shortageItems.length > 0 && overageItems.length === 0 && !loading && (
+                <Text style={styles.buttonSubtext}>
+                  {shortageItems.length} line
+                  {shortageItems.length !== 1 ? "s" : ""} short. Finish will
+                  record a shortage discrepancy.
+                </Text>
+              )}
+              {!areAllItemsReceived && shortageItems.length === 0 && overageItems.length === 0 && !loading && (
+                <Text style={styles.buttonSubtext}>
+                  Finish when every line has sorted qty equal to shipped qty on
+                  this carton (not more, not less).
+                </Text>
+              )}
+              {areAllItemsReceived && putawayItemsNotInTO > 0 && !loading && (
                   <Text
                     style={[
                       styles.buttonSubtext,
                       { color: "#FF9800", fontWeight: "600" },
                     ]}
                   >
-                    {summaryTotals.totalRemainingForPutaway} items will go to
-                    Putaway
+                    {putawayItemsNotInTO} items will go to Putaway
+                    {summaryTotals.totalTOAllocatedQty > 0
+                      ? " (not in TO)"
+                      : ""}
                   </Text>
                 )}
             </TouchableOpacity>
@@ -8569,7 +9393,11 @@ export default function ReceiveSortScreen() {
           <View style={styles.modalContainer}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
-                Expected Items ({incompleteItems.length})
+                {cartonItems.length === 0
+                  ? "Carton lines"
+                  : incompleteItems.length === 0
+                    ? `All lines match shipped (${cartonItems.length})`
+                    : `Lines to fix (${incompleteItems.length} of ${cartonItems.length})`}
               </Text>
               <TouchableOpacity
                 style={styles.modalCloseButton}
@@ -8598,12 +9426,6 @@ export default function ReceiveSortScreen() {
 
             <FlatList
               data={cartonItems.filter((item) => {
-                // Filter out items that are completely scanned
-                const scannedQty = scannedQuantities[item.item_code] || 0;
-                const isComplete = scannedQty >= item.shipped_qty;
-                if (isComplete) return false;
-
-                // Apply search filter if query exists
                 if (expectedItemsSearchQuery) {
                   return item.item_code
                     .toLowerCase()
@@ -8612,6 +9434,11 @@ export default function ReceiveSortScreen() {
 
                 return true;
               })}
+              extraData={{
+                scannedQuantities,
+                lockedCarton,
+                incompleteItems,
+              }}
               keyExtractor={(item) =>
                 `${item.item_code}-${item.carton_id}-${lockedCarton}`
               }
@@ -8623,7 +9450,13 @@ export default function ReceiveSortScreen() {
                   <Text style={styles.emptyModalText}>
                     {expectedItemsSearchQuery
                       ? "No items found matching your search"
-                      : "No items available"}
+                      : cartonLinesLoading
+                        ? "Loading carton lines..."
+                        : cartonLinesLoadError
+                          ? cartonLinesLoadError
+                          : cartonItems.length === 0
+                            ? "No carton lines after local load and server fetch. Check network, carton id, then refresh this ASN in ASN list or Sync Center."
+                            : "No items available"}
                   </Text>
                 </View>
               }
@@ -9005,7 +9838,7 @@ export default function ReceiveSortScreen() {
             <View style={styles.editModalContent}>
               <Text style={styles.inputLabel}>
                 {pendingItemScan
-                  ? "Please scan or enter the BOX ID for this item:"
+                  ? "Scan the destination BOX (open box from Box Management). Do not scan the supplier carton barcode:"
                   : pendingBoxScan
                   ? "Please scan or enter the BOX ID for this BOX:"
                   : "Please scan or enter the BOX ID:"}
@@ -9060,9 +9893,39 @@ export default function ReceiveSortScreen() {
                       }
                       (global as any).ctnIdAutoSubmitTimeout = null;
                     }, 800);
+                  } else if (
+                    normalized.length >= 6 &&
+                    normalized.length <= 48 &&
+                    /^[A-Z0-9._-]+$/.test(normalized) &&
+                    !normalized.startsWith("CTN-") &&
+                    !normalized.startsWith("TC-") &&
+                    !(
+                      lockedCarton &&
+                      normalized === String(lockedCarton).trim().toUpperCase()
+                    )
+                  ) {
+                    // Custom open box ids (e.g. store-style ids) — not supplier carton on this lock
+                    (global as any).ctnIdAutoSubmitTimeout = setTimeout(() => {
+                      const finalText = text.trim();
+                      const fn = finalText.toUpperCase();
+                      if (
+                        fn.length >= 6 &&
+                        fn.length <= 48 &&
+                        /^[A-Z0-9._-]+$/.test(fn) &&
+                        !fn.startsWith("CTN-") &&
+                        !fn.startsWith("TC-") &&
+                        !(
+                          lockedCarton &&
+                          fn === String(lockedCarton).trim().toUpperCase()
+                        )
+                      ) {
+                        handleCTNIdPromptSubmit(finalText);
+                      }
+                      (global as any).ctnIdAutoSubmitTimeout = null;
+                    }, 700);
                   }
                 }}
-                placeholder="Enter BOX ID (e.g., BOX-STORE001-267199)"
+                placeholder="BOX-…, PAW-…, or custom Open box (not carton CN…)"
                 autoFocus={true}
                 autoCapitalize="characters"
                 onSubmitEditing={() => {

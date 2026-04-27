@@ -65,12 +65,12 @@ function maxIso(a: string | null | undefined, b: string): string {
  */
 export async function bulkUpsertItemMaster(
   db: SQLite.SQLiteDatabase,
-  rows: Array<{
+  rows: {
     item_code: string;
     barcode: string;
     item_name: string | null;
     updated_on: string;
-  }>
+  }[]
 ): Promise<void> {
   if (rows.length === 0) return;
 
@@ -201,12 +201,12 @@ export async function syncItemMasterPaged(
       offset
     );
 
-    const prepared: Array<{
+    const prepared: {
       item_code: string;
       barcode: string;
       item_name: string | null;
       updated_on: string;
-    }> = [];
+    }[] = [];
 
     for (const item of items) {
       const itemCode = String(item.item_code ?? "").trim();

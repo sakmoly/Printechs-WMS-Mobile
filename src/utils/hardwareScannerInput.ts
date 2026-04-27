@@ -24,6 +24,8 @@ export type OnScannerTextChangeOptions = {
   delayMs?: number;
   /** When false, only commit on \\r\\n\\t (no idle debounce). Default true. */
   autoIdleSubmit?: boolean;
+  /** If set, idle debounce reads this at fire time instead of the captured `display` (avoids stale closure). */
+  getLatestDisplay?: () => string;
 };
 
 /**
@@ -64,7 +66,8 @@ export function onScannerTextChange(
   if (display.trim().length > 0) {
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
-      const v = display.trim();
+      const raw = options?.getLatestDisplay?.() ?? display;
+      const v = String(raw).replace(/[\r\n\t\u0000]+/g, "").trim();
       if (v.length > 0) {
         setField("");
         commit(v);

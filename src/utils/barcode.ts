@@ -1,10 +1,9 @@
-import { DEMO_ITEMS } from '../types';
-
 /**
  * Resolve item code from barcode
  */
 export const resolveItemFromBarcode = (barcode: string): { item_code: string; item_name?: string } | null => {
-  const item = DEMO_ITEMS.find(i => i.barcode === barcode);
+  const DEMO_ITEMS: { barcode: string; item_code: string; item_name?: string }[] = [];
+  const item = DEMO_ITEMS.find((i: { barcode: string }) => i.barcode === barcode);
   if (item) {
     return {
       item_code: item.item_code,

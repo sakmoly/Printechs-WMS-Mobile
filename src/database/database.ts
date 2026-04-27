@@ -366,11 +366,55 @@ export async function runSchemaMigrations(db: SQLite.SQLiteDatabase) {
           );
           console.log("✅ Added purpose column to box_cache");
         }
+        const hasCreatedBy = boxCacheColumns.some(
+          (col) => col.name === "created_by"
+        );
+        if (!hasCreatedBy) {
+          console.log("📝 Adding created_by column to box_cache table...");
+          await db.execAsync(
+            "ALTER TABLE box_cache ADD COLUMN created_by TEXT"
+          );
+          console.log("✅ Added created_by column to box_cache");
+        }
       }
     } catch (error: any) {
-      if (!error?.message?.includes("no such table")) {
+      if (
+        !error?.message?.includes("no such table") &&
+        !error?.message?.includes("duplicate column")
+      ) {
         console.error(
-          "❌ Error checking/adding purpose column to box_cache:",
+          "❌ Error checking/adding purpose/created_by column to box_cache:",
+          error
+        );
+      }
+    }
+
+    // carton_status_cache: who recorded dock unload (for Unload UI + sync)
+    try {
+      const cartonStatusCols = await db.getAllAsync<{ name: string }>(
+        "PRAGMA table_info(carton_status_cache)"
+      );
+      if (cartonStatusCols.length > 0) {
+        const hasUnloadedBy = cartonStatusCols.some(
+          (col) => col.name === "unloaded_by"
+        );
+        if (!hasUnloadedBy) {
+          console.log(
+            "📝 Adding unloaded_by column to carton_status_cache table..."
+          );
+          await db.execAsync(
+            "ALTER TABLE carton_status_cache ADD COLUMN unloaded_by TEXT"
+          );
+          console.log("✅ Added unloaded_by column to carton_status_cache");
+        }
+      }
+    } catch (error: any) {
+      if (
+        !error?.message?.includes("no such table") &&
+        !error?.message?.includes("duplicate column")
+      ) {
+        console.error(
+          "❌ Error checking/adding unloaded_by to carton_status_cache:",
           error
         );
       }

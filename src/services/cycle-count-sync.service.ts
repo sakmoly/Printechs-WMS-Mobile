@@ -14,6 +14,8 @@ interface CycleCountSession {
   is_blind_count: number;
   device_id: string;
   synced: number;
+  /** Backend cycle count task title when linked */
+  server_session_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -104,7 +106,7 @@ export const syncCycleCountSessions = async (): Promise<{
         // The backend expects an existing task title, so we need to either:
         // 1. Use server_session_id if available
         // 2. Or try to find/create a task for this bin
-        let title = session.server_session_id;
+        let title: string = String(session.server_session_id ?? "");
         
         if (!title) {
           // Try to find an existing task for this bin
@@ -144,7 +146,7 @@ export const syncCycleCountSessions = async (): Promise<{
             });
             
             if (existingTask) {
-              title = existingTask.title;
+              title = String(existingTask.title ?? "");
               console.log(`✅ Using existing task ${title} for bin ${session.bin_code}`);
               // Save the server session ID for future syncs
               await db.runAsync(
@@ -162,7 +164,7 @@ export const syncCycleCountSessions = async (): Promise<{
               });
               
               if (generalTask) {
-                title = generalTask.title;
+                title = String(generalTask.title ?? "");
                 console.log(`⚠️ Using general task ${title} as fallback for bin ${session.bin_code} (no bin-specific task found)`);
                 console.log(`⚠️ Note: This task has no bin_code/bin_id - ensure backend accepts counts for any bin`);
                 // Save the server session ID for future syncs
@@ -207,7 +209,7 @@ export const syncCycleCountSessions = async (): Promise<{
                   const createdTaskTitle = createResponse?.title || createResponse?.data?.title || createResponse?.task_title || generatedTitle;
                   
                   if (createdTaskTitle) {
-                    title = createdTaskTitle;
+                    title = String(createdTaskTitle);
                     console.log(`✅ Successfully created backend task: ${title} for bin ${session.bin_code}`);
                     
                     // Save the server session ID for future syncs
@@ -239,9 +241,17 @@ export const syncCycleCountSessions = async (): Promise<{
           console.log(`✅ Using saved server_session_id: ${title} for session ${session.session_id}`);
         }
 
+        title = String(title ?? "").trim();
+        if (!title) {
+          result.errors.push(
+            `Session ${session.session_id}: No backend cycle count task title — cannot sync`
+          );
+          continue;
+        }
+
         // ✅ FIX: Fetch task from backend first to get actual line IDs
         // Backend requires lineId to match existing lines in the task
-        let backendTaskLines: Array<{ id?: number; line_id?: string; item_code?: string; itemCode?: string; barcode?: string }> = [];
+        let backendTaskLines: { id?: number; line_id?: string; item_code?: string; itemCode?: string; barcode?: string }[] = [];
         try {
           console.log(`🔍 Fetching task ${title} from backend to get line IDs...`);
           const taskResponse = await apiService.getCycleCount(title);
@@ -458,7 +468,7 @@ export const syncCycleCountSessions = async (): Promise<{
         try {
           const response = await apiService.submitCycleCountCounts(title, {
             counted_by: countedBy,
-            lines: linesToSync,
+            lines: linesToSync as any,
           });
           
           console.log(`✅ Backend response:`, JSON.stringify(response, null, 2));
@@ -574,7 +584,7 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
     }
     
     // Check if we have a server_session_id (from previous sync)
-    let title = session.server_session_id;
+    let title: string = String(session.server_session_id ?? "");
     
     if (!title) {
       // Try to find an existing task for this bin
@@ -614,7 +624,7 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
         });
         
         if (existingTask) {
-          title = existingTask.title;
+          title = String(existingTask.title ?? "");
           console.log(`✅ Using existing task ${title} for bin ${session.bin_code}`);
           // Save the server session ID for future syncs
           await db.runAsync(
@@ -632,7 +642,7 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
           });
           
           if (generalTask) {
-            title = generalTask.title;
+            title = String(generalTask.title ?? "");
             console.log(`⚠️ Using general task ${title} as fallback for bin ${session.bin_code} (no bin-specific task found)`);
             console.log(`⚠️ Note: This task has no bin_code/bin_id - ensure backend accepts counts for any bin`);
             // Save the server session ID for future syncs
@@ -677,7 +687,7 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
               const createdTaskTitle = createResponse?.title || createResponse?.data?.title || createResponse?.task_title || generatedTitle;
               
               if (createdTaskTitle) {
-                title = createdTaskTitle;
+                title = String(createdTaskTitle);
                 console.log(`✅ Successfully created backend task: ${title} for bin ${session.bin_code}`);
                 
                 // Save the server session ID for future syncs
@@ -707,10 +717,16 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
       console.log(`✅ Using saved server_session_id: ${title} for session ${sessionId}`);
     }
 
+    title = String(title ?? "").trim();
+    if (!title) {
+      console.error(`❌ Session ${sessionId}: No backend cycle count task title — cannot sync`);
+      return false;
+    }
+
     const countedBy = session.started_by || settings.user_id || settings.user_code || "MOBILE-USER";
 
     // ✅ FIX: Fetch task from backend first to get actual line IDs (fetch once, use for all lines)
-    let backendTaskLines: Array<{ id?: number; line_id?: string; item_code?: string; itemCode?: string; barcode?: string }> = [];
+    let backendTaskLines: { id?: number; line_id?: string; item_code?: string; itemCode?: string; barcode?: string }[] = [];
     try {
       console.log(`🔍 Fetching task ${title} from backend to get line IDs for sync...`);
       const taskResponse = await apiService.getCycleCount(title);
@@ -939,7 +955,7 @@ export const syncCycleCountSession = async (sessionId: string, itemCode?: string
         console.log(`🔄 Calling apiService.submitCycleCountCounts for task ${title}...`);
         const response = await apiService.submitCycleCountCounts(title, {
           counted_by: countedBy,
-          lines: linesToSync,
+          lines: linesToSync as any,
         });
         
         console.log(`✅ Backend response received:`, JSON.stringify(response, null, 2));

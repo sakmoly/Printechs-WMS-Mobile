@@ -141,6 +141,10 @@ export default function CycleCountCountingScreen() {
       const discrepancy = qty - expectedQty;
 
       // Record the count via API using update-line endpoint
+      if (item.id == null) {
+        Alert.alert("Error", "This line has no id — cannot update on server.");
+        return;
+      }
       await apiService.updateCycleCountLine(cycleCount.title, {
         line_id: item.id,
         actual_qty: qty,

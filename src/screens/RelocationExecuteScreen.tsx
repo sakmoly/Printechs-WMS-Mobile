@@ -16,11 +16,11 @@ import { useNavigation, useRoute } from "@react-navigation/native";
 import { PickingTheme } from "../theme/picking-theme";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
-import { getSettings } from "../services/settings.service";
+import { getSettings , getSettings as getAppSettings } from "../services/settings.service";
 import { relocationSessionService, RelocationMode, RelocationPolicy } from "../services/relocation-session.service";
 import { addEvent } from "../services/event-queue.service";
 import { getDatabase } from "../database/database";
-import { getSettings as getAppSettings } from "../services/settings.service";
+
 import {
   BarcodeInput,
   type BarcodeInputHandle,

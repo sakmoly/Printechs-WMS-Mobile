@@ -18,14 +18,14 @@ export interface RelocationSession {
   from_carton: string | null;
   to_bin: string | null;
   to_carton: string | null;
-  scanned_lines: Array<{
+  scanned_lines: {
     item_code: string;
     item_name?: string;
     barcode?: string;
     available_qty: number; // Source carton qty
     move_qty: number; // Quantity to move
     remaining_qty: number; // available_qty - move_qty
-  }>;
+  }[];
   status: "Draft" | "In Progress" | "Completed";
   started_by: string;
   started_at: string;

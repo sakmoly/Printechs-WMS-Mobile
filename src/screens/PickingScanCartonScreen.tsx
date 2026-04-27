@@ -400,9 +400,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   cartonScanButtonText: {
+    ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
     fontWeight: "600",
-    ...PickingTheme.typography.body,
   },
   loadingContainer: {
     marginTop: PickingTheme.spacing.md,

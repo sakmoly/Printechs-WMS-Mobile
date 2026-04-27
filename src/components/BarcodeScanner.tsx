@@ -12,6 +12,16 @@ interface BarcodeScannerProps {
   scanType?: 'item' | 'box' | 'carton';
   autoSubmit?: boolean; // Auto-submit after delay (for scanners that don't send Enter)
   autoSubmitDelay?: number; // Delay in milliseconds (default: 500ms)
+  /** When false, render nothing (modal-style usage). */
+  visible?: boolean;
+  onClose?: () => void;
+  /** Alias for onClose used by some screens */
+  onCancel?: () => void;
+  /** Controlled value (optional); when set with onChangeText, pairs with parent state */
+  value?: string;
+  onChangeText?: (text: string) => void;
+  /** Change this value to force-focus the underlying barcode input. */
+  focusSignal?: unknown;
 }
 
 export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
@@ -21,19 +31,39 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
   scanType = 'item',
   autoSubmit = true, // Enable auto-submit by default
   autoSubmitDelay = 300, // 300ms delay (scanners are usually fast)
+  visible = true,
+  onClose,
+  onCancel,
+  value: valueProp,
+  onChangeText: onChangeTextProp,
+  focusSignal,
 }) => {
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState(valueProp ?? '');
   const inputRef = useRef<TextInput>(null);
+  const latestInputRef = useRef('');
   const autoSubmitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (valueProp !== undefined) setInput(valueProp);
+  }, [valueProp]);
 
   // Auto-focus when component mounts or scanType changes
   useEffect(() => {
+    if (!visible) return;
     // Small delay to ensure the input is rendered
     const timer = setTimeout(() => {
       inputRef.current?.focus();
     }, 100);
     return () => clearTimeout(timer);
-  }, [scanType, title]);
+  }, [scanType, title, visible]);
+
+  useEffect(() => {
+    if (!visible || focusSignal === undefined) return;
+    const timer = setTimeout(() => {
+      inputRef.current?.focus();
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [focusSignal, visible]);
 
   // Clear auto-submit timer when input changes or component unmounts
   useEffect(() => {
@@ -43,16 +73,27 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
   }, []);
 
   const handleSubmit = () => {
-    if (input.trim()) {
+    const v = latestInputRef.current.trim() || input.trim();
+    if (v) {
       clearScannerTimer(autoSubmitTimerRef);
 
-      onScan(input.trim());
+      onScan(v);
+      latestInputRef.current = '';
       setInput('');
+      onChangeTextProp?.('');
       // Refocus after submission
       setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
     }
+  };
+
+  if (visible === false) {
+    return null;
+  }
+
+  const dismiss = () => {
+    (onClose ?? onCancel)?.();
   };
 
   // Handle text input changes with auto-submit
@@ -61,7 +102,9 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
       const trimmed = barcode.trim();
       if (!trimmed) return;
       onScan(trimmed);
+      latestInputRef.current = '';
       setInput('');
+      onChangeTextProp?.('');
       setTimeout(() => {
         inputRef.current?.focus();
       }, 100);
@@ -69,10 +112,18 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
 
     onScannerTextChange(
       text,
-      setInput,
+      (s: string) => {
+        latestInputRef.current = String(s).replace(/[\r\n\t\u0000]+/g, "");
+        setInput(s);
+        onChangeTextProp?.(s);
+      },
       autoSubmitTimerRef,
       commit,
-      { delayMs: autoSubmitDelay, autoIdleSubmit: autoSubmit }
+      {
+        delayMs: autoSubmitDelay,
+        autoIdleSubmit: autoSubmit,
+        getLatestDisplay: () => latestInputRef.current,
+      }
     );
   };
 
@@ -95,12 +146,21 @@ export const BarcodeScanner: React.FC<BarcodeScannerProps> = ({
   return (
     <View style={[styles.container, containerStyle]}>
       {title && <Text style={[styles.title, titleStyle]}>{title}</Text>}
-      
+      {(onClose || onCancel) && (
+        <TouchableOpacity
+          style={styles.closeRow}
+          onPress={dismiss}
+          accessibilityRole="button"
+          accessibilityLabel="Close scanner"
+        >
+          <Text style={styles.closeText}>Close</Text>
+        </TouchableOpacity>
+      )}
       <View style={styles.inputContainer}>
         <TextInput
           ref={inputRef}
           style={[styles.input, inputStyle]}
-          value={input}
+          value={valueProp !== undefined ? valueProp : input}
           onChangeText={handleTextChange}
           placeholder={placeholder}
           placeholderTextColor={isBoxScan ? '#9E9E9E' : '#999'}
@@ -190,6 +250,15 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: 'bold',
     fontSize: 16,
+  },
+  closeRow: {
+    alignSelf: 'flex-end',
+    marginBottom: 8,
+  },
+  closeText: {
+    color: '#1976D2',
+    fontSize: 14,
+    fontWeight: '600',
   },
 });
 

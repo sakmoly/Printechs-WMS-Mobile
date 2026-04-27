@@ -11,7 +11,10 @@ import {
 } from "react-native";
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
+import { getAppVersionDetails } from "../utils/appVersion";
+import { dataService } from "../services/data.service";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
+import BarcodeScanModal from "../components/BarcodeScanModal";
 import { saveSettings, getSettings } from "../services/settings.service";
 import type { ItemMasterSyncMode } from "../types";
 import { apiService } from "../services/api.service";
@@ -32,11 +35,26 @@ import {
 
 export default function SettingsScreen() {
   const navigation = useNavigation();
-  const { refreshSettings, refreshPendingEvents, activeASN, activeSession } = useApp();
+  const {
+    settings,
+    refreshSettings,
+    refreshPendingEvents,
+    refreshDeviceSessionStatus,
+    activeASN,
+    activeSession,
+    setActiveASN,
+    setActiveSession,
+    deviceSessionRestricted,
+    deviceSessionBlockReason,
+  } = useApp();
+
   const [apiUrl, setApiUrl] = useState("");
   const [deviceId, setDeviceId] = useState("");
-  const [userId, setUserId] = useState("");
   const [userCode, setUserCode] = useState("");
+  const [deviceIdScanVisible, setDeviceIdScanVisible] = useState(false);
+  const [clearingTransactionData, setClearingTransactionData] = useState(false);
+  /** 0 = Server Setting, 1 = Data Management, 2 = About */
+  const [settingsTab, setSettingsTab] = useState<0 | 1 | 2>(0);
   const [password, setPassword] = useState("");
   // Demo mode removed from UI - always set to 0 in database
   const [testingConnection, setTestingConnection] = useState(false);
@@ -65,7 +83,9 @@ export default function SettingsScreen() {
     React.useCallback(() => {
       console.log("🔄 SettingsScreen focused - reloading settings from database");
       loadSettings();
-    }, [])
+      refreshSettings();
+      refreshDeviceSessionStatus();
+    }, [refreshDeviceSessionStatus])
   );
 
   const loadSettings = async () => {
@@ -75,15 +95,21 @@ export default function SettingsScreen() {
       console.log("📥 Settings loaded from database:", {
         api_url: settings.api_url || "(empty)",
         device_id: settings.device_id || "(empty)",
-        user_id: settings.user_id || "(empty)",
+        user_id: settings.user_id || settings.user_code || "(empty)",
         demo_mode: settings.demo_mode,
       });
       
       // Always load from database, even if empty string
       setApiUrl(settings.api_url || "");
       setDeviceId(settings.device_id || "");
-      setUserId(settings.user_id || "");
-      setUserCode(settings.user_code || "");
+      {
+        const uid = (settings.user_id || "").trim();
+        const autoUserId = /^USER-\d{6}$/i.test(uid);
+        setUserCode(
+          (settings.user_code || "").trim() ||
+            (uid && !autoUserId ? uid : "")
+        );
+      }
       setPassword(settings.password || "");
       // Demo mode is always disabled (removed from UI)
 
@@ -103,7 +129,6 @@ export default function SettingsScreen() {
       // On error, still set empty values to avoid showing stale data
       setApiUrl("");
       setDeviceId("");
-      setUserId("");
       setUserCode("");
       setPassword("");
     }
@@ -183,7 +208,7 @@ export default function SettingsScreen() {
       console.log("Saving settings:", {
         api_url: trimmedApiUrl || "(empty)",
         device_id: deviceId.trim(),
-        user_id: userId.trim(),
+        user_id: userCode.trim(),
         user_code: userCode.trim(),
         demo_mode: 0, // Always 0 (demo mode disabled)
       });
@@ -197,7 +222,7 @@ export default function SettingsScreen() {
       await saveSettings({
         api_url: trimmedApiUrl.length > 0 ? trimmedApiUrl : null,
         device_id: deviceId.trim().length > 0 ? deviceId.trim() : null,
-        user_id: userId.trim().length > 0 ? userId.trim() : null,
+        user_id: userCode.trim().length > 0 ? userCode.trim() : null,
         user_code: userCode.trim().length > 0 ? userCode.trim() : null,
         password: password && password.length > 0 ? password : null,
         demo_mode: 0, // Always set to 0 (demo mode disabled)
@@ -234,7 +259,7 @@ export default function SettingsScreen() {
       const logData: any = {
         api_url: savedSettings.api_url || "(empty)",
         device_id: savedSettings.device_id,
-        user_id: savedSettings.user_id,
+        user_id: savedSettings.user_id || savedSettings.user_code,
       };
 
       // Only include demo_mode if it's relevant (show as ON/OFF for clarity)
@@ -290,6 +315,13 @@ export default function SettingsScreen() {
   };
 
   const handleSync = async () => {
+    if (deviceSessionRestricted) {
+      Alert.alert(
+        "Device pending approval",
+        "Only account and connection settings are available until an administrator approves this device."
+      );
+      return;
+    }
     if (!apiUrl) {
       Alert.alert("Error", "Please configure API URL first");
       return;
@@ -367,6 +399,13 @@ export default function SettingsScreen() {
 
   /** Full sync: master data + sessions + events + resend receive lines (same as Sync Center). */
   const handleSyncNow = async () => {
+    if (deviceSessionRestricted) {
+      Alert.alert(
+        "Device pending approval",
+        "Full sync is not available until an administrator approves this device."
+      );
+      return;
+    }
     if (!apiUrl?.trim()) {
       Alert.alert("Error", "Please configure and save API URL first.");
       return;
@@ -430,6 +469,64 @@ export default function SettingsScreen() {
         <Text style={styles.title}>Device Settings</Text>
       </View>
 
+      {deviceSessionRestricted ? (
+        <View style={styles.pendingDeviceBanner}>
+          <Text style={styles.pendingDeviceBannerTitle}>
+            {deviceSessionBlockReason === "disabled"
+              ? "Device disabled"
+              : "Device pending approval"}
+          </Text>
+          <Text style={styles.pendingDeviceBannerText}>
+            {deviceSessionBlockReason === "disabled"
+              ? "This device was disabled by an administrator. Only Settings is available. Contact support if this is a mistake."
+              : "Only Settings (connection, credentials, device ID) is available. Ask an administrator to approve this device; the app rechecks every minute."}
+          </Text>
+        </View>
+      ) : null}
+
+      <View style={styles.tabBar}>
+        <TouchableOpacity
+          style={[styles.tabItem, settingsTab === 0 && styles.tabItemActive]}
+          onPress={() => setSettingsTab(0)}
+        >
+          <Text
+            style={[
+              styles.tabItemText,
+              settingsTab === 0 && styles.tabItemTextActive,
+            ]}
+          >
+            Server Setting
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tabItem, settingsTab === 1 && styles.tabItemActive]}
+          onPress={() => setSettingsTab(1)}
+        >
+          <Text
+            style={[
+              styles.tabItemText,
+              settingsTab === 1 && styles.tabItemTextActive,
+            ]}
+          >
+            Data Management
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.tabItem, settingsTab === 2 && styles.tabItemActive]}
+          onPress={() => setSettingsTab(2)}
+        >
+          <Text
+            style={[
+              styles.tabItemText,
+              settingsTab === 2 && styles.tabItemTextActive,
+            ]}
+          >
+            About
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {settingsTab === 0 ? (
       <View style={styles.form}>
         <Text style={styles.label}>API URL</Text>
             <TextInput
@@ -441,31 +538,38 @@ export default function SettingsScreen() {
               keyboardType="url"
             />
 
-            <Text style={styles.label}>Device ID</Text>
+            <Text style={styles.label}>Device ID (server / Asset ID)</Text>
+            <Text style={styles.helpText}>
+              Used for mobile login and device approval. Keep the auto-generated value,
+              or replace with your printed Asset ID. Scan the label to fill this field.
+            </Text>
             <TextInput
               style={styles.input}
               value={deviceId}
               onChangeText={setDeviceId}
-              placeholder="DEVICE-001"
+              placeholder="DEVICE-001 or scanned Asset ID"
               autoCapitalize="characters"
             />
+            <TouchableOpacity
+              style={styles.scanAssetButton}
+              onPress={() => setDeviceIdScanVisible(true)}
+            >
+              <Text style={styles.scanAssetButtonText}>
+                Scan Asset ID barcode
+              </Text>
+            </TouchableOpacity>
 
-            <Text style={styles.label}>User ID</Text>
-            <TextInput
-              style={styles.input}
-              value={userId}
-              onChangeText={setUserId}
-              placeholder="USER-001"
-              autoCapitalize="characters"
-            />
-
-            <Text style={styles.label}>User Code</Text>
+            <Text style={styles.label}>User code (login name)</Text>
+            <Text style={styles.helpText}>
+              Same value is stored for login and for activity fields on the server
+              (previously shown as User ID + User code).
+            </Text>
             <TextInput
               style={styles.input}
               value={userCode}
               onChangeText={setUserCode}
-              placeholder="USER-001"
-              autoCapitalize="characters"
+              placeholder="e.g. sysadmin"
+              autoCapitalize="none"
             />
 
             <Text style={styles.label}>Password</Text>
@@ -575,9 +679,12 @@ export default function SettingsScreen() {
         {apiUrl && (
           <>
             <TouchableOpacity
-              style={[styles.syncButton, syncing && styles.buttonDisabled]}
+              style={[
+                styles.syncButton,
+                (syncing || deviceSessionRestricted) && styles.buttonDisabled,
+              ]}
               onPress={handleSync}
-              disabled={syncing}
+              disabled={syncing || deviceSessionRestricted}
             >
               {syncing ? (
                 <View style={styles.buttonLoading}>
@@ -592,9 +699,13 @@ export default function SettingsScreen() {
               <Text style={styles.userSyncStatusText}>{userSyncStatusLine}</Text>
             ) : null}
             <TouchableOpacity
-              style={[styles.syncNowButton, (syncingFull || syncing) && styles.buttonDisabled]}
+              style={[
+                styles.syncNowButton,
+                (syncingFull || syncing || deviceSessionRestricted) &&
+                  styles.buttonDisabled,
+              ]}
               onPress={handleSyncNow}
-              disabled={syncingFull || syncing}
+              disabled={syncingFull || syncing || deviceSessionRestricted}
             >
               {syncingFull ? (
                 <View style={styles.buttonLoading}>
@@ -610,10 +721,85 @@ export default function SettingsScreen() {
             ) : null}
           </>
         )}
+      </View>
+      ) : settingsTab === 1 ? (
+      <View style={styles.form}>
+        <Text style={styles.dataTabSectionTitle}>Transaction data</Text>
+        <View style={styles.transactionClearZone}>
+          <TouchableOpacity
+            style={[
+              styles.transactionClearButton,
+              clearingTransactionData && styles.buttonDisabled,
+              deviceSessionRestricted && styles.buttonDisabled,
+            ]}
+            disabled={deviceSessionRestricted || clearingTransactionData}
+            onPress={() => {
+              if (deviceSessionRestricted) {
+                Alert.alert(
+                  deviceSessionBlockReason === "disabled"
+                    ? "Device disabled"
+                    : "Device pending approval",
+                  "Data management is not available until this device is allowed to use the warehouse app."
+                );
+                return;
+              }
+              Alert.alert(
+                "Clear All Transaction Data",
+                "This will permanently delete ALL transaction data:\n\n• All events\n• All scanned items\n• All workflow states\n• All carton statuses\n• All boxes\n• All transfer cartons\n• All cartons (CTN)\n• All ASN data\n• All transfer orders\n• All transfer in data\n• All material requests\n• All cycle count sessions\n• All cycle count lines\n• All cycle count cache\n• All stock ledger cache\n• All stock transactions\n• All putaway items\n• All inbound sessions\n• Active ASN and session\n\nMaster data will also be cleared:\n• Items, users, warehouses, locations\n• Bins, item barcode maps\n• Warehouse racks\n\n⚠️ Master data will be automatically repopulated from backend during next sync.\n\nThis action cannot be undone!\n\nSettings and demo data structure will be preserved.\n\nAre you sure?",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Clear All Data",
+                    style: "destructive",
+                    onPress: async () => {
+                      setClearingTransactionData(true);
+                      try {
+                        await dataService.clearAllTransactionData();
+                        setActiveASN(null);
+                        setActiveSession(null);
+                        await refreshSettings();
+                        await refreshPendingEvents();
+                        await loadSettings();
+                        Alert.alert(
+                          "Success",
+                          "All transaction data has been cleared successfully.",
+                          [{ text: "OK" }]
+                        );
+                      } catch (error: any) {
+                        Alert.alert(
+                          "Error",
+                          error.message || "Failed to clear transaction data"
+                        );
+                      } finally {
+                        setClearingTransactionData(false);
+                      }
+                    },
+                  },
+                ]
+              );
+            }}
+          >
+            {clearingTransactionData ? (
+              <View style={{ flexDirection: "row", alignItems: "center" }}>
+                <ActivityIndicator
+                  size="small"
+                  color="#fff"
+                  style={{ marginRight: 10 }}
+                />
+                <Text style={styles.transactionClearButtonText}>
+                  Clearing Data...
+                </Text>
+              </View>
+            ) : (
+              <Text style={styles.transactionClearButtonText}>
+                🗑️ Clear All Transaction Data
+              </Text>
+            )}
+          </TouchableOpacity>
+        </View>
 
+        <Text style={styles.dataTabSectionTitle}>Backup & database</Text>
         <View style={styles.dangerZone}>
-          <Text style={styles.dangerZoneTitle}>⚠️ Data Management</Text>
-
           <TouchableOpacity
             style={[styles.backupButton, backupBusy && styles.buttonDisabled]}
             onPress={async () => {
@@ -843,7 +1029,47 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </View>
       </View>
+      ) : (
+      <View style={styles.form}>
+        <Text style={styles.aboutIntro}>
+          Read-only device and app details (useful for support).
+        </Text>
+        <View
+          style={[styles.runtimeSummaryCard, styles.runtimeSummaryCardInForm]}
+        >
+          <Text style={styles.runtimeSummaryTitle}>Device summary</Text>
+          <Text style={styles.runtimeSummaryLine}>
+            Mode: {settings?.demo_mode ? "Demo" : "Production"}
+          </Text>
+          {(settings?.user_code || settings?.user_id) && (
+            <Text style={styles.runtimeSummaryLine}>
+              User: {settings?.user_code || settings?.user_id}
+            </Text>
+          )}
+          {settings?.device_id ? (
+            <Text style={styles.runtimeSummaryLine}>
+              Device: {settings.device_id}
+            </Text>
+          ) : null}
+          <Text style={styles.runtimeSummaryLine}>
+            Version: {getAppVersionDetails()}
+          </Text>
+        </View>
+      </View>
+      )}
     </ScrollView>
+    <BarcodeScanModal
+      visible={deviceIdScanVisible}
+      title="Scan Asset / Device ID"
+      onClose={() => setDeviceIdScanVisible(false)}
+      onScan={(raw) => {
+        const v = String(raw || "").trim();
+        if (v) {
+          setDeviceId(v.toUpperCase());
+        }
+        setDeviceIdScanVisible(false);
+      }}
+    />
     <ScreenFooterFrame />
     </View>
   );
@@ -864,6 +1090,114 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "#fff",
     marginBottom: 8,
+  },
+  pendingDeviceBanner: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    padding: 14,
+    backgroundColor: "#FFF8E1",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#FFC107",
+  },
+  pendingDeviceBannerTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#BF360C",
+    marginBottom: 6,
+  },
+  pendingDeviceBannerText: {
+    fontSize: 14,
+    color: "#5D4037",
+    lineHeight: 20,
+  },
+  aboutIntro: {
+    fontSize: 13,
+    color: "#666",
+    marginBottom: 12,
+    lineHeight: 18,
+  },
+  runtimeSummaryCard: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    padding: 16,
+    backgroundColor: "#fff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+  },
+  runtimeSummaryTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#333",
+    marginBottom: 10,
+  },
+  runtimeSummaryLine: {
+    fontSize: 14,
+    color: "#666",
+    marginBottom: 4,
+  },
+  runtimeSummaryCardInForm: {
+    marginHorizontal: 0,
+    marginTop: 0,
+  },
+  transactionClearZone: {
+    marginHorizontal: 16,
+    marginTop: 16,
+    padding: 16,
+    backgroundColor: "#fff",
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: "#FF9800",
+  },
+  tabBar: {
+    flexDirection: "row",
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 4,
+    borderRadius: 8,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "#C5CAE9",
+    backgroundColor: "#E8EAF6",
+  },
+  tabItem: {
+    flex: 1,
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tabItemActive: {
+    backgroundColor: "#fff",
+    borderBottomWidth: 2,
+    borderBottomColor: "#007AFF",
+  },
+  tabItemText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#5C6BC0",
+    textAlign: "center",
+  },
+  tabItemTextActive: {
+    color: "#007AFF",
+  },
+  dataTabSectionTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#333",
+    marginBottom: 10,
+    marginTop: 8,
+  },
+  transactionClearButton: {
+    backgroundColor: "#FF9800",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  transactionClearButtonText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "bold",
   },
   form: {
     padding: 24,
@@ -983,6 +1317,21 @@ const styles = StyleSheet.create({
   clearWatermarkText: {
     fontSize: 14,
     color: "#C62828",
+    fontWeight: "600",
+  },
+  scanAssetButton: {
+    alignSelf: "flex-start",
+    marginBottom: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    backgroundColor: "#E3F2FD",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#90CAF9",
+  },
+  scanAssetButtonText: {
+    color: "#1565C0",
+    fontSize: 15,
     fontWeight: "600",
   },
   buttonText: {

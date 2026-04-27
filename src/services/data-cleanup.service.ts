@@ -104,7 +104,7 @@ export const clearDemoData = async () => {
     const mockMRs = ["MR-0001", "MR-0002"];
 
     // Clear demo ASN data
-    const demoDataQueries = [
+    const demoDataQueries: [string, string[]][] = [
       [`DELETE FROM asn_carton_map WHERE asn_no = ?`, [demoASN]],
       [`DELETE FROM transfer_order_cache WHERE asn_no = ?`, [demoASN]],
       [`DELETE FROM box_cache WHERE asn_no = ?`, [demoASN]],
@@ -113,7 +113,9 @@ export const clearDemoData = async () => {
       [`DELETE FROM scanned_items WHERE asn_no = ?`, [demoASN]],
     ];
 
-    for (const [query, params] of demoDataQueries) {
+    for (const row of demoDataQueries) {
+      const query = row[0];
+      const params = row[1];
       try {
         const result = await db.runAsync(query, params);
         if (result.changes && result.changes > 0) {

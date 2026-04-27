@@ -25,6 +25,7 @@ export const PickingTheme = {
     statusPending: "#FF9800",
     statusPartial: "#2196F3",
     statusDone: "#4CAF50",
+    statusWarning: "#FB8C00",
     
     // Background colors
     backgroundLight: "#F5F5F5",

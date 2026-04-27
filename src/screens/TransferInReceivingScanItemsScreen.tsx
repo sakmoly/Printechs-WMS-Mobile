@@ -438,7 +438,9 @@ export default function TransferInReceivingScanItemsScreen() {
           box.box_id &&
           box.box_id !== "" &&
           box.box_id !== null &&
-          (box.status === "Open" || box.status === "OPEN" || box.status === "open" || box.status === "")
+          (box.status === "Open" ||
+            box.status === "OPEN" ||
+            box.status === "open")
       );
       
       setAvailableBoxes(validBoxes);
@@ -500,6 +502,10 @@ export default function TransferInReceivingScanItemsScreen() {
         status: "Open",
         purpose: "PUTAWAY",
         updated_on: new Date().toISOString(),
+        created_by:
+          String(settings.user_id || "").trim() ||
+          String(settings.user_code || "").trim() ||
+          null,
       };
 
       await dataService.saveBox(newBox);

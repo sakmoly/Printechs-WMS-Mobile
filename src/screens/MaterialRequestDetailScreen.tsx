@@ -34,11 +34,11 @@ export default function MaterialRequestDetailScreen() {
   const [loading, setLoading] = useState(false);
   const [stockModalVisible, setStockModalVisible] = useState(false);
   const [stockData, setStockData] = useState<
-    Array<{
+    {
       location_id: string;
       qty: number;
-      cartons?: Array<{ carton_id: string; qty: number }>;
-    }>
+      cartons?: { carton_id: string; qty: number }[];
+    }[]
   >([]);
   const [loadingStock, setLoadingStock] = useState(false);
   const [selectedItemCode, setSelectedItemCode] = useState<string>("");
@@ -1568,11 +1568,11 @@ export default function MaterialRequestDetailScreen() {
 
       console.log(`📦 Detected format: ${isGroupedFormat ? "Grouped (bin_location + cartons)" : isFlatFormatWithCartonId ? "Flat (location_id + carton_id)" : "Legacy (location_id + qty)"}`);
 
-      let formattedStock: Array<{
+      let formattedStock: {
         location_id: string;
         qty: number;
-        cartons?: Array<{ carton_id: string; qty: number }>;
-      }> = [];
+        cartons?: { carton_id: string; qty: number }[];
+      }[] = [];
 
       if (isGroupedFormat) {
         // New grouped format: { bin_location, cartons: [{ carton_id, qty }], total_qty }
@@ -1629,7 +1629,7 @@ export default function MaterialRequestDetailScreen() {
         const locationMap = new Map<string, {
           location_id: string;
           qty: number;
-          cartons: Array<{ carton_id: string; qty: number }>;
+          cartons: { carton_id: string; qty: number }[];
         }>();
 
         stockEntries.forEach((entry) => {

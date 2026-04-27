@@ -1,30 +1,33 @@
 /**
- * Logger utility - Only shows errors
- * All console.log, console.warn, console.info, and console.debug statements are suppressed
- * Only console.error will be displayed
+ * Console noise control for React Native.
+ * - Production: suppress log / info / debug / warn (keep errors).
+ * - Dev: suppress log / info / debug / warn (keep errors).
+ *
+ * Import this module as early as possible in App.tsx (right after gesture-handler).
  */
 
-// Store original console methods
 const originalLog = console.log;
 const originalWarn = console.warn;
 const originalInfo = console.info;
 const originalDebug = console.debug;
 
-// Override console.log to do nothing (suppress info logs)
-console.log = () => {};
+const noop = () => {};
 
-// Override console.warn to do nothing (suppress warning logs)
-console.warn = () => {};
+const isDev = typeof __DEV__ !== "undefined" && __DEV__;
 
-// Override console.info to do nothing (suppress info logs)
-console.info = () => {};
+if (isDev) {
+  console.log = noop;
+  console.info = noop;
+  console.debug = noop;
+  console.warn = noop;
+} else {
+  console.log = noop;
+  console.info = noop;
+  console.debug = noop;
+  console.warn = noop;
+}
 
-// Override console.debug to do nothing (suppress debug logs)
-console.debug = () => {};
-
-// Keep console.error as-is (only errors will show)
-
-// Export a function to restore logging if needed (for debugging)
+/** Restore full console (e.g. temporary debugging). */
 export const enableVerboseLogging = () => {
   console.log = originalLog;
   console.warn = originalWarn;
@@ -32,11 +35,17 @@ export const enableVerboseLogging = () => {
   console.debug = originalDebug;
 };
 
-// Export a function to disable logging again
+/** Re-apply suppression (matches current dev/prod rules). */
 export const disableVerboseLogging = () => {
-  console.log = () => {};
-  console.warn = () => {};
-  console.info = () => {};
-  console.debug = () => {};
+  if (isDev) {
+    console.log = noop;
+    console.warn = noop;
+    console.info = noop;
+    console.debug = noop;
+  } else {
+    console.log = noop;
+    console.warn = noop;
+    console.info = noop;
+    console.debug = noop;
+  }
 };
-

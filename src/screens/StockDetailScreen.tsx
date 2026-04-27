@@ -16,10 +16,10 @@ import { StockLedger, StockTransaction } from "../types";
 // New grouped format interface
 interface StockLocationGroup {
   bin_location: string;
-  cartons: Array<{
+  cartons: {
     carton_id: string;
     qty: number;
-  }>;
+  }[];
   total_qty: number;
 }
 

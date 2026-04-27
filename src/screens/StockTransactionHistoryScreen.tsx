@@ -247,7 +247,9 @@ export default function StockTransactionHistoryScreen() {
         ) : (
           <FlatList
             data={transactions}
-            keyExtractor={(item) => item.transaction_id}
+            keyExtractor={(item, index) =>
+              String(item.transaction_id ?? item.id ?? `${item.item_code}-${index}`)
+            }
             renderItem={renderTransaction}
             refreshing={refreshing}
             onRefresh={handleRefresh}

@@ -1,4 +1,6 @@
 import { getDatabase } from "../database/database";
+import { apiService } from "./api.service";
+import { mergeCartonLinesFromAsnPayload } from "../utils/merge-asn-payload-into-carton-map";
 import {
   ASNItem,
   TransferOrderAllocation,
@@ -9,14 +11,32 @@ import {
   PutAwayItem,
   WarehouseRack,
 } from "../types";
-import { normalizeASN } from "../utils/asn";
+import { normalizeASN, getASNFormatVariations } from "../utils/asn";
+import { storeCodesMatchForTO } from "../utils/box-id";
+
+/** Values to match scanned_items.asn_no against active ASN (padding, case, legacy formats). */
+function asnMatchValuesForQuery(asn_no: string): string[] {
+  const raw = String(asn_no || "").trim();
+  if (!raw) return [];
+  const set = new Set<string>();
+  for (const v of [
+    raw,
+    normalizeASN(raw),
+    ...getASNFormatVariations(raw),
+  ]) {
+    if (!v) continue;
+    const t = v.trim();
+    set.add(t.toUpperCase());
+  }
+  return Array.from(set);
+}
 
 // Mutex to prevent concurrent database operations
-let dbOperationQueue: Array<{
+let dbOperationQueue: {
   operation: () => Promise<any>;
   resolve: (value: any) => void;
   reject: (error: any) => void;
-}> = [];
+}[] = [];
 let isProcessingDbOperation = false;
 
 // Process database operation queue
@@ -98,7 +118,7 @@ const withRetry = async <T>(
 export const dataService = {
   // ASN Operations
   getAllASNs: async (): Promise<
-    Array<{
+    {
       asn_no: string;
       status?: string;
       purchase_order?: string;
@@ -114,7 +134,7 @@ export const dataService = {
       updated_on: string;
       total_cartons?: number;
       total_pieces?: number;
-    }>
+    }[]
   > => {
     return withRetry(async () => {
       const db = await getDatabase();
@@ -435,7 +455,7 @@ export const dataService = {
 
   getASNCartonsWithPieces: async (
     asn_no: string
-  ): Promise<Array<{ carton_id: string; total_pieces: number }>> => {
+  ): Promise<{ carton_id: string; total_pieces: number }[]> => {
     return withRetry(async () => {
       const db = await getDatabase();
       if (!db) throw new Error("Database not initialized");
@@ -458,7 +478,7 @@ export const dataService = {
   // Get boxes for a Transfer Carton
   getBoxesForTC: async (
     tc_id: string
-  ): Promise<Array<{ box_id: string; store: string }>> => {
+  ): Promise<{ box_id: string; store: string }[]> => {
     return withRetry(async () => {
       const db = await getDatabase();
       if (!db) throw new Error("Database not initialized");
@@ -598,7 +618,7 @@ export const dataService = {
       // Group by carton for display
       const cartonGroups: Record<
         string,
-        Array<{ item_code: string; shipped_qty: number }>
+        { item_code: string; shipped_qty: number }[]
       > = {};
       allCartons.forEach((c) => {
         if (!cartonGroups[c.carton_id]) {
@@ -622,14 +642,14 @@ export const dataService = {
       
       // Try with original format FIRST
       let items = await db.getAllAsync<ASNItem>(
-        "SELECT * FROM asn_carton_map WHERE asn_no = ? AND carton_id = ?",
+        "SELECT * FROM asn_carton_map WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND UPPER(TRIM(carton_id)) = UPPER(TRIM(?)) AND UPPER(TRIM(item_code)) <> 'PLACEHOLDER'",
         [asn_no, normalizedCartonId]
       );
       
       // If no results and ASN was normalized, try with normalized format for backward compatibility
       if (items.length === 0 && asn_no !== normalizedASN) {
         items = await db.getAllAsync<ASNItem>(
-          "SELECT * FROM asn_carton_map WHERE asn_no = ? AND carton_id = ?",
+          "SELECT * FROM asn_carton_map WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND UPPER(TRIM(carton_id)) = UPPER(TRIM(?)) AND UPPER(TRIM(item_code)) <> 'PLACEHOLDER'",
           [normalizedASN, normalizedCartonId]
         );
       }
@@ -662,19 +682,118 @@ export const dataService = {
       );
       
       if (items.length === 0) {
-        console.error(
-          `❌ getCartonItems: No items found for carton ${normalizedCartonId} in ASN ${asn_no}!`
+        console.warn(
+          `⚠️ getCartonItems: No items found for carton ${normalizedCartonId} in ASN ${asn_no}.`
         );
-        console.error(
-          `   Available cartons in DB: ${Object.keys(cartonGroups).join(", ")}`
+        console.warn(
+          `   Available cartons in DB: ${Object.keys(cartonGroups).join(", ") || "(none)"}`
         );
-        console.error(
+        console.warn(
           `   Tried ASN formats: ${asn_no}${asn_no !== normalizedASN ? `, ${normalizedASN}` : ""}`
         );
       }
       
       return items;
     });
+  },
+
+  /**
+   * When local `asn_carton_map` has no lines for this carton, fetch GET /api/asn and merge
+   * lines for the given carton (same payload rules as Box Management). Heals second-device gaps when online.
+   */
+  hydrateCartonLinesFromAsnApi: async (
+    asn_no: string,
+    carton_id: string
+  ): Promise<{ ok: boolean; reason?: string }> => {
+    const trimmedAsn = String(asn_no || "").trim();
+    const trimmedCarton = String(carton_id || "").trim();
+    if (!trimmedAsn || !trimmedCarton) {
+      return { ok: false, reason: "Missing ASN or carton id" };
+    }
+    try {
+      const db = await getDatabase();
+      if (!db) return { ok: false, reason: "Database not initialized" };
+      const normalizedASN = normalizeASN(trimmedAsn);
+      const cartonUpper = trimmedCarton.toUpperCase();
+      const cachedAsn = await db.getFirstAsync<{ payload_json?: string | null }>(
+        `SELECT payload_json
+         FROM asn_cache
+         WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?))
+            OR UPPER(TRIM(asn_no)) = UPPER(TRIM(?))
+            OR UPPER(TRIM(asn_no_original)) = UPPER(TRIM(?))
+            OR UPPER(TRIM(asn_no_original)) = UPPER(TRIM(?))
+         LIMIT 1`,
+        [trimmedAsn, normalizedASN, trimmedAsn, normalizedASN]
+      );
+      if (cachedAsn?.payload_json) {
+        const mergedFromCache = await mergeCartonLinesFromAsnPayload(
+          db,
+          trimmedAsn,
+          normalizedASN,
+          cartonUpper,
+          { payload_json: cachedAsn.payload_json }
+        );
+        if (mergedFromCache) {
+          console.log(
+            `✅ hydrateCartonLinesFromAsnApi: merged lines for ${cartonUpper} from local ASN cache`
+          );
+          return { ok: true };
+        }
+      }
+
+      let payload: Record<string, unknown> | null = null;
+      try {
+        payload = (await apiService.getASN(trimmedAsn)) as Record<
+          string,
+          unknown
+        >;
+      } catch (asnError: any) {
+        console.warn(
+          "⚠️ hydrateCartonLinesFromAsnApi: GET /api/asn failed, trying /api/master/asns:",
+          asnError?.message || asnError
+        );
+        const masterPayload = await apiService.pullASNData();
+        const list = Array.isArray(masterPayload)
+          ? masterPayload
+          : Array.isArray(masterPayload?.data)
+            ? masterPayload.data
+            : Array.isArray(masterPayload?.asns)
+              ? masterPayload.asns
+              : [];
+        payload =
+          list.find((row: any) => {
+            const rowAsn = String(
+              row?.asn_no || row?.advance_shipping_notice || ""
+            ).trim();
+            return (
+              rowAsn.toUpperCase() === trimmedAsn.toUpperCase() ||
+              normalizeASN(rowAsn) === normalizedASN
+            );
+          }) || null;
+      }
+      const merged = await mergeCartonLinesFromAsnPayload(
+        db,
+        trimmedAsn,
+        normalizedASN,
+        cartonUpper,
+        payload
+      );
+      if (!merged) {
+        return {
+          ok: false,
+          reason:
+            "Server returned no line items for this carton (check API payload / carton id).",
+        };
+      }
+      console.log(
+        `✅ hydrateCartonLinesFromAsnApi: merged lines for ${cartonUpper} under ASN ${trimmedAsn}`
+      );
+      return { ok: true };
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      console.warn("⚠️ hydrateCartonLinesFromAsnApi failed:", msg);
+      return { ok: false, reason: msg };
+    }
   },
 
   // Check if carton belongs to ASN (with ASN normalization)
@@ -790,6 +909,76 @@ export const dataService = {
     });
   },
 
+  /**
+   * Supplier unload list: same as getASNCartons but drops carton IDs that exist only as
+   * mobile PLACEHOLDER rows yet duplicate a distribution STORE box_id (physical BOX barcode).
+   * Those belong to Receive + Sort / Box Management only, not supplier carton unload.
+   */
+  getASNCartonsForUnload: async (asn_no: string): Promise<string[]> => {
+    return withRetry(async () => {
+      const db = await getDatabase();
+      if (!db) throw new Error("Database not initialized");
+
+      const base = await dataService.getASNCartons(asn_no);
+      if (base.length === 0) return base;
+
+      const normalizedASN = normalizeASN(asn_no);
+
+      const excludeRows = await db.getAllAsync<{ carton_id: string }>(
+        `
+        SELECT m.carton_id AS carton_id
+        FROM asn_carton_map m
+        INNER JOIN box_cache b
+          ON UPPER(TRIM(b.box_id)) = UPPER(TRIM(m.carton_id))
+          AND (
+            UPPER(TRIM(b.asn_no)) = UPPER(TRIM(?))
+            OR UPPER(TRIM(b.asn_no)) = UPPER(TRIM(?))
+          )
+        WHERE (
+            UPPER(TRIM(m.asn_no)) = UPPER(TRIM(?))
+            OR UPPER(TRIM(m.asn_no)) = UPPER(TRIM(?))
+          )
+          AND COALESCE(b.purpose, 'STORE') = 'STORE'
+        GROUP BY m.carton_id
+        HAVING SUM(
+          CASE
+            WHEN UPPER(TRIM(m.item_code)) = 'PLACEHOLDER'
+             AND IFNULL(m.shipped_qty, 0) = 0 THEN 0
+            ELSE 1
+          END
+        ) = 0
+        `,
+        [asn_no, normalizedASN, asn_no, normalizedASN]
+      );
+
+      const exclude = new Set(
+        (excludeRows || []).map((r) => String(r.carton_id || "").trim().toUpperCase())
+      );
+      const filtered = base.filter(
+        (cid) => !exclude.has(String(cid || "").trim().toUpperCase())
+      );
+
+      if (filtered.length !== base.length) {
+        console.warn(
+          `📦 getASNCartonsForUnload: excluded ${base.length - filtered.length} carton ID(s) ` +
+            `(PLACEHOLDER-only rows matching a STORE box — not supplier unload cartons)`
+        );
+      }
+
+      return filtered;
+    });
+  },
+
+  /** True if this carton should appear / be scanned on supplier Unload (Scan Supplier Carton). */
+  isCartonValidForSupplierUnload: async (
+    asn_no: string,
+    carton_id: string
+  ): Promise<boolean> => {
+    const ids = await dataService.getASNCartonsForUnload(asn_no);
+    const u = String(carton_id || "").trim().toUpperCase();
+    return ids.some((id) => String(id).trim().toUpperCase() === u);
+  },
+
   // Transfer Order Operations
   getTransferOrderAllocations: async (
     asn_no: string,
@@ -806,7 +995,7 @@ export const dataService = {
           "SELECT * FROM transfer_order_cache WHERE asn_no = ? AND store = ?",
           [asn_no, store]
         );
-        
+
         // If no results and ASN was normalized, try with normalized format (for backward compatibility)
         if (results.length === 0 && asn_no !== normalizedASN) {
           results = await db.getAllAsync<TransferOrderAllocation>(
@@ -814,7 +1003,24 @@ export const dataService = {
             [normalizedASN, store]
           );
         }
-        
+
+        // SQL uses exact store string; TO sync may use different hyphen/spacing than box_cache.
+        if (results.length === 0) {
+          let allForAsn = await db.getAllAsync<TransferOrderAllocation>(
+            "SELECT * FROM transfer_order_cache WHERE asn_no = ?",
+            [asn_no]
+          );
+          if (allForAsn.length === 0 && asn_no !== normalizedASN) {
+            allForAsn = await db.getAllAsync<TransferOrderAllocation>(
+              "SELECT * FROM transfer_order_cache WHERE asn_no = ?",
+              [normalizedASN]
+            );
+          }
+          results = allForAsn.filter((row) =>
+            storeCodesMatchForTO(row.store, store)
+          );
+        }
+
         return results;
       }
       
@@ -833,6 +1039,20 @@ export const dataService = {
       }
       
       return results;
+    });
+  },
+
+  /** Distinct `warehouse_store_cache.code` rows for TO store validation / normalization. */
+  getWarehouseStoreMasterRows: async (): Promise<{ code: string }[]> => {
+    return withRetry(async () => {
+      const db = await getDatabase();
+      if (!db) return [];
+      const rows = await db.getAllAsync<{ code: string }>(
+        `SELECT DISTINCT TRIM(code) AS code FROM warehouse_store_cache 
+         WHERE code IS NOT NULL AND TRIM(code) != '' 
+         ORDER BY code`
+      );
+      return rows || [];
     });
   },
 
@@ -891,8 +1111,8 @@ export const dataService = {
 
                 await db.runAsync(
                   `INSERT OR IGNORE INTO box_cache 
-                   (box_id, asn_no, to_no, store, status, purpose, updated_on) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                   (box_id, asn_no, to_no, store, status, purpose, updated_on, created_by) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                   [
                     scannedBox.box_id,
                     boxASN,
@@ -901,6 +1121,7 @@ export const dataService = {
                     "Open", // Default status for boxes created from scanned items
                     purpose || "STORE",
                     new Date().toISOString(),
+                    null,
                   ]
                 );
                 console.log(
@@ -1011,16 +1232,33 @@ export const dataService = {
   saveBox: async (box: Box) => {
     const db = await getDatabase();
     const purpose = box.purpose || "STORE";
+    let createdBy: string | null =
+      box.created_by !== undefined && box.created_by !== null
+        ? String(box.created_by).trim() || null
+        : null;
+    if (box.created_by === undefined) {
+      try {
+        const existing = await db.getFirstAsync<{ created_by: string | null }>(
+          "SELECT created_by FROM box_cache WHERE box_id = ?",
+          [box.box_id]
+        );
+        if (existing?.created_by != null && String(existing.created_by).trim())
+          createdBy = String(existing.created_by).trim();
+      } catch {
+        /* ignore */
+      }
+    }
     await db.runAsync(
-      "INSERT OR REPLACE INTO box_cache (box_id, asn_no, to_no, store, status, purpose, updated_on) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO box_cache (box_id, asn_no, to_no, store, status, purpose, updated_on, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [
         box.box_id,
         box.asn_no,
-        box.to_no,
+        box.to_no ?? "",
         box.store,
         box.status,
         purpose,
         box.updated_on,
+        createdBy,
       ]
     );
   },
@@ -1035,7 +1273,7 @@ export const dataService = {
 
   // Transfer Carton Operations
   getTransferCartons: async (
-    asn_no?: string,
+    asn_no?: string | null,
     store?: string
   ): Promise<TransferCarton[]> => {
     return withRetry(async () => {
@@ -1150,7 +1388,14 @@ export const dataService = {
       
       await db.runAsync(
         "INSERT OR REPLACE INTO tc_cache (tc_id, asn_no, to_no, store, status, updated_on) VALUES (?, ?, ?, ?, ?, ?)",
-        [tc.tc_id, tc.asn_no, tc.to_no, tc.store, tc.status, tc.updated_on]
+        [
+          tc.tc_id,
+          tc.asn_no,
+          tc.to_no ?? "",
+          tc.store,
+          tc.status,
+          tc.updated_on ?? new Date().toISOString(),
+        ]
       );
       
       // Verify it was saved
@@ -1311,14 +1556,40 @@ export const dataService = {
     // Normalize status: Convert "In Receiving" (with space) to "Receiving" (without space) for local storage
     // This ensures consistency in the local database regardless of what format comes from API or desktop sync
     const normalizedStatus = status.status === "In Receiving" ? "Receiving" : status.status;
+
+    const existing = await db.getFirstAsync<CartonStatus>(
+      "SELECT * FROM carton_status_cache WHERE asn_no = ? AND inbound_session = ? AND carton_id = ?",
+      [status.asn_no, status.inbound_session, status.carton_id]
+    );
+
+    const mergedLockedBy =
+      status.locked_by !== undefined
+        ? status.locked_by || null
+        : existing?.locked_by ?? null;
+    const mergedLockedOn =
+      status.locked_on !== undefined
+        ? status.locked_on || null
+        : existing?.locked_on ?? null;
+
+    // Preserve dock unload actor across status-only updates (Receiving, ASN reconcile, etc.).
+    // Previously mergedUnloadedBy stayed null when status !== "Unloaded", which cleared the column.
+    let mergedUnloadedBy: string | null = null;
+    if (status.unloaded_by !== undefined) {
+      const t = String(status.unloaded_by ?? "").trim();
+      mergedUnloadedBy = t.length > 0 ? t : null;
+    } else if (existing?.unloaded_by) {
+      const t = String(existing.unloaded_by).trim();
+      mergedUnloadedBy = t.length > 0 ? t : null;
+    }
     
     const params = [
         status.asn_no,
         status.inbound_session,
         status.carton_id,
         normalizedStatus, // Use normalized status for storage
-        status.locked_by || null,
-        status.locked_on || null,
+        mergedLockedBy,
+        mergedLockedOn,
+        mergedUnloadedBy,
         status.updated_on,
     ];
 
@@ -1333,8 +1604,8 @@ export const dataService = {
 
     await db.runAsync(
       `INSERT OR REPLACE INTO carton_status_cache 
-       (asn_no, inbound_session, carton_id, status, locked_by, locked_on, updated_on) 
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (asn_no, inbound_session, carton_id, status, locked_by, locked_on, unloaded_by, updated_on) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       params
     );
 
@@ -1391,7 +1662,7 @@ export const dataService = {
       
       // If no results, try with just normalized format (backward compatibility)
       if (results.length === 0 && asn_no !== normalizedASN) {
-        const normalizedQuery = "SELECT * FROM scanned_items WHERE asn_no = ?";
+        let normalizedQuery = "SELECT * FROM scanned_items WHERE asn_no = ?";
         const normalizedParams: any[] = [normalizedASN];
         
         if (inbound_session) {
@@ -1414,14 +1685,23 @@ export const dataService = {
     });
   },
 
-  getScannedItemsByBox: async (box_id: string) => {
+  getScannedItemsByBox: async (box_id: string, asn_no?: string | null) => {
     return withRetry(async () => {
       const db = await getDatabase();
       if (!db) throw new Error("Database not initialized");
-      return await db.getAllAsync(
-        "SELECT * FROM scanned_items WHERE box_id = ? ORDER BY scanned_on DESC",
-        [box_id]
-      );
+      let sql =
+        "SELECT * FROM scanned_items WHERE UPPER(TRIM(box_id)) = UPPER(TRIM(?))";
+      const params: unknown[] = [box_id];
+      if (asn_no) {
+        const asnKeys = asnMatchValuesForQuery(asn_no);
+        if (asnKeys.length > 0) {
+          const placeholders = asnKeys.map(() => "?").join(",");
+          sql += ` AND UPPER(TRIM(asn_no)) IN (${placeholders})`;
+          params.push(...asnKeys);
+        }
+      }
+      sql += " ORDER BY scanned_on DESC";
+      return await db.getAllAsync(sql, params as string[]);
     });
   },
 
@@ -1437,30 +1717,69 @@ export const dataService = {
     });
   },
 
-  getUnitsScannedForBoxes: async (boxIds: string[]): Promise<Map<string, number>> => {
+  /**
+   * Sum scanned_qty per box_id for Box Management.
+   * - Case-insensitive box_id match (same as Receive + Sort canonical vs scan).
+   * - When asn_no is set, restrict to that ASN (both raw + normalized forms) so totals match Receive + Sort.
+   */
+  getUnitsScannedForBoxes: async (
+    boxIds: string[],
+    asn_no?: string | null
+  ): Promise<Map<string, number>> => {
     if (boxIds.length === 0) return new Map();
-    
+
     return withRetry(async () => {
       const db = await getDatabase();
       if (!db) throw new Error("Database not initialized");
-      
-      const placeholders = boxIds.map(() => "?").join(",");
-      const results = await db.getAllAsync<{ box_id: string; total_units: number }>(
-        `SELECT box_id, COALESCE(SUM(scanned_qty), 0) as total_units 
-         FROM scanned_items 
-         WHERE box_id IN (${placeholders})
-         GROUP BY box_id`,
-        boxIds
-      );
-      
+
       const unitsMap = new Map<string, number>();
-      // Initialize all boxes with 0
-      boxIds.forEach(boxId => unitsMap.set(boxId, 0));
-      // Update with actual counts
-      results.forEach(result => {
-        unitsMap.set(result.box_id, result.total_units || 0);
+      boxIds.forEach((id) => unitsMap.set(id, 0));
+
+      const uniqUpper = [
+        ...new Set(
+          boxIds
+            .map((id) => String(id || "").trim().toUpperCase())
+            .filter(Boolean)
+        ),
+      ];
+      if (uniqUpper.length === 0) return unitsMap;
+
+      const placeholders = uniqUpper.map(() => "?").join(",");
+      let sql = `
+        SELECT UPPER(TRIM(box_id)) AS uk, COALESCE(SUM(scanned_qty), 0) AS total_units
+        FROM scanned_items
+        WHERE box_id IS NOT NULL AND TRIM(box_id) != ''
+          AND UPPER(TRIM(box_id)) IN (${placeholders})
+      `;
+      const params: unknown[] = [...uniqUpper];
+
+      if (asn_no) {
+        const asnKeys = asnMatchValuesForQuery(asn_no);
+        if (asnKeys.length > 0) {
+          const aph = asnKeys.map(() => "?").join(",");
+          sql += ` AND UPPER(TRIM(asn_no)) IN (${aph})`;
+          params.push(...asnKeys);
+        }
+      }
+
+      sql += ` GROUP BY UPPER(TRIM(box_id))`;
+
+      const rows = await db.getAllAsync<{ uk: string; total_units: number }>(
+        sql,
+        params as string[]
+      );
+
+      const totalsByUpper = new Map<string, number>();
+      rows.forEach((r) => {
+        const key = String(r.uk || "").trim().toUpperCase();
+        totalsByUpper.set(key, r.total_units || 0);
       });
-      
+
+      boxIds.forEach((id) => {
+        const lookup = String(id || "").trim().toUpperCase();
+        unitsMap.set(id, totalsByUpper.get(lookup) ?? 0);
+      });
+
       return unitsMap;
     });
   },
@@ -1583,8 +1902,8 @@ export const dataService = {
       );
       
       return {
-        events: events?.count || 0,
-        scannedItems: scannedItems?.count || 0,
+        events: events[0]?.count || 0,
+        scannedItems: scannedItems[0]?.count || 0,
         cartonStatuses: cartonStatuses?.count || 0,
         boxes: boxes?.count || 0,
         transferCartons: tcs?.count || 0,
@@ -2157,14 +2476,20 @@ export const dataService = {
 
     // Get received cartons from cache (try normalized and original ASN format)
     const receivedCartonsNormalized = await db.getAllAsync<{ carton_id: string }>(
-      "SELECT DISTINCT carton_id FROM carton_status_cache WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND inbound_session = ? AND (status = ? OR status = ?)",
-      [normalizedASN, inbound_session, "Received", "RECEIVED"]
+      `SELECT DISTINCT carton_id FROM carton_status_cache
+       WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?))
+         AND inbound_session = ?
+         AND UPPER(TRIM(status)) IN ('RECEIVED', 'RECEIVED WITH SHORTAGE')`,
+      [normalizedASN, inbound_session]
     );
     let receivedCartons = receivedCartonsNormalized;
     if (receivedCartons.length === 0 && asn_no !== normalizedASN) {
       receivedCartons = await db.getAllAsync<{ carton_id: string }>(
-        "SELECT DISTINCT carton_id FROM carton_status_cache WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?)) AND inbound_session = ? AND (status = ? OR status = ?)",
-        [asn_no, inbound_session, "Received", "RECEIVED"]
+        `SELECT DISTINCT carton_id FROM carton_status_cache
+         WHERE UPPER(TRIM(asn_no)) = UPPER(TRIM(?))
+           AND inbound_session = ?
+           AND UPPER(TRIM(status)) IN ('RECEIVED', 'RECEIVED WITH SHORTAGE')`,
+        [asn_no, inbound_session]
       );
     }
 
@@ -2184,9 +2509,10 @@ export const dataService = {
       [normalizedASN, asn_no, inbound_session]
     );
     if (allInSession.length === 0) return false;
-    const allReceivedStatus = allInSession.every(
-      (r) => r.status === "Received" || r.status === "RECEIVED"
-    );
+    const allReceivedStatus = allInSession.every((r) => {
+      const status = String(r.status || "").trim().toUpperCase();
+      return status === "RECEIVED" || status === "RECEIVED WITH SHORTAGE";
+    });
     return allReceivedStatus;
   },
 
@@ -2577,7 +2903,7 @@ export const dataService = {
       }
 
       // Check if table exists first
-      let tableInfo: Array<{ name: string }> = [];
+      let tableInfo: { name: string }[] = [];
       try {
         tableInfo = await db.getAllAsync<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='inbound_sessions'"
@@ -2718,7 +3044,7 @@ export const dataService = {
   },
 
   getUnsyncedSessions: async (): Promise<
-    Array<{
+    {
       inbound_session: string;
       asn_no: string;
       transfer_order: string | null;
@@ -2730,7 +3056,7 @@ export const dataService = {
       started_on: string | null;
       completed_on: string | null;
       updated_on: string;
-    }>
+    }[]
   > => {
     try {
       const db = await getDatabase();
@@ -2741,7 +3067,7 @@ export const dataService = {
       }
 
       // Check if table exists first
-      let tableInfo: Array<{ name: string }> = [];
+      let tableInfo: { name: string }[] = [];
       try {
         tableInfo = await db.getAllAsync<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='inbound_sessions'"
@@ -2847,7 +3173,7 @@ export const dataService = {
     device_id: string,
     user_id: string
   ): Promise<
-    Array<{
+    {
       inbound_session: string;
       asn_no: string;
       transfer_order: string | null;
@@ -2859,7 +3185,7 @@ export const dataService = {
       started_on: string | null;
       completed_on: string | null;
       updated_on: string;
-    }>
+    }[]
   > => {
     try {
       const db = await getDatabase();
@@ -2870,7 +3196,7 @@ export const dataService = {
       }
 
       // Check if table exists first
-      let tableInfo: Array<{ name: string }> = [];
+      let tableInfo: { name: string }[] = [];
       try {
         tableInfo = await db.getAllAsync<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='inbound_sessions'"
@@ -2938,7 +3264,7 @@ export const dataService = {
       }
 
       // Check if table exists first
-      let tableInfo: Array<{ name: string }> = [];
+      let tableInfo: { name: string }[] = [];
       try {
         tableInfo = await db.getAllAsync<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='inbound_sessions'"

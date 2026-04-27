@@ -2,16 +2,88 @@ import { getDatabase } from "../database/database";
 import { runDbWrite } from "../database/dbQueue";
 import { Settings } from "../types";
 import * as SQLite from "expo-sqlite";
+import { File, Paths } from "expo-file-system";
+import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_API_URL, DEFAULT_DEMO_MODE } from "../config/default-settings";
 
-// Generate a unique device ID
-const generateDeviceId = (): string => {
-  const timestamp = Date.now().toString().slice(-6);
-  const random = Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `DEV-${random}-${timestamp}`;
-};
+/** Persists across app restarts so device_id does not change if SQLite row is recreated. */
+const INSTALL_DEVICE_ID_FILE = "printechs_wms_install_device_id.txt";
 
-// Generate a unique user ID
+const DEV_ID_PATTERN = /^DEV-[A-Z0-9]{4}-[A-Z0-9]{6}$/i;
+
+function formatStableDevIdFromUuidHex(hexNoHyphens: string): string {
+  const h = hexNoHyphens.replace(/-/g, "").toUpperCase();
+  if (h.length < 10) {
+    const pad = `${h}00000000000000000000000000000000`.slice(0, 32);
+    return `DEV-${pad.slice(0, 4)}-${pad.slice(-6)}`;
+  }
+  return `DEV-${h.slice(0, 4)}-${h.slice(-6)}`;
+}
+
+function installDeviceIdFile(): File {
+  return new File(Paths.document, INSTALL_DEVICE_ID_FILE);
+}
+
+async function readInstallDeviceIdFile(): Promise<string | null> {
+  try {
+    const file = installDeviceIdFile();
+    if (!file.exists) return null;
+    const txt = (await file.text()).trim();
+    if (DEV_ID_PATTERN.test(txt)) return txt.toUpperCase();
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+async function writeInstallDeviceIdFile(id: string): Promise<void> {
+  try {
+    const file = installDeviceIdFile();
+    if (!file.exists) {
+      file.create({ intermediates: true });
+    }
+    file.write(id);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Prefer on-disk backup (e.g. SQLite row cleared); else new UUID-based DEV id (file written after DB save). */
+async function loadOrCreateStableInstallDeviceId(): Promise<string> {
+  const fromFile = await readInstallDeviceIdFile();
+  if (fromFile) return fromFile;
+  return formatStableDevIdFromUuidHex(uuidv4().replace(/-/g, ""));
+}
+
+let deviceIdBootstrapPromise: Promise<string> | null = null;
+
+/**
+ * When settings have no device_id, assign one stable value, persist to DB (awaited), and
+ * dedupe concurrent callers so two parallel getSettings() cannot create two IDs.
+ */
+async function ensureStableDeviceIdPersisted(): Promise<string> {
+  if (!deviceIdBootstrapPromise) {
+    deviceIdBootstrapPromise = (async () => {
+      try {
+        const db = await getDatabase();
+        const row = await db.getFirstAsync<Settings>(
+          "SELECT device_id FROM settings LIMIT 1"
+        );
+        const existing = String(row?.device_id ?? "").trim();
+        if (existing) return existing;
+        const stable = await loadOrCreateStableInstallDeviceId();
+        await saveSettings({ device_id: stable });
+        await writeInstallDeviceIdFile(stable);
+        return stable;
+      } finally {
+        deviceIdBootstrapPromise = null;
+      }
+    })();
+  }
+  return deviceIdBootstrapPromise;
+}
+
+// Fallback only for flows that run before a user logs in.
 const generateUserId = (): string => {
   const timestamp = Date.now().toString().slice(-6);
   return `USER-${timestamp}`;
@@ -55,23 +127,28 @@ export const getSettings = async (): Promise<Settings> => {
     console.log("✅ Settings retrieved from database successfully");
   }
 
-  // Auto-generate Device ID if not set
-  // Defer the save to avoid nested queue operations
-  if (!result.device_id) {
-    result.device_id = generateDeviceId();
-    // Queue the save operation separately (will be processed after this read completes)
-    saveSettings({ device_id: result.device_id }).catch((err) => {
-      console.warn("⚠️ Failed to save auto-generated device_id:", err);
-    });
+  // Stable device_id: single-flight + await persist (avoids duplicate DEV rows on server)
+  if (!String(result.device_id ?? "").trim()) {
+    try {
+      result.device_id = await ensureStableDeviceIdPersisted();
+    } catch (err) {
+      console.warn("⚠️ Failed to assign stable device_id:", err);
+    }
   }
 
-  // Auto-generate User ID if not set
-  // Defer the save to avoid nested queue operations
-  if (!result.user_id) {
-    result.user_id = generateUserId();
-    // Queue the save operation separately (will be processed after this read completes)
+  // The backend user master uses the login name, not a separate mobile-generated id.
+  // Keep user_id available for older API payloads, but make it the same as user_code.
+  const userCode = String(result.user_code ?? "").trim();
+  const userId = String(result.user_id ?? "").trim();
+  if (userCode && userId !== userCode) {
+    result.user_id = userCode;
+    saveSettings({ user_id: userCode }).catch((err) => {
+      console.warn("⚠️ Failed to align user_id with user_code:", err);
+    });
+  } else if (!userId) {
+    result.user_id = userCode || generateUserId();
     saveSettings({ user_id: result.user_id }).catch((err) => {
-      console.warn("⚠️ Failed to save auto-generated user_id:", err);
+      console.warn("⚠️ Failed to save fallback user_id:", err);
     });
   }
 

@@ -250,18 +250,24 @@ const checkAndCreatePutawayTasksAfterSync = async (syncedEvents: ScanEvent[]) =>
       }
 
       try {
-        // Check if all cartons are completed for this ASN
-        const cartons = await dataService.getASNCartons(asnNo);
-        if (!cartons || cartons.length === 0) {
-          continue; // No cartons found, skip
+        // Check if all cartons are received for this ASN (getASNCartons returns carton IDs only)
+        const cartonIds = await dataService.getASNCartons(asnNo);
+        if (!cartonIds || cartonIds.length === 0) {
+          continue;
         }
-
-        const totalCartons = cartons.length;
-        const completedCartons = cartons.filter(
-          (c) => c.status === "Completed" || c.status === "COMPLETED"
-        ).length;
-
-        const allCartonsCompleted = completedCartons === totalCartons && totalCartons > 0;
+        const inboundSession =
+          syncedEvents.find(
+            (e) =>
+              e.asn_no &&
+              e.asn_no.toUpperCase().trim() === asnNo &&
+              e.inbound_session &&
+              String(e.inbound_session).trim()
+          )?.inbound_session || "";
+        const allCartonsCompleted = inboundSession
+          ? await dataService.areAllCartonsReceived(asnNo, inboundSession)
+          : false;
+        const totalCartons = cartonIds.length;
+        const completedCartons = allCartonsCompleted ? totalCartons : 0;
 
         if (allCartonsCompleted) {
           console.warn(`✅ All cartons completed for ASN ${asnNo} (${completedCartons}/${totalCartons})`);
@@ -275,7 +281,7 @@ const checkAndCreatePutawayTasksAfterSync = async (syncedEvents: ScanEvent[]) =>
           try {
             const existingTasks = await apiService.getPutawayTasks({
               status: "Open",
-              advance_shipping_notice: asnNo,
+              asn_no: asnNo,
             });
 
             let tasksList: any[] = [];

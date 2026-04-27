@@ -290,7 +290,7 @@ export async function saveDatabaseBackupToPickedFolder(): Promise<{
   const safeTs = payload.createdAt.replace(/[:.]/g, "-");
   const filename = `Printechs-WMS-backup-${safeTs}.json`;
 
-  let picked: Directory;
+  let picked: Awaited<ReturnType<typeof Directory.pickDirectoryAsync>>;
   try {
     picked = await Directory.pickDirectoryAsync();
   } catch (e: unknown) {

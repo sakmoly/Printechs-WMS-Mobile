@@ -57,14 +57,14 @@ interface RequestedItemWithLocations {
   requested_qty: number;
   scanned_qty: number;
   picked_qty?: number; // ✅ Backend's calculated total quantity (sum of all events)
-  locations: Array<{
+  locations: {
     bin_location: string;
     total_qty: number;
-    cartons: Array<{
+    cartons: {
       carton_id: string;
       qty: number;
-    }>;
-  }>;
+    }[];
+  }[];
 }
 
 export default function MaterialRequestPackingScreen() {
@@ -153,12 +153,12 @@ export default function MaterialRequestPackingScreen() {
   // TC Items modal state
   const [tcItemsModal, setTcItemsModal] = useState<{
     visible: boolean;
-    items: Array<{
+    items: {
       item_code: string;
       item_name?: string;
       requested_qty: number;
       scanned_qty: number;
-    }>;
+    }[];
   } | null>(null);
   const lastTCTapTimeRef = useRef<number>(0);
 
@@ -276,7 +276,6 @@ export default function MaterialRequestPackingScreen() {
       );
       scannedItemsRef.current = backendTotal;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [materialRequest?.items, scannedItems.length]);
 
   // Load scanned items and restore state when screen is focused
@@ -1399,12 +1398,12 @@ export default function MaterialRequestPackingScreen() {
 
         // ✅ NEW WORKFLOW: Add items from Material Request to Transfer Carton
         // Get items with picked_qty > 0 from Material Request
-        const itemsToAdd: Array<{
+        const itemsToAdd: {
           item_code: string;
           qty: number;
           carton_id?: string;
           source_bin?: string;
-        }> = [];
+        }[] = [];
 
         if (materialRequest?.items && Array.isArray(materialRequest.items)) {
           for (const item of materialRequest.items) {
@@ -2636,11 +2635,11 @@ export default function MaterialRequestPackingScreen() {
           }
 
           // Parse grouped format: [{ bin_location, cartons: [{ carton_id, qty }], total_qty }]
-          let locations: Array<{
+          let locations: {
             bin_location: string;
             total_qty: number;
-            cartons: Array<{ carton_id: string; qty: number }>;
-          }> = [];
+            cartons: { carton_id: string; qty: number }[];
+          }[] = [];
 
           if (Array.isArray(stockResponse)) {
             // New grouped format

@@ -1,4 +1,4 @@
-import { getSettings } from "./settings.service";
+import { getSettings, saveSettings } from "./settings.service";
 import { ScanEvent } from "../types";
 
 /** Query params for GET /api/master/items (paging + incremental). */
@@ -15,6 +15,18 @@ export type PullItemMasterParams = {
 const API_TIMEOUT = 10000;
 /** Large JSON payloads (paged item master). */
 const ITEM_MASTER_API_TIMEOUT_MS = 120000;
+
+/** In-memory unload lines when app `demo_mode` is on (aligns with server demo DUPLICATE_UNLOAD). */
+const demoUnloadLinesBySession = new Map<
+  string,
+  {
+    parent_title: string;
+    unit_type: string;
+    unit_id: string;
+    scanned_by: string;
+    scanned_on: string;
+  }[]
+>();
 
 // Login/Authentication function
 const authenticate = async (): Promise<string | null> => {
@@ -56,15 +68,22 @@ const authenticate = async (): Promise<string | null> => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
+      const uc = String(settings.user_code || settings.user_id || "").trim();
+      const pw = String(settings.password || settings.device_id || "");
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          user_code: settings.user_code || settings.user_id,
-          password: settings.password || settings.device_id || "",
-        }),
+        body: JSON.stringify(
+          buildAuthLoginRequestBody(
+            loginEndpoint,
+            uc,
+            pw,
+            settings.device_id,
+            (settings as any).device_label
+          )
+        ),
         signal: controller.signal,
       });
 
@@ -91,7 +110,6 @@ const authenticate = async (): Promise<string | null> => {
           const expiresAt = new Date(Date.now() + expiresIn * 1000);
 
           // Save token to settings
-          const { saveSettings } = await import("./settings.service");
           await saveSettings({
             auth_token: token,
             auth_token_expires: expiresAt.toISOString(),
@@ -139,6 +157,81 @@ const authenticate = async (): Promise<string | null> => {
   console.warn("⚠️ Could not authenticate - all login endpoints failed");
   return null;
 };
+
+/**
+ * WMS mobile device session API: `POST /api/auth/login` expects `client_type: "mobile"`
+ * and a stable `device_id` (see Wms.Desktop MOBILE_DEVICE_SESSION_API.md).
+ * Other legacy login paths stay minimal (`user_code` + `password`) for compatibility.
+ */
+export type AuthLoginOptions = {
+  /** If true, ask server to drop the other mobile session for this user (backend must honor this field). */
+  replaceOtherMobileSession?: boolean;
+  /** @internal prevents infinite loop when auto-retrying after same-device session conflict */
+  _sessionConflictRetried?: boolean;
+};
+
+function deviceIdComparable(id: string | undefined | null): string {
+  return String(id || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+/** Best-effort: ask server to release mobile session using credentials (no Bearer). */
+async function bestEffortAuthLogoutWithCredentials(
+  apiUrl: string,
+  user_code: string,
+  password: string,
+  device_id: string | undefined | null
+): Promise<void> {
+  const base = apiUrl.replace(/\/$/, "");
+  const url = `${base}/api/auth/logout`;
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 8000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_code,
+        password,
+        client_type: "mobile",
+        device_id: String(device_id || "").trim() || undefined,
+      }),
+      signal: controller.signal,
+    });
+  } catch {
+    /* ignore */
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
+function buildAuthLoginRequestBody(
+  loginEndpoint: string,
+  user_code: string,
+  password: string,
+  device_id: string | undefined | null,
+  device_label?: string | null,
+  loginOptions?: AuthLoginOptions
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    user_code,
+    password,
+  };
+  const did = String(device_id || "").trim();
+  if (loginEndpoint === "/api/auth/login" && did.length > 0) {
+    body.client_type = "mobile";
+    body.device_id = did;
+    const label = String(device_label || "").trim();
+    if (label) {
+      body.device_label = label;
+    }
+    if (loginOptions?.replaceOtherMobileSession) {
+      body.replace_other_mobile_session = true;
+    }
+  }
+  return body;
+}
 
 const makeRequest = async (
   endpoint: string,
@@ -470,7 +563,6 @@ const makeRequest = async (
       if (response.status === 401 && retryAuth) {
         console.log("🔄 401 Unauthorized - Attempting to re-authenticate...");
         // Clear existing token
-        const { saveSettings } = await import("./settings.service");
         await saveSettings({
           auth_token: undefined,
           auth_token_expires: undefined,
@@ -749,9 +841,22 @@ const makeRequest = async (
                                   endpoint.includes("/api/putaway/tasks/") && 
                                   method === "GET" &&
                                   !endpoint.endsWith("/api/putaway/tasks"); // Individual task endpoint, not list
+
+        const dupUnloadHttpCode =
+          errorJson?.error?.code || errorJson?.code;
+        const isDuplicateUnload409 =
+          response.status === 409 &&
+          endpoint.includes("/api/inbound/unload-line") &&
+          method === "POST" &&
+          (dupUnloadHttpCode === "DUPLICATE_UNLOAD" ||
+            errorJson?.duplicate === true);
         
-        if (!isValidationError && !endpoint.includes("/api/relocation/") && !isPutawayTask404) {
+        if (!isValidationError && !endpoint.includes("/api/relocation/") && !isPutawayTask404 && !isDuplicateUnload409) {
           console.error(`❌ ${finalError}`);
+        } else if (isDuplicateUnload409) {
+          console.warn(
+            `ℹ️ Duplicate unload (409 DUPLICATE_UNLOAD) — same session + unit already recorded`
+          );
         } else if (isPutawayTask404) {
           // Log as info instead of error for optional endpoint
           console.warn(`ℹ️ getPutawayTask endpoint not available (404): ${endpoint} - this is expected and handled gracefully`);
@@ -812,10 +917,21 @@ const makeRequest = async (
       throw error;
     }
 
-    // If response is OK, read as JSON
+    // If response is OK, read body (201 Created may have empty JSON — avoid response.json() throw)
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.includes("application/json")) {
-      return await response.json();
+      const text = await response.text();
+      if (!text || !String(text).trim()) {
+        return { ok: true, status: response.status };
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        console.warn(
+          `⚠️ API returned non-parseable JSON body (status ${response.status}): ${text.substring(0, 120)}`
+        );
+        return { ok: true, status: response.status, raw: text.substring(0, 200) };
+      }
     } else {
       // If response is not JSON, return as text
       const text = await response.text();
@@ -1668,6 +1784,79 @@ const simulateApiResponse = async (
 
   // Removed all Cycle Count mock data - data should come from backend
 
+  if (
+    endpoint === "/api/inbound/sessions" ||
+    endpoint.startsWith("/api/inbound/sessions?")
+  ) {
+    return [];
+  }
+
+  if (endpoint === "/api/inbound/unload-line" && method === "POST" && body) {
+    const parent = String(body.parent_title || "").trim();
+    const unitType = String(body.unit_type || "Carton").trim();
+    const unitId = String(body.unit_id || "").trim().toUpperCase();
+    if (!parent || !unitId) {
+      return { ok: false, message: "parent_title and unit_id required" };
+    }
+    const list = demoUnloadLinesBySession.get(parent) || [];
+    const exists = list.some(
+      (r) =>
+        String(r.unit_type || "")
+          .trim()
+          .toUpperCase() === unitType.toUpperCase() &&
+        String(r.unit_id || "")
+          .trim()
+          .toUpperCase() === unitId
+    );
+    if (exists) {
+      const err = new Error(
+        "API error (409): Unload line already exists for this session and unit (DUPLICATE_UNLOAD)"
+      );
+      (err as any).status = 409;
+      (err as any).code = "DUPLICATE_UNLOAD";
+      (err as any).data = {
+        duplicate: true,
+        error: { code: "DUPLICATE_UNLOAD", duplicate: true },
+      };
+      throw err;
+    }
+    const row = {
+      parent_title: parent,
+      unit_type: unitType,
+      unit_id: unitId,
+      scanned_by: String(body.scanned_by || "demo").trim(),
+      scanned_on: String(body.scanned_on || new Date().toISOString()),
+      device_id: String((body as any).device_id || "").trim() || undefined,
+    };
+    list.push(row);
+    demoUnloadLinesBySession.set(parent, list);
+    return { ok: true, created: true, status: 201 };
+  }
+
+  if (endpoint.startsWith("/api/inbound/unload-lines") && method === "GET") {
+    const q = endpoint.includes("?") ? endpoint.split("?")[1] : "";
+    const sp = new URLSearchParams(q);
+    const parent =
+      sp.get("parent_title")?.trim() ||
+      sp.get("parentTitle")?.trim() ||
+      "";
+    const lines = demoUnloadLinesBySession.get(parent) || [];
+    return {
+      lines,
+      unload_lines: lines,
+      items: lines,
+      results: lines,
+      demo: true,
+      data: {
+        lines,
+        unload_lines: lines,
+        items: lines,
+        results: lines,
+        parent_title: parent,
+      },
+    };
+  }
+
   return { ok: true };
 };
 
@@ -1675,11 +1864,26 @@ export const apiService = {
   startInbound: async (data: {
     asn_no: string;
     transfer_order: string;
+    warehouse?: string;
     dock: string;
     user_id: string;
     device_id: string;
+    source_type?: "ASN" | "TransferIn";
+    source_doc?: string;
+    inbound_session?: string;
+    requested_session_id?: string;
   }) => {
-    return makeRequest("/api/inbound/start", "POST", data);
+    return makeRequest("/api/inbound/session/start", "POST", {
+      inbound_session: data.inbound_session || data.requested_session_id,
+      requested_session_id: data.requested_session_id || data.inbound_session,
+      source_type: data.source_type || "ASN",
+      source_doc: data.source_doc || data.asn_no,
+      transfer_order: data.transfer_order,
+      warehouse: data.warehouse || "WH-MAIN",
+      dock: data.dock,
+      user_id: data.user_id,
+      device_id: data.device_id,
+    });
   },
 
   updateInboundSession: async (data: {
@@ -1696,6 +1900,11 @@ export const apiService = {
     // Single endpoint that both creates new sessions and updates existing ones
     // Prevents duplicates automatically - safe to call multiple times
     return makeRequest("/api/inbound/update", "POST", data);
+  },
+
+  /** List inbound sessions (e.g. for session totals / completed counts). */
+  getInboundSessions: async () => {
+    return makeRequest("/api/inbound/sessions", "GET");
   },
 
   lockCarton: async (data: {
@@ -1722,12 +1931,12 @@ export const apiService = {
     asn_no: string;
     inbound_session: string;
     carton_id?: string;
-    cartons?: Array<{ carton_id: string; status: string }>;
+    cartons?: { carton_id: string; status: string }[];
     status?: string;
     locked_by?: string;
     locked_on?: string;
-    user_id?: string;
-    device_id?: string;
+    user_id?: string | null;
+    device_id?: string | null;
   }) => {
     // Send status as-is: Mobile app uses "Receiving" (without space)
     // Backend must accept "Receiving" instead of "In Receiving"
@@ -1755,6 +1964,8 @@ export const apiService = {
     unit_id: string;
     scanned_by: string;
     scanned_on?: string;
+    /** Same handset id as Settings / session — persisted on tabInboundUnloadLine for GET unload-lines. */
+    device_id?: string;
   }) => {
     return makeRequest("/api/inbound/unload-line", "POST", data);
   },
@@ -1762,6 +1973,8 @@ export const apiService = {
   getUnloadLines: async (parent_title: string) => {
     const queryParams = new URLSearchParams();
     queryParams.append("parent_title", parent_title);
+    // Avoid any intermediary caching an empty list right after another device unloads
+    queryParams.append("_", String(Date.now()));
     return makeRequest(
       `/api/inbound/unload-lines?${queryParams.toString()}`,
       "GET"
@@ -1783,14 +1996,14 @@ export const apiService = {
 
   createReceiveLines: async (data: {
     parent_title: string; // Session ID
-    receive_lines: Array<{
+    receive_lines: {
       carton_id: string; // Changed back to carton_id as backend expects it
       item_code: string;
       expected_qty: number;
       received_qty: number;
       condition?: string;
       remarks?: string | null;
-    }>;
+    }[];
   }) => {
     return makeRequest("/api/inbound/receive-lines", "POST", data);
   },
@@ -1839,12 +2052,12 @@ export const apiService = {
     return makeRequest("/api/events/batch", "POST", requestBody);
   },
 
-  createBox: async (data: { 
-    asn_no?: string; 
-    to_no?: string; 
-    store: string; 
+  createBox: async (data: {
+    asn_no?: string;
+    to_no?: string;
+    store: string;
     purpose?: "STORE" | "PUTAWAY";
-    user_id?: string;
+    user_id?: string | null;
     carton_id?: string; // ✅ Carton ID to associate with the BOX
     box_id?: string; // ✅ BOX ID (for Transfer In, should be TI-PUT- format)
     transfer_in?: string; // ✅ Transfer In number (alternative to asn_no for Transfer In)
@@ -1866,8 +2079,42 @@ export const apiService = {
     return makeRequest("/api/sort-box/create", "POST", data);
   },
 
-  closeBox: async (data: { box_id: string }) => {
+  scanSortBox: async (data: {
+    purpose?: "STORE" | "PUTAWAY";
+    asn_no: string;
+    box_id: string;
+    carton_id?: string | null;
+    item_code: string;
+    qty: number;
+    user_id?: string | null;
+    device_id?: string | null;
+  }) => {
+    return makeRequest("/api/sort-box/scan", "POST", data);
+  },
+
+  adjustSortBox: async (data: {
+    purpose?: "STORE" | "PUTAWAY";
+    asn_no: string;
+    box_id: string;
+    carton_id?: string | null;
+    item_code: string;
+    new_qty: number;
+    user_id?: string | null;
+    device_id?: string | null;
+  }) => {
+    return makeRequest("/api/sort-box/adjust", "POST", data);
+  },
+
+  closeBox: async (data: { box_id: string; closed_by?: string }) => {
     return makeRequest("/api/boxes/close", "POST", data);
+  },
+
+  printBox: async (data: {
+    box_id: string;
+    copies?: number;
+    printer_id?: string;
+  }) => {
+    return makeRequest("/api/boxes/print", "POST", data);
   },
 
   reopenBox: async (data: { box_id: string }) => {
@@ -1920,8 +2167,36 @@ export const apiService = {
     return makeRequest("/api/transfer-cartons/create", "POST", requestData);
   },
 
-  sealTransferCarton: async (data: { tc_id: string; sealed_by?: string }) => {
+  sealTransferCarton: async (data: {
+    tc_id: string;
+    sealed_by?: string | null | undefined;
+  }) => {
     return makeRequest("/api/transfer-cartons/seal", "POST", data);
+  },
+
+  reopenTransferCarton: async (data: {
+    tc_id: string;
+    reopened_by?: string | null | undefined;
+    reason?: string | null | undefined;
+  }) => {
+    return makeRequest("/api/transfer-cartons/reopen", "POST", data);
+  },
+
+  packBoxIntoTransferCarton: async (
+    tc_id: string,
+    data: {
+      asn_no: string;
+      box_id: string;
+      store: string;
+      user_id?: string | null;
+      device_id?: string | null;
+    }
+  ) => {
+    return makeRequest(
+      `/api/transfer-cartons/${encodeURIComponent(tc_id)}/pack-box`,
+      "POST",
+      data
+    );
   },
 
   dispatchTransferCarton: async (data: { 
@@ -1986,7 +2261,7 @@ export const apiService = {
    * @param params - Object with asn and store (both required by backend)
    * @returns Array of boxes
    */
-  getBoxes: async (params: { asn?: string; store?: string }) => {
+  getBoxes: async (params: { asn?: string; store?: string; status?: string }) => {
     // Validate required parameters
     if (!params.asn || !params.store) {
       const missing = [];
@@ -2001,8 +2276,29 @@ export const apiService = {
     const queryParams = new URLSearchParams();
     if (params.asn) queryParams.append("asn", params.asn);
     if (params.store) queryParams.append("store", params.store);
+    if (params.status) queryParams.append("status", params.status);
     const query = queryParams.toString();
     return makeRequest(`/api/boxes${query ? `?${query}` : ""}`, "GET");
+  },
+
+  getBoxItems: async (box_id: string, params: { asn: string; store?: string }) => {
+    const queryParams = new URLSearchParams();
+    queryParams.append("asn", params.asn);
+    if (params.store) queryParams.append("store", params.store);
+    const path = `/api/boxes/${encodeURIComponent(
+      box_id
+    )}/items?${queryParams.toString()}`;
+    try {
+      return await makeRequest(path, "GET");
+    } catch (error) {
+      if (!params.store) throw error;
+      const fallbackParams = new URLSearchParams();
+      fallbackParams.append("asn", params.asn);
+      return makeRequest(
+        `/api/boxes/${encodeURIComponent(box_id)}/items?${fallbackParams.toString()}`,
+        "GET"
+      );
+    }
   },
 
   getTransferCartons: async (params: { asn?: string; store?: string; material_request?: string }) => {
@@ -2139,12 +2435,34 @@ export const apiService = {
     return makeRequest("/api/master/all", "GET");
   },
 
+  /**
+   * Mobile device session: `device_status`, `session_active` (see MOBILE_DEVICE_SESSION_API.md).
+   * Use when `device_status === "pending"` to limit UI to settings until admin approves.
+   */
+  getAuthSession: async () => makeRequest("/api/auth/session", "GET"),
+
+  /**
+   * Full mobile logout: revokes server session and releases Transfer In carton locks.
+   * Clears stored auth token after a successful response.
+   */
+  logoutAuth: async () => {
+    const result = await makeRequest("/api/auth/logout", "POST", {});
+    await saveSettings({
+      auth_token: null as any,
+      auth_token_expires: null as any,
+    });
+    return result;
+  },
+
   // Authentication
-  login: async (user_code: string, password: string): Promise<string> => {
+  login: async (
+    user_code: string,
+    password: string,
+    loginOptions?: AuthLoginOptions
+  ): Promise<string> => {
     const settings = await getSettings();
     if (settings.demo_mode === 1 || !settings.api_url) {
       // In demo mode, return a dummy token
-      const { saveSettings } = await import("./settings.service");
       const expiresAt = new Date(Date.now() + 3600 * 1000);
       await saveSettings({
         auth_token: "demo-token",
@@ -2177,10 +2495,14 @@ export const apiService = {
         const trimmedUserCode = user_code?.trim() || "";
         const trimmedPassword = password?.trim() || "";
 
-        const requestBody = {
-          user_code: trimmedUserCode,
-          password: trimmedPassword,
-        };
+        const requestBody = buildAuthLoginRequestBody(
+          loginEndpoint,
+          trimmedUserCode,
+          trimmedPassword,
+          settings.device_id,
+          (settings as any).device_label,
+          loginOptions
+        );
 
         console.log(`🔐 Login attempt: ${url}`);
         console.log(`📤 Request body:`, {
@@ -2188,6 +2510,10 @@ export const apiService = {
           user_code_length: trimmedUserCode.length,
           password: "***",
           password_length: trimmedPassword.length,
+          client_type: requestBody.client_type,
+          device_id: requestBody.device_id
+            ? `${String(requestBody.device_id).substring(0, 8)}…`
+            : undefined,
         });
 
         // Warn if user_code contains spaces (might be a typo)
@@ -2241,7 +2567,6 @@ export const apiService = {
 
             if (token) {
               const expiresAt = new Date(Date.now() + expiresIn * 1000);
-              const { saveSettings } = await import("./settings.service");
               await saveSettings({
                 auth_token: token,
                 auth_token_expires: expiresAt.toISOString(),
@@ -2284,6 +2609,71 @@ export const apiService = {
               error: errorData,
               errorText: errorText.substring(0, 200),
             });
+
+            const errCode = errorData.error?.code || errorData.code;
+            if (response.status === 409 && errCode === "AUTH_SESSION_EXISTS") {
+              const other =
+                errorData.error?.active_device_id ||
+                errorData.active_device_id ||
+                "";
+              const myDid = String(settings.device_id || "").trim();
+              const otherStr = String(other || "").trim();
+              const sameDeviceId =
+                myDid.length > 0 &&
+                otherStr.length > 0 &&
+                deviceIdComparable(myDid) === deviceIdComparable(otherStr);
+
+              // Same user + same device: stale server session after local logout / crash — clear local auth,
+              // best-effort server logout, then one automatic retry with replace_other_mobile_session.
+              if (
+                loginEndpoint === "/api/auth/login" &&
+                sameDeviceId &&
+                !loginOptions?._sessionConflictRetried
+              ) {
+                console.warn(
+                  "ℹ️ AUTH_SESSION_EXISTS for same device_id — clearing local session, best-effort server logout, retrying login"
+                );
+                await saveSettings({
+                  auth_token: undefined as any,
+                  auth_token_expires: undefined as any,
+                });
+                await bestEffortAuthLogoutWithCredentials(
+                  settings.api_url!,
+                  trimmedUserCode,
+                  trimmedPassword,
+                  settings.device_id
+                );
+                return apiService.login(user_code, password, {
+                  replaceOtherMobileSession: true,
+                  _sessionConflictRetried: true,
+                });
+              }
+
+              const base =
+                errorData.error?.message ||
+                "Login session issue: the server still shows an active mobile login for this user.";
+              const hint =
+                "\n\n• Other device: sign out on that phone, or tap “Use this device” below if your API allows replacing the session." +
+                "\n• Logout issue: if you already signed out everywhere, wait a minute or ask an admin to clear the stuck mobile session on the server." +
+                (otherStr && !sameDeviceId
+                  ? `\n\nActive session device id: ${otherStr}`
+                  : otherStr
+                  ? `\n\nDevice id on server (this device): ${otherStr}`
+                  : "");
+              const err = new Error(base + hint) as Error & {
+                code?: string;
+                activeDeviceId?: string;
+              };
+              err.code = "AUTH_SESSION_EXISTS";
+              err.activeDeviceId = otherStr || undefined;
+              throw err;
+            }
+            if (response.status === 403 && errCode === "DEVICE_DISABLED") {
+              throw new Error(
+                errorData.error?.message ||
+                  "This device has been disabled. Contact an administrator."
+              );
+            }
 
             // Create detailed error message
             const errorMessage =
@@ -2758,7 +3148,7 @@ export const apiService = {
     to_bin: string;
     from_carton: string;
     to_carton: string;
-    lines: Array<{ item_code: string; qty: number }>;
+    lines: { item_code: string; qty: number }[];
     create_carton_if_missing?: boolean;
   }) => {
     const body: any = {
@@ -2781,10 +3171,10 @@ export const apiService = {
   // OLD RELOCATION ENDPOINTS (DEPRECATED - Keep for backward compatibility)
   // ============================================
   
-  commitRelocationFull: async (sessionId: string, lines?: Array<{
+  commitRelocationFull: async (sessionId: string, lines?: {
     item_code: string;
     qty: number;
-  }>) => {
+  }[]) => {
     // ⚠️ DEPRECATED: Use completeRelocationFull instead
     console.warn("⚠️ commitRelocationFull is deprecated. Use completeRelocationFull instead.");
     return makeRequest(`/api/relocation/session/${sessionId}/commit-full`, "POST", {
@@ -2792,10 +3182,10 @@ export const apiService = {
     });
   },
 
-  commitRelocationPartial: async (sessionId: string, lines?: Array<{
+  commitRelocationPartial: async (sessionId: string, lines?: {
     item_code: string;
     qty: number;
-  }>) => {
+  }[]) => {
     // ⚠️ DEPRECATED: Use completeRelocationPartial instead
     console.warn("⚠️ commitRelocationPartial is deprecated. Use completeRelocationPartial instead.");
     return makeRequest(`/api/relocation/session/${sessionId}/commit-partial`, "POST", {
@@ -2881,14 +3271,14 @@ export const apiService = {
    */
   pickMaterialRequestItems: async (
     title: string,
-    items: Array<{
+    items: {
       item_code: string;
       picked_qty: number;    // ✅ CORRECT: picked_qty (not qty)
       source_bin: string;   // ✅ CORRECT: source_bin (not bin_location)
       carton_id?: string;   // Optional carton_id for carton-level inventory
-    }>,
+    }[],
     warehouse?: string,
-    user_id?: string  // Required by backend; falls back to settings.user_id / user_code
+    user_id?: string | null // Required by backend; falls back to settings.user_id / user_code
   ) => {
     // Resolve user_id/created_by: backend requires one of them
     let resolvedUserId = user_id;
@@ -2930,12 +3320,12 @@ export const apiService = {
   // ✅ NEW: Add items to Transfer Carton (for Material Request redesign)
   addItemsToTransferCarton: async (
     tc_id: string,
-    items: Array<{
+    items: {
       item_code: string;
       qty: number;
       carton_id?: string;
       source_bin?: string;
-    }>,
+    }[],
     user_id: string
   ) => {
     const requestBody = {
@@ -3321,7 +3711,7 @@ export const apiService = {
     title: string,
     data: {
       counted_by: string;
-      lines: Array<{
+      lines: {
         id?: number;
         lineId?: number; // ✅ FIX: Backend expects lineId (camelCase) for line identification
         line_id?: string; // Optional: Backend line_id in format "LINE-{id}"
@@ -3335,7 +3725,7 @@ export const apiService = {
         discrepancy_reason?: string | null;
         reason_code?: string | null;
         notes?: string | null;
-      }>;
+      }[];
     }
   ) => {
     return makeRequest(`/api/cycle-count/${title}/count`, "POST", data);
@@ -3377,7 +3767,7 @@ export const apiService = {
     opening_stock?: boolean; // Optional - indicates if this is an initial/baseline count (independent of blind_count)
     is_opening_stock?: boolean; // Alias for opening_stock (backend may accept either)
     created_by?: string; // Required
-    lines?: Array<any>; // Required - array of cycle count lines (can be empty for new task)
+    lines?: any[]; // Required - array of cycle count lines (can be empty for new task)
   }) => {
     return makeRequest(`/api/cycle-count`, "POST", data);
   },
@@ -3386,7 +3776,8 @@ export const apiService = {
   // PUTAWAY TASK APIs
   // ============================================
   getPutawayTasks: async (filters?: {
-    asn_no?: string;
+    asn_no?: string | null;
+    advance_shipping_notice?: string;
     source_type?: string;
     transfer_in?: string;
     status?: string;
@@ -3394,6 +3785,9 @@ export const apiService = {
   }) => {
     const params = new URLSearchParams();
     if (filters?.asn_no) params.append("asn_no", filters.asn_no);
+    if (filters?.advance_shipping_notice) {
+      params.append("advance_shipping_notice", filters.advance_shipping_notice);
+    }
     if (filters?.source_type) params.append("source_type", filters.source_type);
     if (filters?.transfer_in) params.append("transfer_in", filters.transfer_in);
     if (filters?.status) params.append("status", filters.status);
@@ -3425,8 +3819,9 @@ export const apiService = {
     location_id?: string;
     user_id?: string;
     item_code?: string;
-    tc_id?: string;
+    tc_id?: string | null;
     carton_id?: string;
+    asn_no?: string;
     warehouse_id?: string; // ✅ NEW: Required by backend to prevent "warehouse is not defined" error
   }) => {
     // ❌ FIX: Remove 'rack' field from request - backend database doesn't have this column
@@ -3435,6 +3830,29 @@ export const apiService = {
     if (rack) {
       console.warn(`⚠️ Removed 'rack' field from putaway request (backend doesn't support it). Using location_id instead.`);
     }
+
+    // Backend returns INVALID_CARTON_FORMAT if carton_id is BOX-* / PAW-* (ASN putaway expects those as box_id only).
+    // Normalize at the API layer so older app builds or mis-set source_type cannot send bad carton_id.
+    const rawCarton = String(requestData.carton_id ?? "").trim();
+    const cartonUpper = rawCarton.toUpperCase();
+    if (rawCarton && !cartonUpper.startsWith("CTN-")) {
+      const existingBox = String(requestData.box_id ?? "").trim();
+      if (!existingBox) {
+        (requestData as any).box_id = rawCarton;
+      }
+      delete (requestData as any).carton_id;
+      if (requestData.tc_id === undefined) {
+        (requestData as any).tc_id = null;
+      }
+      console.warn(
+        `⚠️ scanTransferCarton: non-CTN value was in carton_id; sending as box_id only (backend rule). carton_was=${rawCarton.substring(0, 48)}`
+      );
+    }
+
+    console.warn(
+      `📤 PUTAWAY scan-transfer-carton body:`,
+      JSON.stringify(requestData, null, 2)
+    );
     return makeRequest("/api/putaway/scan-transfer-carton", "POST", requestData);
   },
 
@@ -3449,7 +3867,7 @@ export const apiService = {
     warehouse_id?: string; // ✅ Optional: Alternative warehouse field name
     completed_by?: string;
     performed_by?: string;
-    items?: Array<{
+    items?: {
       item_code: string;
       qty: number;
       carton_id?: string; // ✅ CORRECT: carton_id for carton-level inventory
@@ -3458,7 +3876,7 @@ export const apiService = {
       source_bin?: string;  // Optional: backend may ignore
       target_bin?: string;  // Optional: backend may ignore
       completed?: boolean;
-    }>;
+    }[];
   }) => {
     return makeRequest("/api/putaway/complete", "POST", data);
   },
@@ -3466,6 +3884,25 @@ export const apiService = {
   // ============================================
   // STOCK APIs
   // ============================================
+  /** Stock transaction history (same query shape as ledger; adjust path if backend differs). */
+  getStockTransactions: async (filters?: {
+    item_code?: string;
+    warehouse?: string;
+    location?: string;
+    bin_location?: string;
+  }) => {
+    const params = new URLSearchParams();
+    if (filters?.item_code) params.append("item_code", filters.item_code);
+    if (filters?.warehouse) params.append("warehouse", filters.warehouse);
+    if (filters?.location) params.append("location", filters.location);
+    if (filters?.bin_location) params.append("bin_location", filters.bin_location);
+    const queryString = params.toString();
+    return makeRequest(
+      `/api/stock/transactions${queryString ? `?${queryString}` : ""}`,
+      "GET"
+    );
+  },
+
   getStockLedger: async (filters?: {
     item_code?: string;
     warehouse?: string;

@@ -226,6 +226,7 @@ const testUnloadCartons = async (sessionId: string | null, asnNo: string | null)
           unit_type: "Carton",
           unit_id: testCartonId,
           scanned_by: settings.user_id || "TEST-USER",
+          device_id: settings.device_id || "TEST-DEVICE",
         });
         logResult("POST /api/inbound/unload-line", "PASS", "Unload line created");
       } catch (error: any) {
@@ -290,9 +291,9 @@ const testReceiveItems = async (sessionId: string | null, asnNo: string | null):
       // Test receive lines
       try {
         await apiService.createReceiveLines({
+          parent_title: sessionId,
           receive_lines: [
             {
-              parent_title: sessionId,
               carton_id: testCartonId,
               item_code: testItemCode,
               expected_qty: 10,

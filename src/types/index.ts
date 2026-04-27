@@ -2,16 +2,19 @@
 export type ItemMasterSyncMode = "full" | "incremental";
 
 export interface Settings {
-  api_url?: string;
-  device_id?: string;
-  user_id?: string;
-  user_code?: string;
-  password?: string;
+  api_url?: string | null;
+  device_id?: string | null;
+  user_id?: string | null;
+  user_code?: string | null;
+  password?: string | null;
   demo_mode: number;
-  active_asn?: string;
-  active_session?: string;
+  active_asn?: string | null;
+  active_session?: string | null;
   auth_token?: string;
   auth_token_expires?: string;
+  /** Optional default warehouse context for putaway / relocation */
+  warehouse?: string | null;
+  warehouse_id?: string | null;
   /** Default full. Incremental uses item_master_modified_watermark when set. */
   item_master_sync_mode?: ItemMasterSyncMode | string | null;
   /** Server page size (rows per request). Default 5000. */
@@ -38,29 +41,43 @@ export interface TransferOrderAllocation {
 export interface Box {
   box_id: string;
   asn_no: string;
-  to_no: string;
+  to_no?: string | null;
   store: string;
   status: string;
-  purpose?: "STORE" | "PUTAWAY";
+  purpose?: "STORE" | "PUTAWAY" | string;
   updated_on: string;
+  /** ERP / mobile: who created the sort box (sysadmin, USER-…, etc.) */
+  created_by?: string | null;
 }
 
 export interface TransferCarton {
   tc_id: string;
   asn_no: string;
-  to_no: string;
+  to_no?: string | null;
   store: string;
   status: string;
-  updated_on: string;
+  /** Present for rows from tc_cache; optional when building UI-only task rows */
+  updated_on?: string;
+  /** UI / putaway task linkage (not always from tc_cache row) */
+  purpose?: string;
 }
 
 export interface CartonStatus {
   asn_no: string;
   inbound_session: string;
   carton_id: string;
-  status: "Pending" | "Unloaded" | "Receiving" | "Received";
+  /** Legacy DB / ERP value normalized in app code to "Receiving". */
+  status:
+    | "Pending"
+    | "Unloaded"
+    | "Receiving"
+    | "Received"
+    | "Received with Shortage"
+    | "In Receiving";
   locked_by?: string;
   locked_on?: string;
+  /** User id / code / name who recorded unload (from unload-line or this device). */
+  unloaded_by?: string | null;
   updated_on: string;
 }
 
@@ -81,28 +98,28 @@ export interface ScanEvent {
     | "MATERIAL_REQUEST_PICK"
     | "TRANSFER_IN_RECEIVE"
     | "RELOCATION_MOVE";
-  asn_no?: string;
-  transfer_in?: string;
-  material_request?: string;
-  cycle_count_title?: string;
-  to_no?: string;
-  inbound_session?: string;
-  carton_id?: string;
-  item_code?: string;
+  asn_no?: string | null;
+  transfer_in?: string | null;
+  material_request?: string | null;
+  cycle_count_title?: string | null;
+  to_no?: string | null;
+  inbound_session?: string | null;
+  carton_id?: string | null;
+  item_code?: string | null;
   qty?: number;
-  store?: string;
-  box_id?: string;
-  tc_id?: string;
-  rack?: string;
-  bin?: string;
-  source_bin?: string;
-  location_id?: string;
-  from_bin?: string;
-  from_carton?: string;
-  to_bin?: string;
-  to_carton?: string;
-  device_id?: string;
-  user_id?: string;
+  store?: string | null;
+  box_id?: string | null;
+  tc_id?: string | null;
+  rack?: string | null;
+  bin?: string | null;
+  source_bin?: string | null;
+  location_id?: string | null;
+  from_bin?: string | null;
+  from_carton?: string | null;
+  to_bin?: string | null;
+  to_carton?: string | null;
+  device_id?: string | null;
+  user_id?: string | null;
   event_time: string;
   synced: number;
   error_msg?: string;
@@ -114,6 +131,7 @@ export interface RemainingItem {
   allocated_qty: number;
   remaining_qty: number;
   scanned_to_stores: number;
+  box_id?: string;
 }
 
 export interface PutAwayItem {
@@ -138,7 +156,7 @@ export interface WarehouseRack {
 export interface ItemMaster {
   item_code: string;
   barcode: string;
-  item_name?: string;
+  item_name?: string | null;
 }
 
 // Transfer In Types
@@ -149,14 +167,14 @@ export interface TransferIn {
   transfer_date: string;
   expected_arrival_date?: string;
   status: "Draft" | "Submitted" | "In Transit" | "Receiving" | "Received" | "Completed" | "Cancelled";
-  items: Array<{
+  items: {
     item_code: string;
     qty: number;
     received_qty?: number;
     carton_id?: string;
     status?: "Pending" | "Picking" | "Received"; // Item-level status
     line_id?: string | number; // Optional line identifier
-  }>;
+  }[];
   prepared_by: string;
   received_by?: string;
   received_on?: string;
@@ -175,7 +193,7 @@ export interface MaterialRequest {
   request_date: string;
   required_date?: string;
   status: "Draft" | "Submitted" | "In Progress" | "Picked" | "Dispatched" | "Completed" | "Cancelled";
-  items: Array<{
+  items: {
     item_code: string;
     requested_qty: number;
     picked_qty?: number;
@@ -183,7 +201,7 @@ export interface MaterialRequest {
     status?: "Pending" | "In Progress" | "Picked" | "Sealed";
     item_name?: string;
     description?: string;
-  }>;
+  }[];
   requested_by: string;
   total_requested_qty?: number;
   total_picked_qty?: number;
@@ -203,11 +221,20 @@ export interface CycleCount {
   scheduled_start_time?: string;
   scheduled_end_time?: string;
   freeze_stock?: boolean;
-  status: "Draft" | "Scheduled" | "In Progress" | "Completed" | "Cancelled" | "Approved";
-  items: Array<{
+  status:
+    | "Draft"
+    | "Scheduled"
+    | "In Progress"
+    | "Completed"
+    | "Cancelled"
+    | "Approved"
+    | "Submitted";
+  items: {
     id?: number;
     item_code: string;
     bin_location?: string;
+    /** Actual bin when counted differs from planned location */
+    actual_bin_location?: string;
     expected_qty: number;
     actual_qty?: number;
     discrepancy?: number;
@@ -220,7 +247,7 @@ export interface CycleCount {
     approved_on?: string;
     discrepancy_reason?: string;
     status?: "Pending" | "Counted" | "Reviewed" | "Approved";
-  }>;
+  }[];
   created_by: string;
   assigned_to?: string;
   total_items?: number;

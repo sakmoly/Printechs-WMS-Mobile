@@ -21,7 +21,7 @@ export async function resendReceiveLinesToBackend(
   inbound_session: string
 ): Promise<ResendReceiveLinesResult> {
   const statuses = await dataService.getAllCartonStatuses(asn_no, inbound_session);
-  const allReceiveLines: Array<{
+  const allReceiveLines: {
     parent_title: string;
     carton_id: string;
     item_code: string;
@@ -29,7 +29,7 @@ export async function resendReceiveLinesToBackend(
     received_qty: number;
     condition: "Good";
     remarks: null;
-  }> = [];
+  }[] = [];
 
   for (const status of statuses) {
     const cartonId = status.carton_id;
@@ -38,7 +38,16 @@ export async function resendReceiveLinesToBackend(
       inbound_session,
       cartonId
     );
-    const cartonItems = await dataService.getCartonItems(asn_no, cartonId);
+    let cartonItems = await dataService.getCartonItems(asn_no, cartonId);
+    if (cartonItems.length === 0) {
+      const hydrated = await dataService.hydrateCartonLinesFromAsnApi(
+        asn_no,
+        cartonId
+      );
+      if (hydrated.ok) {
+        cartonItems = await dataService.getCartonItems(asn_no, cartonId);
+      }
+    }
     if (cartonItems.length === 0) continue;
 
     const expectedQtyByItem = new Map<string, number>();
@@ -47,7 +56,7 @@ export async function resendReceiveLinesToBackend(
     }
 
     const receivedQtyByItem = new Map<string, number>();
-    for (const row of scannedItems as Array<{ item_code: string; scanned_qty?: number }>) {
+    for (const row of scannedItems as { item_code: string; scanned_qty?: number }[]) {
       const itemCode = row.item_code;
       const qty = Number(row.scanned_qty || 0);
       if (!itemCode) continue;

@@ -96,8 +96,8 @@ export async function testAllCartonsInASN(): Promise<TestResult[]> {
         asn_no: normalizedASN,
         inbound_session: sessionId,
         carton_id: cartonId,
-        status: 'InReceiving',
-        locked_by: settings.user_id,
+        status: "In Receiving",
+        locked_by: settings.user_id ?? undefined,
         locked_on: new Date().toISOString(),
         updated_on: new Date().toISOString(),
       });
@@ -110,7 +110,7 @@ export async function testAllCartonsInASN(): Promise<TestResult[]> {
       });
 
       // Scan all items
-      const scannedItems: Array<{ item_code: string; box_id: string }> = [];
+      const scannedItems: { item_code: string; box_id: string }[] = [];
       for (const cartonItem of cartonItems) {
         // Get allocation for this item
         const allocations = await dataService.getTransferOrderAllocations(normalizedASN);
@@ -220,11 +220,11 @@ export async function testAllCartonsInASN(): Promise<TestResult[]> {
     const scannedItemsList = await dataService.getScannedItems(normalizedASN, sessionId);
     
     logResult('5', 'success', 'Data verification complete', {
-      eventCount: verification.eventCount,
-      scannedItemCount: verification.scannedItemCount,
-      cartonStatusCount: verification.cartonStatusCount,
-      boxCount: verification.boxCount,
-      tcCount: verification.tcCount,
+      events: verification.events,
+      scannedItems: verification.scannedItems,
+      cartonStatuses: verification.cartonStatuses,
+      boxes: verification.boxes,
+      transferCartons: verification.transferCartons,
       actualScannedItems: scannedItemsList.length,
     });
 

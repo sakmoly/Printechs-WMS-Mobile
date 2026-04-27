@@ -15,6 +15,7 @@ import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { apiService } from "../services/api.service";
 import { getDatabase } from "../database/database";
 import { getSettings } from "../services/settings.service";
+import { generateUUID } from "../utils/uuid";
 
 export default function CycleCountDashboardScreen() {
   const navigation = useNavigation();
@@ -22,7 +23,7 @@ export default function CycleCountDashboardScreen() {
   const [showCreateTaskModal, setShowCreateTaskModal] = useState(false);
   const [creatingTask, setCreatingTask] = useState(false);
   const [showWarehousePicker, setShowWarehousePicker] = useState(false);
-  const [warehouses, setWarehouses] = useState<Array<{ code: string; name: string; warehouse_type: string }>>([]);
+  const [warehouses, setWarehouses] = useState<{ code: string; name: string; warehouse_type: string }[]>([]);
   const [taskForm, setTaskForm] = useState({
     bin_code: "",
     warehouse_id: "",
@@ -30,7 +31,7 @@ export default function CycleCountDashboardScreen() {
     opening_stock: false, // ✅ NEW: Opening Stock flag (default: false - unchecked)
   });
   const [showPreviewModal, setShowPreviewModal] = useState(false); // ✅ NEW: Preview modal state
-  const [previewItems, setPreviewItems] = useState<Array<{ item_code: string; item_name?: string; qty: number; carton_id?: string | null }>>([]); // ✅ NEW: Preview items state
+  const [previewItems, setPreviewItems] = useState<{ item_code: string; item_name?: string; qty: number; carton_id?: string | null }[]>([]); // ✅ NEW: Preview items state
   const [pendingTaskData, setPendingTaskData] = useState<any>(null); // ✅ NEW: Store task data while showing preview
   const [stats, setStats] = useState({
     pendingBins: 0,
@@ -165,13 +166,13 @@ export default function CycleCountDashboardScreen() {
       // Load expected items from stock ledger for this bin to create initial lines
       // Backend requires at least one line in the lines array
       // Backend requires expected_qty to be non-null, so we use 0 when there's no stock value
-      let initialLines: Array<{
+      let initialLines: {
         item_code: string;
         bin_location: string;
         expected_qty: number; // Always a number (never null) - use 0 when no stock data
         actual_qty?: number;
         counted_qty?: number;
-      }> = [];
+      }[] = [];
       
       // Blind Count is controlled in the scan bin screen, not in task creation
       // Always fetch expected items for preview in task creation screen
@@ -245,9 +246,7 @@ export default function CycleCountDashboardScreen() {
               // Show preview from local cache
               const formattedItems = expectedItems.map((item) => ({
                 item_code: item.item_code,
-                item_name: null,
                 qty: item.qty || 0,
-                carton_id: null, // Carton ID is not in local cache
               }));
               
               setPreviewItems(formattedItems);
@@ -290,14 +289,14 @@ export default function CycleCountDashboardScreen() {
     countDate: string,
     createdBy: string,
     generatedTitle: string,
-    initialLines: Array<{
+    initialLines: {
       item_code: string;
       bin_location: string;
       expected_qty: number;
       actual_qty?: number;
       counted_qty?: number;
       carton_id?: string | null;
-    }>
+    }[]
   ) => {
     setCreatingTask(true);
     try {
@@ -382,7 +381,6 @@ export default function CycleCountDashboardScreen() {
       }
 
       // Create local session immediately so it shows in drafts
-      const { generateUUID } = require("../utils/uuid");
       const sessionId = generateUUID();
       const now = new Date().toISOString();
       

@@ -22,7 +22,7 @@ export class AutomatedTest {
   private asnNo: string = 'ASN-00045';
   private sessionId: string | null = null;
   private cartons: string[] = [];
-  private scannedItems: Array<{ item_code: string; box_id: string }> = [];
+  private scannedItems: { item_code: string; box_id: string }[] = [];
 
   async runCompleteScenario(): Promise<TestProgress[]> {
     this.progress = [];
@@ -154,8 +154,8 @@ export class AutomatedTest {
       asn_no: normalizedASN,
       inbound_session: this.sessionId,
       carton_id: cartonId,
-      status: 'InReceiving',
-      locked_by: settings.user_id,
+      status: "In Receiving",
+      locked_by: settings.user_id ?? undefined,
       locked_on: new Date().toISOString(),
       updated_on: new Date().toISOString(),
     });

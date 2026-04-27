@@ -56,7 +56,8 @@ export const CREATE_BOX_CACHE_TABLE = `
     store TEXT,
     status TEXT,
     purpose TEXT DEFAULT 'STORE',
-    updated_on TEXT
+    updated_on TEXT,
+    created_by TEXT
   );
 `;
 
@@ -79,6 +80,7 @@ export const CREATE_CARTON_STATUS_CACHE_TABLE = `
     status TEXT,
     locked_by TEXT,
     locked_on TEXT,
+    unloaded_by TEXT,
     updated_on TEXT,
     PRIMARY KEY (asn_no, inbound_session, carton_id)
   );

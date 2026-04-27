@@ -2,6 +2,51 @@ apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
+import java.util.Properties
+
+/** android/version.properties — incremented after each successful release build (local Gradle / Android Studio). */
+def versionPropertiesFile = rootProject.file("version.properties")
+def vp = new Properties()
+if (versionPropertiesFile.exists()) {
+    versionPropertiesFile.withInputStream { vp.load(it) }
+} else {
+    vp.setProperty("VERSION_CODE", "1")
+    vp.setProperty("VERSION_NAME", "1.0.0")
+    versionPropertiesFile.parentFile?.mkdirs()
+    versionPropertiesFile.withOutputStream {
+        vp.store(it, "Created by Gradle — see android/version.properties")
+    }
+}
+rootProject.ext.printechsVersionProps = vp
+rootProject.ext.printechsVersionPropsFile = versionPropertiesFile
+
+/** Bump last numeric segment: 1.0.1 -> 1.0.2, 1.0.9 -> 1.0.10, 2 -> 3 */
+static String bumpPatchVersionName(String raw) {
+    if (raw == null || raw.trim().isEmpty()) return "1.0.1"
+    def s = raw.trim()
+    def m = (s =~ /^(.+\.)(\d+)$/)
+    if (m.matches()) {
+        def prefix = m[0][1]
+        def last = (m[0][2] as int) + 1
+        return prefix + last
+    }
+    if (s.isInteger()) return String.valueOf((s as int) + 1)
+    return s + ".1"
+}
+
+def readVersionCode() {
+    try {
+        def p = rootProject.ext.printechsVersionProps as Properties
+        return Integer.parseInt(p.getProperty("VERSION_CODE", "1"))
+    } catch (Exception ignored) {
+        return 1
+    }
+}
+
+def readVersionName() {
+    return (rootProject.ext.printechsVersionProps as Properties).getProperty("VERSION_NAME", "1.0.0")
+}
+
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
 /**
@@ -92,8 +137,8 @@ android {
         applicationId 'com.printechs.wmsmobile'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0.0"
+        versionCode readVersionCode()
+        versionName readVersionName()
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }
@@ -129,6 +174,55 @@ android {
     }
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+}
+
+// Release: bump android/version.properties (patch +1, e.g. 1.0.1 -> 1.0.2) and VERSION_CODE; wire into AGP (cannot set defaultConfig in preReleaseBuild).
+def printechsVersionCodeFile = layout.buildDirectory.file("printechs-version/versionCode.txt")
+def printechsVersionNameFile = layout.buildDirectory.file("printechs-version/versionName.txt")
+
+def syncReleaseVersionForBuild = tasks.register("syncReleaseVersionForBuild") {
+    outputs.file(printechsVersionCodeFile)
+    outputs.file(printechsVersionNameFile)
+    doLast {
+        def f = rootProject.ext.printechsVersionPropsFile as File
+        def props = new Properties()
+        if (f.exists()) {
+            f.withInputStream { props.load(it) }
+        }
+        def prevCode = Integer.parseInt(props.getProperty("VERSION_CODE", "1"))
+        def prevName = props.getProperty("VERSION_NAME", "1.0.0")
+        def nextCode = prevCode + 1
+        def nextName = bumpPatchVersionName(prevName)
+        f.text =
+            "# Auto: each release build bumps last segment of VERSION_NAME (1.0.1 -> 1.0.2) and increments VERSION_CODE.\n" +
+            "VERSION_CODE=${nextCode}\n" +
+            "VERSION_NAME=${nextName}\n"
+        rootProject.ext.printechsVersionProps = props
+        printechsVersionCodeFile.get().asFile.parentFile.mkdirs()
+        printechsVersionCodeFile.get().asFile.text = String.valueOf(nextCode)
+        printechsVersionNameFile.get().asFile.text = nextName
+        println "Printechs release: versionCode=${nextCode}, versionName=${nextName} (android/version.properties updated)"
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        variant.outputs.forEach { output ->
+            output.versionCode.set(syncReleaseVersionForBuild.map {
+                Integer.parseInt(printechsVersionCodeFile.get().asFile.text.trim())
+            })
+            output.versionName.set(syncReleaseVersionForBuild.map {
+                printechsVersionNameFile.get().asFile.text.trim()
+            })
+        }
+    }
+}
+
+afterEvaluate {
+    def preRel = tasks.findByName("preReleaseBuild")
+    if (preRel != null) {
+        preRel.dependsOn(syncReleaseVersionForBuild)
     }
 }
 

@@ -25,7 +25,77 @@ import { getSettings, saveSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { dataService } from "../services/data.service";
 import { normalizeASN } from "../utils/asn";
+import { canonicalStoreForToLine } from "../utils/to-store-master";
+import {
+  storeFieldFromAllocationRow,
+  itemCodeFromAllocationRow,
+} from "../utils/allocation-row-fields";
 import { ProgressIndicator } from "../components/ProgressIndicator";
+import { isDeviceOnline } from "../utils/network-check";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cleanSessionPart(value: unknown): string {
+  return String(value ?? "")
+    .replace(/[^A-Z0-9]/g, "")
+    .toUpperCase();
+}
+
+function cleanOwnerCandidates(...values: unknown[]): string[] {
+  return Array.from(
+    new Set(values.map(cleanSessionPart).filter((value) => value.length > 0))
+  );
+}
+
+function sessionRecordBelongsToDevice(session: any, deviceId: string): boolean {
+  const cleanDevice = cleanSessionPart(deviceId);
+  if (!cleanDevice) return false;
+
+  const explicitDevice = cleanSessionPart(
+    session?.device_id || session?.device || session?.mobile_device_id
+  );
+  if (explicitDevice) {
+    return explicitDevice === cleanDevice;
+  }
+
+  const inboundSession = String(
+    session?.inbound_session || session?.session_id || session?.id || session?.title || ""
+  ).toUpperCase();
+  return inboundSession.includes(`-${cleanDevice}-`);
+}
+
+function sessionRecordBelongsToUser(session: any, userCandidates: string[]): boolean {
+  if (userCandidates.length === 0) return false;
+
+  const explicitUser = cleanSessionPart(
+    session?.started_by ||
+      session?.user_id ||
+      session?.user ||
+      session?.owner ||
+      session?.created_by
+  );
+  if (explicitUser) {
+    return userCandidates.includes(explicitUser);
+  }
+
+  const inboundSession = String(
+    session?.inbound_session || session?.session_id || session?.id || session?.title || ""
+  ).toUpperCase();
+  return userCandidates.some((user) => inboundSession.includes(`-${user}`));
+}
+
+function sessionRecordBelongsToCurrentUserAndDevice(
+  session: any,
+  deviceId: string,
+  userCandidates: string[]
+): boolean {
+  return (
+    sessionRecordBelongsToUser(session, userCandidates) &&
+    sessionRecordBelongsToDevice(session, deviceId)
+  );
+}
 
 export default function StartInboundScreen() {
   const navigation = useNavigation();
@@ -46,14 +116,14 @@ export default function StartInboundScreen() {
   const [loadingTO, setLoadingTO] = useState(false);
   const [sessionId, setSessionId] = useState<string>("");
   const [existingSessions, setExistingSessions] = useState<
-    Array<{
+    {
       inbound_session: string;
       status: string;
       started_on: string | null;
       completed_cartons: number;
       total_cartons: number;
       updated_on: string;
-    }>
+    }[]
   >([]);
   const [showSessionList, setShowSessionList] = useState(false);
   const [allCartonsCompleted, setAllCartonsCompleted] = useState(false);
@@ -388,56 +458,53 @@ export default function StartInboundScreen() {
   const checkExistingSessions = async (asn: string) => {
     try {
       const settings = await getSettings();
-      const userId = settings.user_id || "USER-AUTO";
       const deviceId = settings.device_id || "DEV-AUTO";
+      const userCandidates = cleanOwnerCandidates(settings.user_id, settings.user_code);
+      const apiEnabled = !!settings.api_url && settings.demo_mode !== 1;
 
-      // First, check local database - try both with and without device/user filters
-      // This ensures we show all sessions for the ASN, not just for current device/user
-      const localSessionsByCombination =
-        await dataService.getSessionsByCombination(asn, deviceId, userId);
+      let localSessions: any[] = [];
+      if (!apiEnabled) {
+        setExistingSessions([]);
+        setAllCartonsCompleted(false);
+        console.warn(
+          "ℹ️ API is not enabled; local inbound sessions are not shown."
+        );
+        return;
+      }
 
-      // Also get all sessions for this ASN (regardless of device/user)
-      // This helps when user navigates back and wants to see all sessions
-      let localSessionsAll: any[] = [];
       try {
         const db = await getDatabase();
         const normalizedASN = normalizeASN(asn);
-        localSessionsAll = await db.getAllAsync<any>(
+        const rows = await db.getAllAsync<any>(
           "SELECT * FROM inbound_sessions WHERE asn_no = ? ORDER BY updated_on DESC",
           [normalizedASN]
         );
+        localSessions = rows
+          .filter((s: any) => {
+            const id = String(s?.inbound_session || "").toUpperCase();
+            return id.length > 0 && !id.startsWith("SESSION-");
+          })
+          .filter((s: any) =>
+            sessionRecordBelongsToCurrentUserAndDevice(s, deviceId, userCandidates)
+          );
         console.log(
-          `📋 Found ${localSessionsAll.length} total session(s) in DB for ASN ${normalizedASN}`
+          `📋 Found ${localSessions.length} server-backed local session(s) for this user/device in DB for ASN ${normalizedASN} (${rows.length} total for ASN)`
         );
       } catch (dbError: any) {
         console.warn(
-          `⚠️ Error querying all sessions for ASN:`,
+          `⚠️ Error querying sessions for ASN:`,
           dbError.message
         );
       }
 
-      // Merge both results, deduplicate by inbound_session
-      const sessionMap = new Map<string, any>();
-      for (const session of localSessionsByCombination) {
-        sessionMap.set(session.inbound_session, session);
-      }
-      for (const session of localSessionsAll) {
-        if (!sessionMap.has(session.inbound_session)) {
-          sessionMap.set(session.inbound_session, session);
-        }
-      }
-      const localSessions = Array.from(sessionMap.values());
-
-      console.log(
-        `📋 Merged sessions: ${localSessions.length} total (${localSessionsByCombination.length} by combination, ${localSessionsAll.length} by ASN only)`
-      );
-
       // Also try to fetch from backend API (if available and not in demo mode)
       let backendSessions: any[] = [];
-      if (settings.api_url && settings.demo_mode !== 1) {
+      let backendSessionFetchOk = false;
+      if (apiEnabled) {
         try {
           console.log(`🌐 Fetching sessions from backend for ASN: ${asn}`);
           const backendResponse = await apiService.getInboundSessions();
+          backendSessionFetchOk = true;
 
           // Handle different response formats
           if (Array.isArray(backendResponse)) {
@@ -456,15 +523,23 @@ export default function StartInboundScreen() {
 
           // Filter sessions for this ASN (normalize for comparison)
           const normalizedASN = normalizeASN(asn);
-          backendSessions = backendSessions.filter((s: any) => {
-            const sessionASN = normalizeASN(
-              s.asn_no || s.advance_shipping_notice || ""
+          backendSessions = backendSessions
+            .filter((s: any) => {
+              const sessionASN = normalizeASN(
+                s.asn_no || s.advance_shipping_notice || ""
+              );
+              return sessionASN === normalizedASN;
+            })
+            .filter((s: any) =>
+              sessionRecordBelongsToCurrentUserAndDevice(
+                s,
+                deviceId,
+                userCandidates
+              )
             );
-            return sessionASN === normalizedASN;
-          });
 
           console.log(
-            `📋 Found ${backendSessions.length} session(s) from backend for ASN ${asn}`
+            `📋 Found ${backendSessions.length} session(s) from backend for ASN ${asn} (this user/device only)`
           );
         } catch (backendError: any) {
           // Backend API might not be available or might return 404 - that's OK
@@ -474,16 +549,25 @@ export default function StartInboundScreen() {
         }
       }
 
+      if (!backendSessionFetchOk) {
+        setExistingSessions([]);
+        setAllCartonsCompleted(false);
+        console.warn(
+          `ℹ️ Backend session list was not reachable for ASN ${asn}; not showing local fallback sessions.`
+        );
+        return;
+      }
+
       // Merge local and backend sessions (deduplicate by inbound_session)
       // Map local sessions to match existingSessions type (subset of fields)
-      const allSessions: Array<{
+      const allSessions: {
         inbound_session: string;
         status: string;
         started_on: string | null;
         completed_cartons: number;
         total_cartons: number;
         updated_on: string;
-      }> = localSessions.map((s: any) => ({
+      }[] = localSessions.map((s: any) => ({
         inbound_session: s.inbound_session,
         status: s.status,
         started_on: s.started_on,
@@ -695,17 +779,35 @@ export default function StartInboundScreen() {
 
             if (allocations && Array.isArray(allocations)) {
               const db = await getDatabase();
+              let masterRows: { code: string }[] = [];
+              try {
+                masterRows = await dataService.getWarehouseStoreMasterRows();
+              } catch {
+                masterRows = [];
+              }
               for (const alloc of allocations) {
-                const store = alloc.store || alloc.store_code;
-                const itemCode = alloc.item_code ?? "";
-                if (store) {
+                const rawStore = storeFieldFromAllocationRow(alloc);
+                const lineItem = itemCodeFromAllocationRow(alloc);
+                if (rawStore && lineItem) {
+                  const resolved = canonicalStoreForToLine(
+                    rawStore,
+                    masterRows
+                  );
+                  if (resolved.unknownInMaster) {
+                    console.warn(
+                      `⚠️ StartInbound TO store "${rawStore}" not in warehouse master (item ${lineItem}). ` +
+                        (resolved.suggestions.length
+                          ? `Similar: ${resolved.suggestions.join(", ")}`
+                          : "")
+                    );
+                  }
                   await db.runAsync(
                     "INSERT OR REPLACE INTO transfer_order_cache (to_no, asn_no, store, item_code, allocated_qty) VALUES (?, ?, ?, ?, ?)",
                     [
                       toNoStr,
                       asn,
-                      store,
-                      itemCode || "",
+                      resolved.storeToPersist || rawStore,
+                      lineItem,
                       alloc.allocated_qty ?? alloc.qty ?? 0,
                     ]
                   );
@@ -956,6 +1058,31 @@ export default function StartInboundScreen() {
     setLoading(true);
     try {
       const settings = await getSettings();
+      const apiEnabled = !!settings.api_url && settings.demo_mode !== 1;
+      if (!apiEnabled) {
+        Alert.alert(
+          "Network Required",
+          "Inbound sessions must be created on the server. Please configure the API connection before starting a session."
+        );
+        setLoading(false);
+        return;
+      }
+
+      const online = await isDeviceOnline();
+      if (!online) {
+        Alert.alert(
+          "Network Required",
+          "Cannot reach the server. Please connect to the network and try again before starting an inbound session."
+        );
+        setLoading(false);
+        return;
+      }
+
+      const currentOwnerCandidates = cleanOwnerCandidates(
+        userId,
+        settings.user_id,
+        settings.user_code
+      );
 
       // Normalize ASN only for database operations (lookups, storage) - only if ASN is provided
       const normalizedASN = scannedASN ? normalizeASN(scannedASN) : null;
@@ -966,6 +1093,7 @@ export default function StartInboundScreen() {
       let inboundSessionId = generatedSessionId; // Default to new session ID
       let sessionTotalCartons = 0;
       let sessionCompletedCartons = 0;
+      let hasForeignActiveBackendSession = false;
 
       if (
         !transferInTitle &&
@@ -977,52 +1105,86 @@ export default function StartInboundScreen() {
           console.warn(
             `🔍 Checking for existing sessions in backend for ASN: ${scannedASN}`
           );
-          const backendSessions = await apiService.getInboundSessions();
 
-          // Handle different response formats
-          let sessionsList: any[] = [];
-          if (Array.isArray(backendSessions)) {
-            sessionsList = backendSessions;
-          } else if (
-            backendSessions?.data &&
-            Array.isArray(backendSessions.data)
-          ) {
-            sessionsList = backendSessions.data;
-          } else if (
-            backendSessions?.sessions &&
-            Array.isArray(backendSessions.sessions)
-          ) {
-            sessionsList = backendSessions.sessions;
-          }
+          for (let attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+              await sleep(320);
+            }
+            const backendSessions = await apiService.getInboundSessions();
 
-          // Filter sessions for this ASN (try both original and normalized format)
-          const matchingSessions = sessionsList.filter((s: any) => {
-            const sessionASN = s.asn_no || s.advance_shipping_notice || "";
-            return (
-              normalizeASN(sessionASN) === normalizedASN ||
-              sessionASN.toUpperCase().trim() ===
-                scannedASN!.toUpperCase().trim()
-            );
-          });
+            let sessionsList: any[] = [];
+            if (Array.isArray(backendSessions)) {
+              sessionsList = backendSessions;
+            } else if (
+              backendSessions?.data &&
+              Array.isArray(backendSessions.data)
+            ) {
+              sessionsList = backendSessions.data;
+            } else if (
+              backendSessions?.sessions &&
+              Array.isArray(backendSessions.sessions)
+            ) {
+              sessionsList = backendSessions.sessions;
+            }
 
-          // Find the most recent active session (Receiving, Draft, or Open status)
-          existingSession = matchingSessions
-            .filter(
+            const matchingSessions = sessionsList.filter((s: any) => {
+              const sessionASN = s.asn_no || s.advance_shipping_notice || "";
+              return (
+                normalizeASN(sessionASN) === normalizedASN ||
+                sessionASN.toUpperCase().trim() ===
+                  scannedASN!.toUpperCase().trim()
+              );
+            });
+
+            const found = matchingSessions
+              .filter(
+                (s: any) =>
+                  s.status === "Receiving" ||
+                  s.status === "Draft" ||
+                  s.status === "Open" ||
+                  !s.status
+              )
+              .filter((s: any) =>
+                sessionRecordBelongsToCurrentUserAndDevice(
+                  s,
+                  deviceId,
+                  currentOwnerCandidates
+                )
+              )
+              .sort((a: any, b: any) => {
+                const dateA = new Date(
+                  a.started_on || a.created_at || a.updated_at || 0
+                );
+                const dateB = new Date(
+                  b.started_on || b.created_at || b.updated_at || 0
+                );
+                return dateB.getTime() - dateA.getTime();
+              })[0];
+
+            if (found) {
+              existingSession = found;
+              break;
+            }
+
+            const activeOtherDeviceCount = matchingSessions.filter(
               (s: any) =>
-                s.status === "Receiving" ||
-                s.status === "Draft" ||
-                s.status === "Open" ||
-                !s.status // Handle null/undefined status
-            )
-            .sort((a: any, b: any) => {
-              const dateA = new Date(
-                a.started_on || a.created_at || a.updated_at || 0
+                (s.status === "Receiving" ||
+                  s.status === "Draft" ||
+                  s.status === "Open" ||
+                  !s.status) &&
+                !sessionRecordBelongsToCurrentUserAndDevice(
+                  s,
+                  deviceId,
+                  currentOwnerCandidates
+                )
+            ).length;
+            if (activeOtherDeviceCount > 0) {
+              hasForeignActiveBackendSession = true;
+              console.warn(
+                `ℹ️ Ignored ${activeOtherDeviceCount} active backend session(s) for ASN ${scannedASN} because they belong to another user/device`
               );
-              const dateB = new Date(
-                b.started_on || b.created_at || b.updated_at || 0
-              );
-              return dateB.getTime() - dateA.getTime(); // Most recent first
-            })[0];
+            }
+          }
 
           if (existingSession) {
             inboundSessionId =
@@ -1045,7 +1207,6 @@ export default function StartInboundScreen() {
               completed_cartons: sessionCompletedCartons,
             });
 
-            // Load unload lines from backend to populate carton statuses
             try {
               const unloadLines = await apiService.getUnloadLines(
                 inboundSessionId
@@ -1066,7 +1227,6 @@ export default function StartInboundScreen() {
                 `📦 Found ${linesList.length} unload line(s) from backend for session ${inboundSessionId}`
               );
 
-              // Populate carton statuses from unload lines
               const db = await getDatabase();
               for (const line of linesList) {
                 const cartonId = line.unit_id || line.carton_id;
@@ -1075,10 +1235,10 @@ export default function StartInboundScreen() {
                   (line.unit_type === "Carton" || !line.unit_type)
                 ) {
                   await dataService.updateCartonStatus({
-                    asn_no: scannedASN!, // Use original format
+                    asn_no: scannedASN!,
                     inbound_session: inboundSessionId,
                     carton_id: cartonId,
-                    status: "Unloaded", // Unload lines indicate cartons were unloaded
+                    status: "Unloaded",
                     updated_on:
                       line.scanned_on ||
                       line.created_at ||
@@ -1094,12 +1254,13 @@ export default function StartInboundScreen() {
                 `⚠️ Could not load unload lines from backend:`,
                 unloadLinesError.message
               );
-              // Continue - this is not critical
             }
           } else {
-            console.warn(
-              `ℹ️ No existing active session found in backend for ASN ${scannedASN}, creating new session`
-            );
+            if (!existingSession) {
+              console.warn(
+                `ℹ️ No existing active session in GET list for ASN ${scannedASN}; server registration runs before first update`
+              );
+            }
           }
         } catch (sessionCheckError: any) {
           console.warn(
@@ -1406,6 +1567,201 @@ export default function StartInboundScreen() {
         cartons = []; // Transfer In doesn't use cartons
       }
 
+      const finalTotalCartons =
+        existingSession && sessionTotalCartons > 0
+          ? sessionTotalCartons
+          : cartons.length;
+      const finalCompletedCartons = existingSession
+        ? sessionCompletedCartons
+        : 0;
+
+      console.warn(`📊 Session carton counts:`, {
+        from_backend_session: existingSession
+          ? {
+              total: sessionTotalCartons,
+              completed: sessionCompletedCartons,
+            }
+          : null,
+        from_carton_map: cartons.length,
+        final_total: finalTotalCartons,
+        final_completed: finalCompletedCartons,
+      });
+
+      let inboundServerUpdateOk = false;
+
+      // Online: register on server. The backend creates sessions via
+      // /api/inbound/session/start, then /api/inbound/update keeps totals/status current.
+      if (settings.demo_mode !== 1 && settings.api_url) {
+        const transferOrderValue =
+          transferOrder && transferOrder.trim().length > 0
+            ? transferOrder
+            : undefined;
+        const transferOrderForStart = transferOrderValue || "-";
+        const dockForStart =
+          dock && String(dock).trim().length > 0 ? String(dock).trim() : "DOCK-01";
+        const warehouseForStart =
+          String((settings as any).warehouse || (settings as any).warehouse_id || "").trim() ||
+          "WH-MAIN";
+
+        let serverSessionStarted = !!existingSession;
+        if (
+          !transferInTitle &&
+          normalizedASN &&
+          !existingSession
+        ) {
+          if (hasForeignActiveBackendSession) {
+            console.warn(
+              `ℹ️ Backend has active session(s) for another user/device on ASN ${scannedASN}; creating/resuming only this user/device session.`
+            );
+          }
+          for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt > 0) {
+              await sleep(400);
+            }
+            try {
+              const startResponse: any = await apiService.startInbound({
+                inbound_session: generatedSessionId,
+                requested_session_id: generatedSessionId,
+                asn_no: scannedASN || normalizedASN,
+                source_type: "ASN",
+                source_doc: scannedASN || normalizedASN,
+                transfer_order: transferOrderForStart,
+                warehouse: warehouseForStart,
+                dock: dockForStart,
+                user_id: userId,
+                device_id: deviceId,
+              });
+              const serverSessionId =
+                startResponse?.inbound_session ||
+                startResponse?.session_id ||
+                startResponse?.session?.inbound_session ||
+                startResponse?.session?.name ||
+                startResponse?.data?.inbound_session ||
+                startResponse?.data?.session_id ||
+                startResponse?.data?.session?.inbound_session ||
+                startResponse?.data?.session?.name;
+              if (serverSessionId) {
+                if (String(serverSessionId) !== generatedSessionId) {
+                  Alert.alert(
+                    "Backend Session Formula Required",
+                    `Mobile requested session:\n${generatedSessionId}\n\nBackend returned:\n${serverSessionId}\n\nPlease update /api/inbound/session/start to use the requested inbound_session/requested_session_id instead of generating an IB number.`
+                  );
+                  setLoading(false);
+                  return;
+                }
+                const serverSessionRecord = {
+                  inbound_session: String(serverSessionId),
+                  device_id:
+                    startResponse?.device_id ||
+                    startResponse?.session?.device_id ||
+                    startResponse?.data?.device_id ||
+                    startResponse?.data?.session?.device_id ||
+                    deviceId,
+                  user_id:
+                    startResponse?.user_id ||
+                    startResponse?.started_by ||
+                    startResponse?.session?.user_id ||
+                    startResponse?.session?.started_by ||
+                    startResponse?.data?.user_id ||
+                    startResponse?.data?.started_by ||
+                    startResponse?.data?.session?.user_id ||
+                    startResponse?.data?.session?.started_by ||
+                    userId,
+                };
+                if (
+                  sessionRecordBelongsToCurrentUserAndDevice(
+                    serverSessionRecord,
+                    deviceId,
+                    currentOwnerCandidates
+                  )
+                ) {
+                  inboundSessionId = String(serverSessionId);
+                  serverSessionStarted = true;
+                  break;
+                }
+                console.warn(
+                  `ℹ️ Ignoring server start response session ${serverSessionId} because it belongs to another user/device`
+                );
+                Alert.alert(
+                  "Session Not Created",
+                  "The server returned a session for another user or device. Mobile will not create a local fallback session."
+                );
+                setLoading(false);
+                return;
+              }
+              throw new Error(
+                "Server did not return an inbound_session from /api/inbound/session/start."
+              );
+            } catch (e) {
+              if (attempt === 1) {
+                console.warn(
+                  `⚠️ POST /api/inbound/session/start failed:`,
+                  (e as Error)?.message || e
+                );
+              }
+            }
+          }
+        }
+
+        if (!existingSession && !serverSessionStarted) {
+          Alert.alert(
+            "Session Not Created",
+            "The server did not confirm a new inbound session. Please check the API/server connection and try again."
+          );
+          setLoading(false);
+          return;
+        }
+
+        const sessionData: Record<string, unknown> = {
+          inbound_session: inboundSessionId,
+          status: existingSession?.status || "Receiving",
+          transfer_order: transferOrderValue,
+          dock: dock,
+          total_cartons: finalTotalCartons,
+          completed_cartons: finalCompletedCartons,
+          user_id: userId,
+          device_id: deviceId,
+        };
+        if (transferInTitle) {
+          sessionData.transfer_in = transferInTitle;
+        } else if (normalizedASN) {
+          sessionData.asn_no = scannedASN || normalizedASN;
+        }
+        let lastSyncErr: unknown = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) {
+            await sleep(400 * attempt);
+          }
+          try {
+            await apiService.updateInboundSession(sessionData as any);
+            lastSyncErr = null;
+            inboundServerUpdateOk = true;
+            break;
+          } catch (e) {
+            lastSyncErr = e;
+          }
+        }
+        if (lastSyncErr != null && !serverSessionStarted) {
+          Alert.alert(
+            "Server did not confirm session",
+            `Mobile will not create a local fallback session.\n\n${
+              (lastSyncErr as Error)?.message || String(lastSyncErr)
+            }`
+          );
+          setLoading(false);
+          return;
+        }
+
+        if (!inboundServerUpdateOk) {
+          Alert.alert(
+            "Server did not confirm session",
+            "Mobile will not create a local fallback session. Please check the API/server connection and try again."
+          );
+          setLoading(false);
+          return;
+        }
+      }
+
       // Initialize carton statuses (only if we have cartons and it's ASN)
       if (cartons.length > 0 && !transferInTitle && normalizedASN) {
         console.log(
@@ -1443,7 +1799,7 @@ export default function StartInboundScreen() {
 
           for (const box of demoBoxes) {
             await db.runAsync(
-              "INSERT OR REPLACE INTO box_cache (box_id, asn_no, to_no, store, status, updated_on) VALUES (?, ?, ?, ?, ?, ?)",
+              "INSERT OR REPLACE INTO box_cache (box_id, asn_no, to_no, store, status, updated_on, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
               [
                 box.box_id,
                 normalizedASN,
@@ -1451,35 +1807,12 @@ export default function StartInboundScreen() {
                 box.store,
                 box.status,
                 new Date().toISOString(),
+                null,
               ]
             );
           }
         }
       }
-
-      // Determine total_cartons: Use session data from backend if available, otherwise use cartons.length
-      // This ensures we use the correct count from backend (e.g., 3) even if asn_carton_map is empty
-      const finalTotalCartons =
-        existingSession && sessionTotalCartons > 0
-          ? sessionTotalCartons
-          : cartons.length;
-
-      // Determine completed_cartons: Use session data from backend if available
-      const finalCompletedCartons = existingSession
-        ? sessionCompletedCartons
-        : 0;
-
-      console.warn(`📊 Session carton counts:`, {
-        from_backend_session: existingSession
-          ? {
-              total: sessionTotalCartons,
-              completed: sessionCompletedCartons,
-            }
-          : null,
-        from_carton_map: cartons.length,
-        final_total: finalTotalCartons,
-        final_completed: finalCompletedCartons,
-      });
 
       // Save session to local database
       await dataService.saveInboundSession({
@@ -1493,49 +1826,42 @@ export default function StartInboundScreen() {
         completed_cartons: finalCompletedCartons, // Use backend value if available
         started_by: existingSession?.started_by || userId,
         started_on: existingSession?.started_on || new Date().toISOString(),
-        synced: existingSession ? 1 : 0, // Mark as synced if loaded from backend
+        synced:
+          settings.demo_mode === 1 || !settings.api_url
+            ? existingSession
+              ? 1
+              : 0
+            : inboundServerUpdateOk
+              ? 1
+              : 0,
       });
 
-      // Sync session to backend using /api/inbound/update
-      try {
-        // Ensure transfer_order is included even if empty string (convert empty to null for clarity)
-        const transferOrderValue =
-          transferOrder && transferOrder.trim().length > 0
-            ? transferOrder
-            : undefined;
-
-        const sessionData: any = {
-          inbound_session: inboundSessionId,
-          status: existingSession?.status || "Receiving", // Use existing status if found
-          transfer_order: transferOrderValue,
-          dock: dock,
-          total_cartons: finalTotalCartons, // Use backend value if available
-          completed_cartons: finalCompletedCartons, // Use backend value if available
-          user_id: userId,
-          device_id: deviceId,
-        };
-
-        // Use transfer_in for Transfer In, asn_no for ASN
-        if (transferInTitle) {
-          sessionData.transfer_in = transferInTitle;
-          // Don't set asn_no for Transfer In
-        } else if (normalizedASN) {
-          sessionData.asn_no = normalizedASN;
+      // Server sync for online builds is done above (before carton init). Demo / no API: best-effort once here.
+      if (settings.demo_mode === 1 || !settings.api_url) {
+        try {
+          const transferOrderValue =
+            transferOrder && transferOrder.trim().length > 0
+              ? transferOrder
+              : undefined;
+          const sessionData: any = {
+            inbound_session: inboundSessionId,
+            status: existingSession?.status || "Receiving",
+            transfer_order: transferOrderValue,
+            dock: dock,
+            total_cartons: finalTotalCartons,
+            completed_cartons: finalCompletedCartons,
+            user_id: userId,
+            device_id: deviceId,
+          };
+          if (transferInTitle) {
+            sessionData.transfer_in = transferInTitle;
+          } else if (normalizedASN) {
+            sessionData.asn_no = scannedASN || normalizedASN;
+          }
+          await apiService.updateInboundSession(sessionData);
+        } catch {
+          // Offline demo — ignore
         }
-
-        await apiService.updateInboundSession(sessionData);
-
-        console.log(
-          `✅ Session synced with transfer_order: ${
-            transferOrderValue || "(none)"
-          }`
-        );
-        console.log("✅ Session synced to backend");
-      } catch (syncError: any) {
-        console.warn(
-          "⚠️ Failed to sync session to backend:",
-          syncError.message
-        );
       }
 
       // For ASN, use the scanned ASN format (preserve exact format from barcode)
@@ -1737,8 +2063,11 @@ export default function StartInboundScreen() {
           
           const asnTasks = tasksList.filter((t: any) => {
             const taskASN = t.asn_no || t.advance_shipping_notice || "";
-            return normalizeASN(taskASN) === normalizeASN(scannedASN) ||
-                   taskASN.toUpperCase().trim() === scannedASN.toUpperCase().trim();
+            return (
+              !!scannedASN &&
+              (normalizeASN(taskASN) === normalizeASN(scannedASN) ||
+                taskASN.toUpperCase().trim() === scannedASN.toUpperCase().trim())
+            );
           });
           
           if (asnTasks.length > 0) {
@@ -1787,44 +2116,25 @@ export default function StartInboundScreen() {
     );
 
     if (existingSession && existingSession.status !== "Completed") {
-      // Session exists and is not completed - show options
-      Alert.alert(
-        "Session Already Exists",
-        `A session with ID ${generatedSessionId} already exists.\n\nStatus: ${
-          existingSession.status
-        }\nStarted: ${
-          existingSession.started_on
-            ? new Date(existingSession.started_on).toLocaleString()
-            : "Unknown"
-        }\n\nDo you want to resume this session or create a new one?`,
-        [
-          {
-            text: "Resume Existing",
-            onPress: () => {
-              handleSelectExistingSession(existingSession);
-            },
-          },
-          {
-            text: "Create New",
-            style: "destructive",
-            onPress: async () => {
-              // Create new session (will overwrite existing)
-              await createNewSession(
-                scannedASN,
-                userId,
-                deviceId,
-                generatedSessionId,
-                sourceType === "TransferIn" ? selectedTransferIn : null
-              );
-            },
-          },
-        ]
+      const serverBackedExistingSession = existingSessions.find(
+        (session) => session.inbound_session === generatedSessionId,
       );
-      return;
+      if (serverBackedExistingSession) {
+        // Same user/device session exists in the server-backed list: resume it.
+        await handleSelectExistingSession(serverBackedExistingSession);
+        return;
+      }
+      console.warn(
+        `ℹ️ Ignoring local-only inbound session ${generatedSessionId}; backend confirmation is required.`,
+      );
     }
 
     // If there are other existing sessions, show list
     if (existingSessions.length > 0) {
+      if (existingSessions.length === 1) {
+        await handleSelectExistingSession(existingSessions[0]);
+        return;
+      }
       setShowSessionList(true);
       return;
     }
@@ -1864,6 +2174,19 @@ export default function StartInboundScreen() {
       <Text style={styles.sessionTapHint}>Tap to resume</Text>
     </TouchableOpacity>
   );
+
+  const hasActiveExistingSession = existingSessions.some((session) => {
+    const status = String(session.status || "").trim().toLowerCase();
+    return ![
+      "completed",
+      "complete",
+      "closed",
+      "cancelled",
+      "canceled",
+      "received",
+      "done",
+    ].includes(status);
+  });
 
   return (
     <SafeAreaView
@@ -2025,22 +2348,6 @@ export default function StartInboundScreen() {
           </View>
         )}
 
-        {existingSessions.length > 0 && (
-          <View style={styles.inputGroup}>
-            <Text style={styles.label}>
-              Existing Sessions ({existingSessions.length})
-            </Text>
-            <TouchableOpacity
-              style={styles.viewSessionsButton}
-              onPress={() => setShowSessionList(true)}
-            >
-              <Text style={styles.viewSessionsButtonText}>
-                View Existing Sessions
-              </Text>
-            </TouchableOpacity>
-          </View>
-        )}
-
         <View style={styles.buttonContainer}>
           <View style={styles.buttonBorderTop} />
           <TouchableOpacity
@@ -2056,6 +2363,10 @@ export default function StartInboundScreen() {
                 ? "Starting..."
                 : allCartonsCompleted
                 ? "All Cartons Received"
+                : existingSessions.length === 1
+                ? "Continue Existing Session"
+                : existingSessions.length > 1
+                ? `Choose Existing Session (${existingSessions.length})`
                 : "Start Inbound Session"}
             </Text>
           </TouchableOpacity>
@@ -2088,49 +2399,56 @@ export default function StartInboundScreen() {
                 <Text style={styles.emptyText}>No existing sessions found</Text>
               }
             />
-            <TouchableOpacity
-              style={[
-                styles.createNewButton,
-                allCartonsCompleted && styles.buttonDisabled,
-              ]}
-              onPress={async () => {
-                if (allCartonsCompleted) {
-                  Alert.alert(
-                    "All Cartons Received",
-                    "All cartons for this ASN have been received. Cannot create a new session.",
-                    [{ text: "OK" }]
-                  );
-                  return;
-                }
-                setShowSessionList(false);
-                const settings = await getSettings();
-                const userId = settings.user_id || "USER-AUTO";
-                const deviceId = settings.device_id || "DEV-AUTO";
-                const scannedASN = asnNo.trim().toUpperCase();
-                const normalizedASN = normalizeASN(scannedASN);
-                const generatedSessionId = dataService.generateSessionId(
-                  normalizedASN,
-                  deviceId,
-                  userId
-                );
-                await createNewSession(
-                  scannedASN,
-                  userId,
-                  deviceId,
-                  generatedSessionId
-                );
-              }}
-              disabled={allCartonsCompleted}
-            >
-              <Text
-                style={[
-                  styles.createNewButtonText,
-                  allCartonsCompleted && styles.buttonDisabledText,
-                ]}
-              >
-                Create New Session
+            {hasActiveExistingSession ? (
+              <Text style={styles.resumeExistingHint}>
+                Active session found. Tap the session above to resume; a new
+                session is not required.
               </Text>
-            </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={[
+                  styles.createNewButton,
+                  allCartonsCompleted && styles.buttonDisabled,
+                ]}
+                onPress={async () => {
+                  if (allCartonsCompleted) {
+                    Alert.alert(
+                      "All Cartons Received",
+                      "All cartons for this ASN have been received. Cannot create a new session.",
+                      [{ text: "OK" }]
+                    );
+                    return;
+                  }
+                  setShowSessionList(false);
+                  const settings = await getSettings();
+                  const userId = settings.user_id || "USER-AUTO";
+                  const deviceId = settings.device_id || "DEV-AUTO";
+                  const scannedASN = asnNo.trim().toUpperCase();
+                  const normalizedASN = normalizeASN(scannedASN);
+                  const generatedSessionId = dataService.generateSessionId(
+                    normalizedASN,
+                    deviceId,
+                    userId
+                  );
+                  await createNewSession(
+                    scannedASN,
+                    userId,
+                    deviceId,
+                    generatedSessionId
+                  );
+                }}
+                disabled={allCartonsCompleted}
+              >
+                <Text
+                  style={[
+                    styles.createNewButtonText,
+                    allCartonsCompleted && styles.buttonDisabledText,
+                  ]}
+                >
+                  Create New Session
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       </Modal>
@@ -2340,6 +2658,14 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 16,
     fontWeight: "bold",
+  },
+  resumeExistingHint: {
+    color: "#666",
+    fontSize: 13,
+    fontStyle: "italic",
+    lineHeight: 18,
+    marginTop: 16,
+    textAlign: "center",
   },
   radioGroup: {
     flexDirection: "row",

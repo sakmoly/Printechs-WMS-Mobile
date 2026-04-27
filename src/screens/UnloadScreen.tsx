@@ -19,14 +19,175 @@ import { normalizeASN } from "../utils/asn";
 import { apiService } from "../services/api.service";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import { getDatabase } from "../database/database";
+import {
+  fetchBackendCartonUnloadBlockedFromASN,
+  getServerUnloadLineForCarton,
+  isDuplicateUnloadLinePostError,
+  parseUnloadLinesResponse,
+} from "../utils/inbound-unload-server-check";
+import {
+  collectCartonRowsFromAsnPayload,
+  reconcileCartonStatusesFromBackendAsn,
+} from "../utils/reconcile-carton-status-from-asn";
+import { settingsMatchUnloadedActor } from "../utils/unload-actor-match";
+import {
+  parseAsnPayloadForReceiveSortServerBlock,
+  fetchBackendReceiveSortBlockedFromASN,
+} from "../utils/asn-carton-receive-server-gate";
+import {
+  parseAsnPayloadForCartonLock,
+  isOtherScannerLock,
+} from "../utils/inbound-carton-lock-from-asn";
+
+function actorFromUnloadLine(line: Record<string, unknown> | null | undefined): string {
+  if (!line) return "";
+  const v =
+    line.scanned_by ??
+    line.scannedBy ??
+    line.user_name ??
+    line.userName ??
+    line.user_code ??
+    line.userCode ??
+    line.user_id ??
+    line.userId ??
+    line.owner ??
+    line.owner_name ??
+    line.created_by ??
+    line.createdBy ??
+    line.modified_by ??
+    line.modifiedBy ??
+    line.operator ??
+    line.operator_name ??
+    line.full_name ??
+    line.fullName ??
+    "";
+  return String(v).trim();
+}
+
+/** GET unload-lines: device on the line or session hint from API. */
+function deviceFromUnloadLine(line: Record<string, unknown> | null | undefined): string {
+  if (!line) return "";
+  const v =
+    line.device_id ??
+    line.deviceId ??
+    line.device_hint_from_session ??
+    line.deviceHintFromSession ??
+    line.scanned_device_id ??
+    line.scannedDeviceId ??
+    "";
+  return String(v).trim();
+}
+
+function unloadLineTimestampMs(line: Record<string, unknown>): number {
+  const raw = String(
+    line.scanned_on ??
+      line.scannedOn ??
+      line.creation ??
+      line.created_at ??
+      line.createdAt ??
+      line.modified ??
+      line.modified_on ??
+      ""
+  ).trim();
+  const t = Date.parse(raw);
+  return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+}
+
+function currentUserDisplayForUnload(settings: {
+  user_code?: string | null;
+  user_id?: string | null;
+}): string {
+  return (
+    String(settings.user_code || "").trim() ||
+    String(settings.user_id || "").trim() ||
+    ""
+  );
+}
+
+function normalizeLockOwner(value: unknown): string {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function settingsMatchCartonLockOwner(
+  settings: { user_id?: string | null; user_code?: string | null },
+  lockedBy: unknown
+): boolean {
+  const owner = normalizeLockOwner(lockedBy);
+  if (!owner) return false;
+
+  return [settings.user_id, settings.user_code]
+    .map(normalizeLockOwner)
+    .filter(Boolean)
+    .includes(owner);
+}
+
+function duplicateUnloadAlertMessage(
+  cartonId: string,
+  scannedBy: string,
+  scannedOnShort: string,
+  deviceLabel?: string
+): string {
+  const who = String(scannedBy || "").trim() || "another user";
+  const when = String(scannedOnShort || "").trim();
+  const dev = String(deviceLabel || "").trim() || "—";
+  return (
+    `Carton ${cartonId} was already unloaded on this session by ${who}` +
+    (when ? ` at ${when}` : "") +
+    ` · device ${dev}` +
+    `.\n\nYou cannot unload it again here. If another phone still unloaded the same carton, it may be using a different inbound session id (unload lines use parent_title); use one shared session on all devices, or have the API reject duplicate ASN + carton.`
+  );
+}
+
+/** Backend can return 500 + MySQL deadlock on busy carton status updates — brief retry. */
+async function updateCartonStatusApiWithRetry(
+  payload: Parameters<typeof apiService.updateCartonStatus>[0],
+  maxAttempts = 4
+): Promise<any> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await apiService.updateCartonStatus(payload);
+    } catch (e: any) {
+      lastErr = e;
+      const s = String(e?.message ?? e ?? "");
+      const transient =
+        e?.status === 500 ||
+        s.includes("500") ||
+        s.includes("Deadlock") ||
+        s.includes("deadlock") ||
+        s.includes("DATABASE_ERROR") ||
+        s.includes("try restarting transaction");
+      if (transient && attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 150 * Math.pow(2, attempt)));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
 
 export default function UnloadScreen() {
   const navigation = useNavigation();
+  const goToReceiveSort = React.useCallback(
+    (cartonId?: string) => {
+      if (cartonId) {
+        (navigation as any).navigate("ReceiveSort", { cartonId });
+      } else {
+        (navigation as any).navigate("ReceiveSort");
+      }
+    },
+    [navigation]
+  );
   const { activeASN, activeSession } = useApp();
   const [cartons, setCartons] = useState<any[]>([]);
   const [totalCartons, setTotalCartons] = useState<number>(0);
   const [scannedCartons, setScannedCartons] = useState<number>(0);
   const [loading, setLoading] = useState(false);
+  const [currentLockOwner, setCurrentLockOwner] = useState<{
+    user_id?: string | null;
+    user_code?: string | null;
+  }>({});
 
   useEffect(() => {
     loadCartons();
@@ -36,6 +197,11 @@ export default function UnloadScreen() {
     if (!activeASN || !activeSession) return;
 
     const normalizedASN = normalizeASN(activeASN);
+    const currentSettings = await getSettings();
+    setCurrentLockOwner({
+      user_id: currentSettings.user_id,
+      user_code: currentSettings.user_code,
+    });
     console.log("🔄 UnloadScreen: Loading cartons...", {
       activeASN, // Original format
       normalizedASN, // Normalized format
@@ -45,7 +211,7 @@ export default function UnloadScreen() {
     // Get all cartons for this ASN from asn_carton_map (synced from desktop)
     // Try original format first (as cartons are stored with original format from desktop)
     // Then fall back to normalized format for backward compatibility
-    const allCartons = await dataService.getASNCartons(activeASN);
+    const allCartons = await dataService.getASNCartonsForUnload(activeASN);
     
     // DEBUG: Check what ASN formats are actually in the database
     try {
@@ -150,14 +316,21 @@ export default function UnloadScreen() {
       console.warn(`⚠️ Could not load session data from backend API:`, backendError.message);
     }
 
-    // Use session total_cartons if available and greater than 0, otherwise use carton map count
-    const finalTotalCartons = sessionTotalCartons > 0 ? sessionTotalCartons : allCartons.length;
+    // Prefer distinct supplier cartons from asn_carton_map (ground truth on device).
+    // Session total_cartons can be stale or out of sync with the synced map and look "stuck".
+    const mapDistinctCount = allCartons.length;
+    const finalTotalCartons =
+      mapDistinctCount > 0
+        ? mapDistinctCount
+        : sessionTotalCartons > 0
+          ? sessionTotalCartons
+          : 0;
     setTotalCartons(finalTotalCartons);
     
     console.warn(`📦 UnloadScreen: Carton counts:`, {
-      from_carton_map: allCartons.length,
-      from_session: sessionTotalCartons,
-      final_total: finalTotalCartons,
+      distinct_from_map: mapDistinctCount,
+      session_total_hint: sessionTotalCartons,
+      displayed_total: finalTotalCartons,
     });
 
     // ALWAYS try to load cartons from backend ASN details to ensure we have the latest data
@@ -254,10 +427,10 @@ export default function UnloadScreen() {
             console.warn(`✅ Found ${uniqueCartonIds.size} unique carton(s):`, Array.from(uniqueCartonIds));
             
             // Re-fetch cartons after populating - try both ASN formats
-            let reloadedCartons = await dataService.getASNCartons(asnToUse);
+            let reloadedCartons = await dataService.getASNCartonsForUnload(asnToUse);
             if (reloadedCartons.length === 0 && asnToUse !== activeASN) {
               // Also try with original activeASN format
-              reloadedCartons = await dataService.getASNCartons(activeASN);
+              reloadedCartons = await dataService.getASNCartonsForUnload(activeASN);
             }
             console.warn(`✅ Reloaded ${reloadedCartons.length} distinct carton(s) after backend sync`);
             
@@ -276,50 +449,146 @@ export default function UnloadScreen() {
     // Create set of valid carton IDs from desktop (for filtering)
     const validCartonIds = new Set(allCartons);
 
-    // CRITICAL: Load unload lines from backend to populate carton statuses
-    // This ensures we show cartons that were already scanned in previous sessions
+    // CRITICAL: Load unload lines from backend — canonical dock actor is scanned_by + device_id on the line.
+    // Every device must show the same user/device (not whoever last wrote local SQLite).
+    const serverUnloadByCarton = new Map<
+      string,
+      { cartonId: string; who: string; ts: string; deviceLabel: string }
+    >();
+    const serverOwnerByCarton = new Map<
+      string,
+      { owner: string; lockedOn: string | null }
+    >();
     try {
       const unloadLines = await apiService.getUnloadLines(activeSession);
-      let linesList: any[] = [];
-      if (Array.isArray(unloadLines)) {
-        linesList = unloadLines;
-      } else if (unloadLines?.data && Array.isArray(unloadLines.data)) {
-        linesList = unloadLines.data;
-      } else if (unloadLines?.lines && Array.isArray(unloadLines.lines)) {
-        linesList = unloadLines.lines;
+      const linesList = parseUnloadLinesResponse(unloadLines);
+
+      for (const line of linesList) {
+        const cartonId = String(line.unit_id || line.carton_id || "").trim();
+        if (!cartonId) continue;
+        const ut = String(line.unit_type ?? "").trim();
+        if (ut && ut.toLowerCase() !== "carton") continue;
+        const row = line as Record<string, unknown>;
+        const who = actorFromUnloadLine(row);
+        const deviceLabel = deviceFromUnloadLine(row);
+        const k = cartonId.toUpperCase();
+        const ts = String(
+          row.scanned_on ??
+            row.created_at ??
+            row.creation ??
+            new Date().toISOString()
+        );
+        const prev = serverUnloadByCarton.get(k);
+        const tNew = unloadLineTimestampMs(row);
+        const tOld = prev ? Date.parse(prev.ts) : NaN;
+        // Earliest unload wins; on equal time prefer first non-empty scanned_by / device_id.
+        if (!prev || !Number.isFinite(tOld) || tNew < tOld) {
+          serverUnloadByCarton.set(k, { cartonId, who, ts, deviceLabel });
+        } else if (Number.isFinite(tOld) && tNew === tOld) {
+          serverUnloadByCarton.set(k, {
+            cartonId,
+            who: prev.who || who,
+            ts,
+            deviceLabel: prev.deviceLabel || deviceLabel,
+          });
+        }
       }
 
       if (linesList.length > 0) {
-        console.warn(`📦 Found ${linesList.length} unload line(s) from backend for session ${activeSession}`);
-        
-        // Populate carton statuses from unload lines
-        for (const line of linesList) {
-          const cartonId = line.unit_id || line.carton_id;
-          if (cartonId && (line.unit_type === "Carton" || !line.unit_type)) {
-            // Only update if status doesn't exist or is "Pending"
-            const existingStatus = await dataService.getCartonStatus(
-              activeASN,
-              activeSession,
-              cartonId
+        console.warn(
+          `📦 Found ${linesList.length} unload line(s) from backend for session ${activeSession} (${serverUnloadByCarton.size} carton(s) with unload line data)`
+        );
+
+        for (const { cartonId, who, ts } of serverUnloadByCarton.values()) {
+          const existingStatus = await dataService.getCartonStatus(
+            activeASN,
+            activeSession,
+            cartonId
+          );
+
+          if (!existingStatus || existingStatus.status === "Pending") {
+            await dataService.updateCartonStatus({
+              asn_no: activeASN,
+              inbound_session: activeSession,
+              carton_id: cartonId,
+              status: "Unloaded",
+              unloaded_by: who || undefined,
+              updated_on: ts,
+            });
+            console.warn(
+              `✅ Updated carton ${cartonId} to Unloaded from unload line (by ${who || "(no scanned_by)"})`
             );
-            
-            if (!existingStatus || existingStatus.status === "Pending") {
+          } else if (existingStatus.status === "Unloaded") {
+            // Overwrite local unloaded_by so all handsets match server unload-line
+            const local = String(existingStatus.unloaded_by || "").trim();
+            if (who && local !== who) {
               await dataService.updateCartonStatus({
-                asn_no: activeASN, // Use original format
+                asn_no: activeASN,
                 inbound_session: activeSession,
                 carton_id: cartonId,
-                status: "Unloaded", // Unload lines indicate cartons were unloaded
-                updated_on: line.scanned_on || line.created_at || new Date().toISOString(),
+                status: "Unloaded",
+                unloaded_by: who,
+                updated_on: ts || existingStatus.updated_on,
               });
-              console.warn(`✅ Updated carton ${cartonId} status to Unloaded from unload line`);
+              console.warn(
+                `✅ Reconciled unloaded_by for ${cartonId}: "${local}" → "${who}" (server)`
+              );
             }
           }
         }
-        console.warn(`✅ Populated carton statuses from ${linesList.length} unload line(s)`);
+
+        // Unload lines exist for cartons not in map (no scanned_by): still mark Pending → Unloaded
+        for (const line of linesList) {
+          const cartonId = String(line.unit_id || line.carton_id || "").trim();
+          if (!cartonId) continue;
+          const ut = String(line.unit_type ?? "").trim();
+          if (ut && ut.toLowerCase() !== "carton") continue;
+          if (serverUnloadByCarton.has(cartonId.toUpperCase())) continue;
+          const existingStatus = await dataService.getCartonStatus(
+            activeASN,
+            activeSession,
+            cartonId
+          );
+          if (!existingStatus || existingStatus.status === "Pending") {
+            await dataService.updateCartonStatus({
+              asn_no: activeASN,
+              inbound_session: activeSession,
+              carton_id: cartonId,
+              status: "Unloaded",
+              updated_on:
+                line.scanned_on || line.created_at || new Date().toISOString(),
+            });
+          }
+        }
+
+        console.warn(
+          `✅ Applied unload lines for session ${activeSession} (server actor reconciled)`
+        );
       }
     } catch (unloadLinesError: any) {
       // Not critical - continue with local statuses
       console.warn(`⚠️ Could not load unload lines from backend:`, unloadLinesError.message);
+    }
+
+    // Fallback owner source: ASN detail rows expose "Opened By" / locked_by even when
+    // unload-lines for this session don't include scanned_by.
+    try {
+      const settingsOwner = await getSettings();
+      if (settingsOwner.api_url && settingsOwner.demo_mode !== 1) {
+        const asnRes = await apiService.getASN(activeASN.trim());
+        const rowsByCarton = collectCartonRowsFromAsnPayload(asnRes);
+        for (const [cartonId, row] of rowsByCarton.entries()) {
+          const owner = String(row.unloaded_actor || row.locked_by || "").trim();
+          if (owner) {
+            serverOwnerByCarton.set(cartonId.toUpperCase(), {
+              owner,
+              lockedOn: row.locked_on,
+            });
+          }
+        }
+      }
+    } catch (ownerError: any) {
+      console.warn(`⚠️ Could not load ASN owner fields:`, ownerError.message);
     }
 
     // Sync carton status FROM backend when desktop already marked cartons as Received
@@ -339,13 +608,13 @@ export default function UnloadScreen() {
         const st = (c.carton_status ?? c.status ?? c.receiving_status ?? "").toString().toLowerCase();
         if (cid && (st === "received" || st === "unloaded")) cartonIdsMarkedReceived.add(cid);
       }
-      // If backend returns ASN-level status as Received, treat all cartons as received (desktop may not send per-carton status)
+      // Do not expand ASN-level "Received" to every carton — that makes Unload counts jump to
+      // total/total with no per-carton scans. Rely on per-carton flags from details/cartons only.
       const asnStatus = (asnRes?.status ?? asnRes?.receiving_status ?? asnRes?.data?.status ?? asnRes?.data?.receiving_status ?? "").toString().toLowerCase();
       if (asnStatus === "received" || asnStatus === "completed") {
-        for (const cid of allCartons) {
-          if (cid) cartonIdsMarkedReceived.add(cid);
-        }
-        console.warn(`✅ ASN-level status is "${asnStatus}" – marking all ${allCartons.length} carton(s) as Unloaded`);
+        console.warn(
+          `ℹ️ ASN-level status is "${asnStatus}" — not auto-marking all cartons (use per-carton status from payload only)`
+        );
       }
       if (cartonIdsMarkedReceived.size > 0) {
         for (const cartonId of cartonIdsMarkedReceived) {
@@ -367,22 +636,31 @@ export default function UnloadScreen() {
       console.warn(`⚠️ Could not sync carton status from backend ASN:`, e?.message);
     }
 
-    // When backend says session is complete (all cartons received), mark all cartons as Unloaded on mobile
-    if (sessionCompletedCartons >= finalTotalCartons && finalTotalCartons > 0 && allCartons.length > 0) {
-      for (const cartonId of allCartons) {
-        const existing = await dataService.getCartonStatus(activeASN, activeSession, cartonId);
-        if (!existing || existing.status === "Pending") {
-          await dataService.updateCartonStatus({
-            asn_no: activeASN,
-            inbound_session: activeSession,
-            carton_id: cartonId,
-            status: "Unloaded",
-            updated_on: new Date().toISOString(),
-          });
+    // Live lock / receiving state: GET ASN from server, then upsert SQLite so every handset matches.
+    try {
+      const settingsRecon = await getSettings();
+      if (settingsRecon.api_url && settingsRecon.demo_mode !== 1) {
+        const recon = await reconcileCartonStatusesFromBackendAsn({
+          asnNoOriginal: activeASN,
+          inboundSession: activeSession,
+          cartonIds: validCartonIds,
+        });
+        if (!recon.ok && recon.networkError) {
+          Alert.alert("Server connection lost", recon.message);
+        } else if (!recon.ok) {
+          console.warn(`⚠️ Carton lock reconcile skipped:`, recon.message);
+        } else if (recon.updated > 0) {
+          console.log(
+            `✅ Reconciled ${recon.updated} carton status row(s) from server ASN (locks / receiving)`
+          );
         }
       }
-      console.warn(`✅ Session complete on backend (${sessionCompletedCartons}/${finalTotalCartons}) – marked all ${allCartons.length} carton(s) as Unloaded`);
+    } catch (reconErr: any) {
+      console.warn(`⚠️ Carton status reconcile error:`, reconErr?.message);
     }
+
+    // Do not bulk-mark every carton Unloaded when session counters say "complete" — that freezes
+    // Unload at scanned === total with no incremental dock scans.
 
     // Get carton statuses for this session
     // Use original ASN format first, then normalized for backward compatibility
@@ -408,6 +686,44 @@ export default function UnloadScreen() {
     const filteredStatuses = statuses.filter((status) =>
       validCartonIds.has(status.carton_id)
     );
+
+    /** Prefer GET unload-lines scanned_by + device_id so every handset matches server. */
+    const applyServerUnloadActors = <
+      T extends {
+        carton_id: string;
+        status: string;
+        unloaded_by?: string | null;
+        locked_by?: string | null;
+        locked_on?: string | null;
+      }
+    >(
+      list: T[]
+    ): T[] =>
+      list.map((s) => {
+        if (s.status !== "Unloaded") return s;
+        const row = serverUnloadByCarton.get(
+          String(s.carton_id || "").trim().toUpperCase()
+        );
+        const asnOwner = serverOwnerByCarton.get(
+          String(s.carton_id || "").trim().toUpperCase()
+        );
+        if (!row && !asnOwner) return s;
+        const out = { ...s } as T & { unloaded_device_label?: string };
+        const owner = String(row?.who || asnOwner?.owner || "").trim();
+        if (owner) (out as { unloaded_by?: string }).unloaded_by = owner;
+        if (asnOwner?.owner) {
+          (out as { locked_by?: string }).locked_by = asnOwner.owner;
+        }
+        if (asnOwner?.lockedOn) {
+          (out as { locked_on?: string }).locked_on = asnOwner.lockedOn;
+        }
+        const dev = String(row?.deviceLabel || "").trim();
+        if (dev) {
+          (out as { unloaded_device_label?: string }).unloaded_device_label =
+            dev;
+        }
+        return out;
+      });
 
     if (filteredStatuses.length !== statuses.length) {
       // Only log if significant number of invalid statuses (more than 1)
@@ -479,8 +795,9 @@ export default function UnloadScreen() {
           allValidStatuses.push(newStatus);
         }
       }
-      setCartons(allValidStatuses);
-      const scannedCount = allValidStatuses.filter(
+      const displayed = applyServerUnloadActors(allValidStatuses);
+      setCartons(displayed);
+      const scannedCount = displayed.filter(
         (c) =>
           c.status === "Unloaded" ||
           c.status === "Receiving" ||
@@ -488,7 +805,7 @@ export default function UnloadScreen() {
       ).length;
       setScannedCartons(scannedCount);
       console.log(
-        `✅ Initialized ${missingCartons.length} missing carton status(es). Total cartons: ${allValidStatuses.length}`
+        `✅ Initialized ${missingCartons.length} missing carton status(es). Total cartons: ${displayed.length}`
       );
       return;
     }
@@ -542,7 +859,7 @@ export default function UnloadScreen() {
       const validInitializedStatuses = initializedStatuses.filter((status) =>
         validCartonIds.has(status.carton_id)
       );
-      setCartons(validInitializedStatuses);
+      setCartons(applyServerUnloadActors(validInitializedStatuses));
       setScannedCartons(0);
       console.log(
         `✅ Initialized ${validInitializedStatuses.length} carton status(es) from desktop`
@@ -584,8 +901,9 @@ export default function UnloadScreen() {
         const validMigratedStatuses = migratedStatuses.filter((status) =>
           validCartonIds.has(status.carton_id)
         );
-        setCartons(validMigratedStatuses);
-        const scannedCount = validMigratedStatuses.filter(
+        const displayedM = applyServerUnloadActors(validMigratedStatuses);
+        setCartons(displayedM);
+        const scannedCount = displayedM.filter(
           (c) =>
             c.status === "Unloaded" ||
             c.status === "Receiving" ||
@@ -600,10 +918,11 @@ export default function UnloadScreen() {
     }
 
     // Use filtered statuses (only valid cartons from desktop)
-    setCartons(filteredStatuses);
+    const displayedMain = applyServerUnloadActors(filteredStatuses);
+    setCartons(displayedMain);
 
     // Count scanned cartons (Unloaded, Receiving, or Received) from filtered statuses
-    const scannedCount = filteredStatuses.filter(
+    const scannedCount = displayedMain.filter(
       (c) =>
         c.status === "Unloaded" ||
         c.status === "Receiving" ||
@@ -647,6 +966,16 @@ export default function UnloadScreen() {
       return;
     }
 
+    const okSupplierUnload =
+      await dataService.isCartonValidForSupplierUnload(activeASN, cartonId);
+    if (!okSupplierUnload) {
+      Alert.alert(
+        "Not a supplier unload carton",
+        `${cartonId} matches a distribution BOX barcode (Receive + Sort) or is only a local placeholder tied to that BOX — it is not listed as a supplier carton for this ASN.\n\nUnload only the cartons shown above, or use Receive + Sort with this BOX ID.`
+      );
+      return;
+    }
+
     // Always fetch latest carton status from database to ensure accuracy
     const settings = await getSettings();
 
@@ -677,7 +1006,52 @@ export default function UnloadScreen() {
 
     if (latestStatus) {
       if (latestStatus.status === "Unloaded") {
-        Alert.alert("Info", "Carton already unloaded");
+        const unloadedBy = String(
+          (latestStatus as { unloaded_by?: string | null }).unloaded_by || ""
+        ).trim();
+        if (
+          unloadedBy &&
+          !settingsMatchUnloadedActor(settings, unloadedBy)
+        ) {
+          Alert.alert(
+            "Already unloaded",
+            `This carton was already unloaded by ${unloadedBy}. Only that user can continue to receive and sort.`
+          );
+          return;
+        }
+        if (settings.demo_mode !== 1 && settings.api_url) {
+          try {
+            const recv = await fetchBackendReceiveSortBlockedFromASN(
+              activeASN,
+              cartonId
+            );
+            if (recv.blocked) {
+              await dataService.updateCartonStatus({
+                asn_no: activeASN,
+                inbound_session: activeSession,
+                carton_id: cartonId,
+                status: "Received",
+                locked_by: "",
+                locked_on: "",
+                updated_on: new Date().toISOString(),
+              });
+              await loadCartons();
+              Alert.alert(
+                "Carton already completed",
+                recv.reason ??
+                  "This carton was already received on the server. Your list has been updated."
+              );
+              return;
+            }
+          } catch (e: any) {
+            Alert.alert(
+              "Could not verify with server",
+              `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+            );
+            return;
+          }
+        }
+        goToReceiveSort(cartonId);
         return;
       }
 
@@ -689,25 +1063,24 @@ export default function UnloadScreen() {
         const currentUserId = settings.user_id
           ? String(settings.user_id).trim()
           : "";
+        const currentUserCode = settings.user_code
+          ? String(settings.user_code).trim()
+          : "";
 
         console.log(`🔍 Comparing lock status:`, {
           locked_by: lockedBy,
           locked_by_raw: latestStatus.locked_by,
           current_user: currentUserId,
+          current_user_code: currentUserCode,
           current_user_raw: settings.user_id,
-          match: lockedBy === currentUserId,
-          match_upper: lockedBy.toUpperCase() === currentUserId.toUpperCase(),
+          match: settingsMatchCartonLockOwner(settings, lockedBy),
+          match_upper: settingsMatchCartonLockOwner(settings, lockedBy),
           locked_by_length: lockedBy.length,
           current_user_length: currentUserId.length,
           both_empty: !lockedBy && !currentUserId,
         });
 
-        // Check if locked by current user (case-insensitive comparison as fallback)
-        const isSameUser =
-          lockedBy &&
-          currentUserId &&
-          (lockedBy === currentUserId ||
-            lockedBy.toUpperCase() === currentUserId.toUpperCase());
+        const isSameUser = settingsMatchCartonLockOwner(settings, lockedBy);
 
         if (isSameUser) {
           // Same user - show resume dialog
@@ -723,12 +1096,7 @@ export default function UnloadScreen() {
                 text: "Resume",
                 onPress: () => {
                   console.log(`📦 Resuming work on carton: ${cartonId}`);
-                  navigation.navigate(
-                    "ReceiveSort" as never,
-                    {
-                      cartonId: cartonId,
-                    } as never
-                  );
+                  goToReceiveSort(cartonId);
                 },
               },
             ]
@@ -751,68 +1119,66 @@ export default function UnloadScreen() {
             }
           );
 
-          // If locked_by is missing but status is Receiving, it might be a data issue
-          // In demo mode, allow resuming if no locked_by is set (assume it's the current user)
-          if (!lockedBy && settings.demo_mode === 1) {
-            console.log(
-              `⚠️ Demo mode: Carton ${cartonId} has no locked_by, assuming current user and showing resume dialog`
-            );
-            Alert.alert(
-              "Carton Already Locked",
-              `Carton ${cartonId} is already locked.\n\nWould you like to resume work on this carton?`,
-              [
-                { text: "Cancel", style: "cancel" },
-                {
-                  text: "Resume",
-                  onPress: () => {
-                    console.log(`📦 Resuming work on carton: ${cartonId}`);
-                    navigation.navigate(
-                      "ReceiveSort" as never,
-                      {
-                        cartonId: cartonId,
-                      } as never
-                    );
-                  },
-                },
-              ]
-            );
-            return;
-          }
-
-          // If carton is Receiving, always offer to resume (even if user IDs don't match)
-          // This handles the case where user_id is regenerated on app restart or between sessions
-          // In production, you might want to add additional validation, but for now we allow resuming
-          console.log(
-            `⚠️ User mismatch but carton is Receiving: Offering resume option`,
-            {
-              lockedBy,
-              currentUserId,
-              demoMode: settings.demo_mode,
-              status: latestStatus.status,
+          if (settings.demo_mode !== 1 && settings.api_url) {
+            try {
+              const asnRes = await apiService.getASN(activeASN.trim());
+              const recv = parseAsnPayloadForReceiveSortServerBlock(
+                asnRes,
+                cartonId
+              );
+              if (recv.blocked) {
+                await dataService.updateCartonStatus({
+                  asn_no: activeASN,
+                  inbound_session: activeSession,
+                  carton_id: cartonId,
+                  status: "Received",
+                  locked_by: "",
+                  locked_on: "",
+                  updated_on: new Date().toISOString(),
+                });
+                await loadCartons();
+                Alert.alert(
+                  "Carton already completed",
+                  recv.reason ??
+                    "Server shows this carton as already received. Your list has been updated."
+                );
+                return;
+              }
+              const backendLock = parseAsnPayloadForCartonLock(asnRes, cartonId);
+              if (
+                backendLock &&
+                isOtherScannerLock(
+                  backendLock,
+                  settings.user_id || "",
+                  settings.device_id || ""
+                )
+              ) {
+                await dataService.updateCartonStatus({
+                  asn_no: activeASN,
+                  inbound_session: activeSession,
+                  carton_id: cartonId,
+                  status: "Receiving",
+                  locked_by: backendLock.locked_by || undefined,
+                  locked_on: new Date().toISOString(),
+                  updated_on: new Date().toISOString(),
+                });
+                await loadCartons();
+                Alert.alert(
+                  "Carton in use",
+                  `Another device is receiving this carton (per server).\n\nUser: ${
+                    backendLock.locked_by || "unknown"
+                  }\n\nYou cannot take over this session from here.`
+                );
+                return;
+              }
+            } catch (e: any) {
+              Alert.alert(
+                "Could not verify with server",
+                `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+              );
+              return;
             }
-          );
-          Alert.alert(
-            "Carton Already Locked",
-            `Carton ${cartonId} is currently locked.\n\nLocked by: ${lockedBy}\nCurrent user: ${currentUserId}\n\nWould you like to resume work on this carton?`,
-            [
-              { text: "Cancel", style: "cancel" },
-              {
-                text: "Resume",
-                onPress: () => {
-                  console.log(
-                    `📦 Resuming work on carton: ${cartonId} (user mismatch - allowing resume)`
-                  );
-                  navigation.navigate(
-                    "ReceiveSort" as never,
-                    {
-                      cartonId: cartonId,
-                    } as never
-                  );
-                },
-              },
-            ]
-          );
-          return;
+          }
 
           Alert.alert(
             "Carton In Use",
@@ -836,14 +1202,56 @@ export default function UnloadScreen() {
     const existing = cartons.find((c) => c.carton_id === cartonId);
     if (existing) {
       if (existing.status === "Unloaded") {
-        Alert.alert("Info", "Carton already unloaded");
+        const unloadedBy = String(existing.unloaded_by || "").trim();
+        if (
+          unloadedBy &&
+          !settingsMatchUnloadedActor(settings, unloadedBy)
+        ) {
+          Alert.alert(
+            "Already unloaded",
+            `This carton was already unloaded by ${unloadedBy}. Only that user can continue to receive and sort.`
+          );
+          return;
+        }
+        if (settings.demo_mode !== 1 && settings.api_url) {
+          try {
+            const recv = await fetchBackendReceiveSortBlockedFromASN(
+              activeASN,
+              cartonId
+            );
+            if (recv.blocked) {
+              await dataService.updateCartonStatus({
+                asn_no: activeASN,
+                inbound_session: activeSession,
+                carton_id: cartonId,
+                status: "Received",
+                locked_by: "",
+                locked_on: "",
+                updated_on: new Date().toISOString(),
+              });
+              await loadCartons();
+              Alert.alert(
+                "Carton already completed",
+                recv.reason ??
+                  "This carton was already received on the server. Your list has been updated."
+              );
+              return;
+            }
+          } catch (e: any) {
+            Alert.alert(
+              "Could not verify with server",
+              `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+            );
+            return;
+          }
+        }
+        goToReceiveSort(cartonId);
         return;
       }
       if (existing.status === "Receiving") {
         const lockedBy = (existing.locked_by || "").trim();
-        const currentUserId = (settings.user_id || "").trim();
 
-        if (lockedBy && lockedBy === currentUserId) {
+        if (lockedBy && settingsMatchCartonLockOwner(settings, lockedBy)) {
           console.log(
             `✅ Carton ${cartonId} is locked by current user (from local state), showing resume dialog`
           );
@@ -856,12 +1264,7 @@ export default function UnloadScreen() {
                 text: "Resume",
                 onPress: () => {
                   console.log(`📦 Resuming work on carton: ${cartonId}`);
-                  navigation.navigate(
-                    "ReceiveSort" as never,
-                    {
-                      cartonId: cartonId,
-                    } as never
-                  );
+                  goToReceiveSort(cartonId);
                 },
               },
             ]
@@ -883,10 +1286,227 @@ export default function UnloadScreen() {
       }
     }
 
+    // Server: refuse duplicate unload if another device already posted unload-line for this session
+    if (settings.demo_mode !== 1 && settings.api_url) {
+      try {
+        const { line } = await getServerUnloadLineForCarton(
+          activeSession,
+          cartonId
+        );
+        if (line) {
+          const lineRec = line as Record<string, unknown>;
+          const scannedBy = actorFromUnloadLine(lineRec);
+          const scannedOnRaw =
+            line.scanned_on || line.created_at || line.modified || "";
+          const scannedOn =
+            typeof scannedOnRaw === "string" && scannedOnRaw.length > 10
+              ? scannedOnRaw.slice(0, 19)
+              : "";
+          const devHint = deviceFromUnloadLine(lineRec);
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: "Unloaded",
+            unloaded_by: scannedBy || undefined,
+            updated_on: new Date().toISOString(),
+          });
+          await loadCartons();
+          Alert.alert(
+            "Carton already unloaded",
+            duplicateUnloadAlertMessage(
+              cartonId,
+              scannedBy,
+              scannedOn,
+              devHint
+            )
+          );
+          return;
+        }
+
+        const asnGate = await fetchBackendCartonUnloadBlockedFromASN(
+          activeASN,
+          cartonId
+        );
+        if (asnGate.blocked) {
+          const sl = (asnGate.serverStatus || "").toLowerCase();
+          let localStatus: "Unloaded" | "Receiving" | "Received" = "Unloaded";
+          if (sl.includes("receiv") || sl === "locked") {
+            localStatus = "Receiving";
+          } else if (sl === "received") {
+            localStatus = "Received";
+          }
+          const whoAsn = asnGate.locked_by?.trim();
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: localStatus,
+            locked_by:
+              localStatus === "Receiving"
+                ? asnGate.locked_by || undefined
+                : undefined,
+            locked_on:
+              localStatus === "Receiving"
+                ? new Date().toISOString()
+                : undefined,
+            unloaded_by:
+              localStatus === "Unloaded" && whoAsn ? whoAsn : undefined,
+            updated_on: new Date().toISOString(),
+          });
+          await loadCartons();
+          Alert.alert(
+            whoAsn ? `Already unloaded by ${whoAsn}` : "Already unloaded",
+            `Server status: ${asnGate.serverStatus || "unknown"}.\n\nYour list has been updated.`
+          );
+          return;
+        }
+      } catch (e: any) {
+        Alert.alert(
+          "Could not verify with server",
+          `${e?.message || "Unknown error"}\n\nCheck your connection and try again.`
+        );
+        return;
+      }
+    }
+
     setLoading(true);
     try {
       const settings = await getSettings();
       const userId = settings.user_id || "USER-AUTO";
+
+      // Final server re-check immediately before claim (reduces lost race vs earlier GET)
+      if (settings.demo_mode !== 1 && settings.api_url) {
+        const { line: lineAgain } = await getServerUnloadLineForCarton(
+          activeSession,
+          cartonId
+        );
+        if (lineAgain) {
+          const lineRec = lineAgain as Record<string, unknown>;
+          const scannedBy = actorFromUnloadLine(lineRec);
+          const onRaw =
+            lineAgain.scanned_on || lineAgain.created_at || lineAgain.modified || "";
+          const onShort =
+            typeof onRaw === "string" && onRaw.length > 10
+              ? onRaw.slice(0, 19)
+              : "";
+          const devHint = deviceFromUnloadLine(lineRec);
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: "Unloaded",
+            unloaded_by: scannedBy || undefined,
+            updated_on: new Date().toISOString(),
+          });
+          await loadCartons();
+          Alert.alert(
+            "Carton already unloaded",
+            duplicateUnloadAlertMessage(cartonId, scannedBy, onShort, devHint)
+          );
+          return;
+        }
+        const gateAgain = await fetchBackendCartonUnloadBlockedFromASN(
+          activeASN,
+          cartonId
+        );
+        if (gateAgain.blocked) {
+          const sl = (gateAgain.serverStatus || "").toLowerCase();
+          let localStatus: "Unloaded" | "Receiving" | "Received" = "Unloaded";
+          if (sl.includes("receiv") || sl === "locked") {
+            localStatus = "Receiving";
+          } else if (sl === "received") {
+            localStatus = "Received";
+          }
+          const who = gateAgain.locked_by?.trim();
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: localStatus,
+            locked_by:
+              localStatus === "Receiving" ? who || undefined : undefined,
+            locked_on:
+              localStatus === "Receiving"
+                ? new Date().toISOString()
+                : undefined,
+            unloaded_by:
+              localStatus === "Unloaded" && who ? who : undefined,
+            updated_on: new Date().toISOString(),
+          });
+          await loadCartons();
+          Alert.alert(
+            who ? `Already unloaded by ${who}` : "Already unloaded",
+            `Server status: ${gateAgain.serverStatus || "unknown"}.\n\nYour list has been updated.`
+          );
+          return;
+        }
+      }
+
+      // Claim unload on server first — two devices cannot both succeed if POST enforces uniqueness
+      try {
+        console.log(`📡 Calling POST /api/inbound/unload-line for carton ${cartonId}:`, {
+          parent_title: activeSession,
+          unit_type: "Carton",
+          unit_id: cartonId,
+          scanned_by: userId,
+          device_id: settings.device_id,
+        });
+        await apiService.createUnloadLine({
+          parent_title: activeSession,
+          unit_type: "Carton",
+          unit_id: cartonId,
+          scanned_by: userId,
+          scanned_on: new Date().toISOString(),
+          device_id: String(settings.device_id || "").trim() || undefined,
+        });
+        console.log(`✅ Unload line created for carton ${cartonId}`);
+      } catch (unloadLineError: any) {
+        if (isDuplicateUnloadLinePostError(unloadLineError)) {
+          let byName = "";
+          let onShort = "";
+          let dupDev = "";
+          try {
+            const { line } = await getServerUnloadLineForCarton(
+              activeSession,
+              cartonId
+            );
+            const lr = line as Record<string, unknown> | null;
+            byName = actorFromUnloadLine(lr);
+            const raw =
+              line?.scanned_on || line?.created_at || line?.modified || "";
+            onShort =
+              typeof raw === "string" && raw.length > 10 ? raw.slice(0, 19) : "";
+            if (lr) dupDev = deviceFromUnloadLine(lr);
+          } catch {
+            /* ignore */
+          }
+          await dataService.updateCartonStatus({
+            asn_no: activeASN,
+            inbound_session: activeSession,
+            carton_id: cartonId,
+            status: "Unloaded",
+            unloaded_by: byName || undefined,
+            updated_on: new Date().toISOString(),
+          });
+          await loadCartons();
+          Alert.alert(
+            "Carton already unloaded",
+            duplicateUnloadAlertMessage(cartonId, byName, onShort, dupDev)
+          );
+          return;
+        }
+        const msg = String(unloadLineError?.message || "");
+        if (msg.includes("404") || msg.includes("not found")) {
+          setLoading(false);
+          Alert.alert(
+            "Unload not confirmed on server",
+            "This app requires a working POST /api/inbound/unload-line on your server to stop two devices unloading the same carton. The server returned 404 for that URL.\n\nAsk your backend team to implement unload-line (and ideally GET unload-lines + unique constraint on session + carton).\n\nUnload was cancelled — nothing was saved."
+          );
+          return;
+        }
+        throw unloadLineError;
+      }
 
       // Create UNLOAD_SCAN event
       await addEvent({
@@ -898,39 +1518,17 @@ export default function UnloadScreen() {
         user_id: userId,
       });
 
-      // Update carton status locally
-      // CRITICAL: Use original ASN format (activeASN) to match how cartons are stored
+      // Update carton status locally after server accepted unload line
+      const selfLabel =
+        currentUserDisplayForUnload(settings) || String(userId).trim();
       await dataService.updateCartonStatus({
-        asn_no: activeASN, // Use original format (not normalized) to match carton storage
+        asn_no: activeASN,
         inbound_session: activeSession,
         carton_id: cartonId,
         status: "Unloaded",
+        unloaded_by: selfLabel || undefined,
         updated_on: new Date().toISOString(),
       });
-
-      // Call new unload line API to save to tabInboundUnloadLine
-      try {
-        console.log(`📡 Calling POST /api/inbound/unload-line for carton ${cartonId}:`, {
-          parent_title: activeSession,
-          unit_type: "Carton",
-          unit_id: cartonId,
-          scanned_by: userId,
-        });
-        await apiService.createUnloadLine({
-          parent_title: activeSession,
-          unit_type: "Carton",
-          unit_id: cartonId,
-          scanned_by: userId,
-          scanned_on: new Date().toISOString(),
-        });
-        console.log(`✅ Unload line created/updated for carton ${cartonId}`);
-      } catch (unloadLineError: any) {
-        console.warn(
-          `⚠️ Failed to create unload line for carton ${cartonId}:`,
-          unloadLineError.message
-        );
-        // Don't block user flow if unload line API fails - carton status is still saved
-      }
 
       // Sync status change to backend immediately for real-time updates
       // Use original ASN format (activeASN) for API calls, not normalized version
@@ -941,7 +1539,7 @@ export default function UnloadScreen() {
           session: activeSession,
           status: "Unloaded",
         });
-        await apiService.updateCartonStatus({
+        await updateCartonStatusApiWithRetry({
           asn_no: activeASN, // Use original format from desktop (e.g., ASN-00002)
           inbound_session: activeSession,
           carton_id: cartonId,
@@ -999,7 +1597,7 @@ export default function UnloadScreen() {
 
     if (unloadedCartons.length === 0) {
       // No unloaded cartons, just navigate
-      navigation.navigate("ReceiveSort" as never);
+      goToReceiveSort();
       return;
     }
 
@@ -1033,7 +1631,7 @@ export default function UnloadScreen() {
 
       // Call API to update carton status on backend (safety net for any failed individual syncs)
       // Use original ASN format (activeASN) for API calls, not normalized version
-      await apiService.updateCartonStatus({
+      await updateCartonStatusApiWithRetry({
         asn_no: activeASN, // Use original format from desktop (e.g., ASN-00002)
         inbound_session: activeSession,
         cartons: cartonsToUpdate,
@@ -1046,12 +1644,12 @@ export default function UnloadScreen() {
       );
 
       // Navigate to ReceiveSort screen
-      navigation.navigate("ReceiveSort" as never);
+      goToReceiveSort();
     } catch (error: any) {
       console.error("❌ Batch sync failed (individual syncs already completed):", error);
       // Still navigate even if batch sync fails (cartons were already synced individually)
       // Individual syncs happened when each carton was scanned
-      navigation.navigate("ReceiveSort" as never);
+      goToReceiveSort();
     } finally {
       setLoading(false);
     }
@@ -1098,6 +1696,9 @@ export default function UnloadScreen() {
           onScan={handleCartonScan}
           placeholder="Scan carton barcode"
           title="Carton Barcode"
+          scanType="carton"
+          autoSubmit
+          autoSubmitDelay={450}
         />
 
         <View style={styles.listContainer}>
@@ -1105,56 +1706,95 @@ export default function UnloadScreen() {
           <FlatList
             data={cartons}
             keyExtractor={(item) => item.carton_id}
-            renderItem={({ item }) => (
-              <TouchableOpacity
+            renderItem={({ item }) => {
+              const unloadedBy = String(item.unloaded_by || "").trim();
+              const lockedBy = String(item.locked_by || "").trim();
+              const lockedOn = String(item.locked_on || "").trim();
+              const lockDateText = lockedOn
+                ? new Date(lockedOn).toLocaleString()
+                : "";
+              const isUnloadedByCurrentUser =
+                item.status === "Unloaded" &&
+                unloadedBy.length > 0 &&
+                settingsMatchUnloadedActor(currentLockOwner, unloadedBy);
+              const isReceivingByCurrentUser =
+                item.status === "Receiving" &&
+                settingsMatchCartonLockOwner(currentLockOwner, item.locked_by);
+              const isActionable =
+                isUnloadedByCurrentUser || isReceivingByCurrentUser;
+              const isReadOnlyUnloaded =
+                item.status === "Unloaded" && !isUnloadedByCurrentUser;
+
+              return (
+                <TouchableOpacity
                 style={[
                   styles.cartonItem,
-                  (item.status === "Unloaded" ||
-                    (item.status === "Receiving" && item.locked_by)) &&
-                    styles.cartonItemClickable,
+                  isActionable && styles.cartonItemClickable,
+                  isReadOnlyUnloaded && styles.cartonItemDisabled,
                 ]}
+                disabled={
+                  (item.status === "Receiving" && !isReceivingByCurrentUser) ||
+                  isReadOnlyUnloaded
+                }
                 onPress={async () => {
                   const cartonId = item.carton_id;
+                  const settingsTap = await getSettings();
 
-                  // Allow clicking on Unloaded cartons
+                  if (item.status === "Pending") {
+                    Alert.alert(
+                      "Scan Carton",
+                      `Please scan the barcode for carton ${item.carton_id} using the barcode scanner above.`,
+                      [{ text: "OK" }]
+                    );
+                    return;
+                  }
+
+                  // Unloaded: only the user who unloaded may open Receive & Sort
                   if (item.status === "Unloaded") {
+                    const who = String(item.unloaded_by || "").trim();
+                    if (
+                      !who ||
+                      !settingsMatchUnloadedActor(settingsTap, who)
+                    ) {
+                      Alert.alert(
+                        "Already unloaded",
+                        who
+                          ? `This carton was already unloaded by ${who}. Only that user can continue to receive and sort.`
+                          : "This carton is already unloaded but the unload owner is missing. Please refresh from backend before continuing."
+                      );
+                      return;
+                    }
                     console.log(
                       `📦 Navigating to ReceiveSort with carton: ${cartonId}`
                     );
-                    navigation.navigate(
-                      "ReceiveSort" as never,
-                      {
-                        cartonId: cartonId,
-                      } as never
-                    );
+                    goToReceiveSort(cartonId);
                     return;
                   }
 
                   // Also allow clicking on Receiving cartons if locked by current user
                   if (item.status === "Receiving") {
-                    const settings = await getSettings();
+                    const settings = settingsTap;
+                    const isLockedByCurrentUser = settingsMatchCartonLockOwner(
+                      settings,
+                      item.locked_by
+                    );
                     console.log(`🔍 Checking carton ${cartonId} lock status:`, {
                       locked_by: item.locked_by,
                       current_user: settings.user_id,
-                      is_same_user: item.locked_by === settings.user_id,
+                      current_user_code: settings.user_code,
+                      is_same_user: isLockedByCurrentUser,
                     });
                     // Check if locked_by exists and matches current user
-                    if (item.locked_by && item.locked_by === settings.user_id) {
+                    if (item.locked_by && isLockedByCurrentUser) {
                       console.log(
                         `📦 Resuming work on carton: ${cartonId} (locked by current user: ${settings.user_id})`
                       );
-                      navigation.navigate(
-                        "ReceiveSort" as never,
-                        {
-                          cartonId: cartonId,
-                        } as never
-                      );
+                      goToReceiveSort(cartonId);
                       return;
                     } else if (item.locked_by) {
-                      // Locked by different user - show message
                       Alert.alert(
-                        "Carton In Use",
-                        `Carton ${cartonId} is currently being processed by ${item.locked_by}.\n\nPlease select a different carton.`
+                        "Carton Already Locked",
+                        `Carton ${cartonId} is already locked by ${item.locked_by}.\n\nYou cannot continue this carton from this device.`
                       );
                       return;
                     } else {
@@ -1179,68 +1819,49 @@ export default function UnloadScreen() {
                     return;
                   }
                 }}
-                disabled={
-                  // Allow clicking on Pending cartons to scan them
-                  // Only disable if status is Receiving (without lock) or Received
-                  item.status === "Receiving" && !item.locked_by
-                }
-                onPress={() => {
-                  // If Pending, trigger scan by setting the barcode input
-                  if (item.status === "Pending") {
-                    // For Pending cartons, allow user to scan the barcode
-                    // The barcode scanner will handle the actual scan
-                    Alert.alert(
-                      "Scan Carton",
-                      `Please scan the barcode for carton ${item.carton_id} using the barcode scanner above.`,
-                      [{ text: "OK" }]
-                    );
-                    return;
-                  }
-                  
-                  // For Unloaded cartons, navigate to ReceiveSort
-                  if (item.status === "Unloaded") {
-                    navigation.navigate("ReceiveSort" as never, {
-                      cartonId: item.carton_id,
-                    } as never);
-                    return;
-                  }
-                  
-                  // For Receiving cartons with lock, show resume option
-                  if (item.status === "Receiving" && item.locked_by) {
-                    const cartonId = item.carton_id;
-                    Alert.alert(
-                      "Carton Already Locked",
-                      `Carton ${cartonId} is already locked by ${item.locked_by}.\n\nWould you like to resume work on this carton?`,
-                      [
-                        { text: "Cancel", style: "cancel" },
-                        {
-                          text: "Resume",
-                          onPress: () => {
-                            navigation.navigate("ReceiveSort" as never, {
-                              cartonId: cartonId,
-                            } as never);
-                          },
-                        },
-                      ]
-                    );
-                    return;
-                  }
-                }}
               >
                 <View style={styles.cartonInfo}>
                   <View style={styles.cartonHeader}>
                     <Text
                       style={[
                         styles.cartonId,
-                        (item.status === "Unloaded" ||
-                          (item.status === "Receiving" && item.locked_by)) &&
-                          styles.cartonIdClickable,
+                        isActionable && styles.cartonIdClickable,
+                        isReadOnlyUnloaded && styles.cartonIdDisabled,
                       ]}
                     >
                       {item.carton_id}
                     </Text>
-                    <StatusBadge status={item.status} />
+                    <StatusBadge
+                      status={item.status}
+                      color={isReadOnlyUnloaded ? "#9E9E9E" : undefined}
+                    />
                   </View>
+                  {item.status === "Unloaded" && (
+                    <Text
+                      style={[
+                        styles.unloadedByHint,
+                        isReadOnlyUnloaded && styles.unloadedByHintDisabled,
+                      ]}
+                      numberOfLines={2}
+                      ellipsizeMode="tail"
+                    >
+                      {lockedBy
+                        ? `Locked by ${lockedBy}`
+                        : unloadedBy
+                          ? `By ${unloadedBy}`
+                          : "Owner not available"}
+                    </Text>
+                  )}
+                  {item.status === "Unloaded" && lockedBy && lockDateText && (
+                    <Text
+                      style={[
+                        styles.lockTime,
+                        isReadOnlyUnloaded && styles.unloadedByHintDisabled,
+                      ]}
+                    >
+                      {lockDateText}
+                    </Text>
+                  )}
                   {item.status === "Receiving" && item.locked_by && (
                     <View style={styles.lockInfo}>
                       <Text style={styles.lockText}>
@@ -1254,16 +1875,20 @@ export default function UnloadScreen() {
                     </View>
                   )}
                 </View>
-                {item.status === "Unloaded" && (
+                {item.status === "Unloaded" && isUnloadedByCurrentUser && (
                   <Text style={styles.tapHint}>Tap to receive & sort →</Text>
+                )}
+                {isReadOnlyUnloaded && (
+                  <Text style={styles.disabledHint}>Not available on this device</Text>
                 )}
                 {item.status === "Receiving" && (
                   <Text style={styles.lockedHint}>
                     Currently being processed
                   </Text>
                 )}
-              </TouchableOpacity>
-            )}
+                </TouchableOpacity>
+              );
+            }}
             scrollEnabled={false}
           />
         </View>
@@ -1356,6 +1981,25 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     fontStyle: "italic",
   },
+  infoBox: {
+    backgroundColor: "#FFF8E1",
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "#FFE082",
+  },
+  infoText: {
+    fontSize: 14,
+    color: "#5D4037",
+    lineHeight: 20,
+  },
+  infoSubtext: {
+    fontSize: 13,
+    color: "#795548",
+    marginTop: 6,
+    fontWeight: "600",
+  },
   listContainer: {
     marginTop: 24,
     backgroundColor: "#fff",
@@ -1378,6 +2022,13 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 4,
     borderBottomWidth: 0,
+  },
+  cartonItemDisabled: {
+    backgroundColor: "#F1F1F1",
+    borderRadius: 8,
+    marginBottom: 4,
+    borderBottomWidth: 0,
+    opacity: 0.85,
   },
   cartonInfo: {
     flex: 1,
@@ -1418,9 +2069,28 @@ const styles = StyleSheet.create({
   cartonIdClickable: {
     color: "#4CAF50",
   },
+  cartonIdDisabled: {
+    color: "#757575",
+  },
+  unloadedByHint: {
+    fontSize: 13,
+    color: "#558B2F",
+    marginTop: 2,
+    fontWeight: "600",
+    flexShrink: 1,
+  },
+  unloadedByHintDisabled: {
+    color: "#757575",
+  },
   tapHint: {
     fontSize: 12,
     color: "#4CAF50",
+    marginTop: 4,
+    fontStyle: "italic",
+  },
+  disabledHint: {
+    fontSize: 12,
+    color: "#757575",
     marginTop: 4,
     fontStyle: "italic",
   },

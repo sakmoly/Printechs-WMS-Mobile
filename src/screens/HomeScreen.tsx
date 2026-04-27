@@ -8,43 +8,113 @@ import {
   Alert,
   ActivityIndicator,
 } from "react-native";
-import { useNavigation } from "@react-navigation/native";
+import { CommonActions, useNavigation } from "@react-navigation/native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApp } from "../context/AppContext";
-import { StatusBadge } from "../components/StatusBadge";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
-import { runAutomatedTest } from "../utils/automated-test";
-import { runPutawayBoxScanAutomatedTest } from "../utils/putaway-scan-automated-test";
-import { testAllCartonsInASN } from "../utils/test-all-cartons";
-import { runASNFormatCorrectionTest } from "../utils/test-asn-format-correction";
-import { dataService } from "../services/data.service";
-import { normalizeASN } from "../utils/asn";
-import { getAppVersionDetails } from "../utils/appVersion";
+import { apiService } from "../services/api.service";
+import { saveSettings } from "../services/settings.service";
 
 export default function HomeScreen() {
   const navigation = useNavigation();
+  const [loggingOut, setLoggingOut] = useState(false);
   const insets = useSafeAreaInsets();
   const {
     settings,
     pendingEventsCount,
     activeASN,
     activeSession,
-    refreshPendingEvents,
-    refreshSettings,
     setActiveASN,
     setActiveSession,
+    refreshPendingEvents,
+    refreshSettings,
+    refreshDeviceSessionStatus,
+    deviceSessionRestricted,
+    deviceSessionBlockReason,
   } = useApp();
-  const [runningTest, setRunningTest] = useState(false);
-  const [clearingData, setClearingData] = useState(false);
 
   useEffect(() => {
     const unsubscribe = navigation.addListener("focus", () => {
       refreshPendingEvents();
       // Refresh settings to correct ASN format if needed
       refreshSettings();
+      refreshDeviceSessionStatus();
     });
     return unsubscribe;
-  }, [navigation, refreshSettings]);
+  }, [navigation, refreshSettings, refreshDeviceSessionStatus]);
+
+  const goMenu = (route: string) => {
+    if (deviceSessionRestricted) {
+      Alert.alert(
+        deviceSessionBlockReason === "disabled"
+          ? "Device disabled"
+          : "Device pending approval",
+        deviceSessionBlockReason === "disabled"
+          ? "This device was disabled. You can open Settings only. Contact an administrator."
+          : "This device is not approved yet. You can open Settings only. Ask an administrator to approve this device."
+      );
+      return;
+    }
+    navigation.navigate(route as never);
+  };
+
+  const handleLogout = () => {
+    Alert.alert(
+      "Log out",
+      "End this session and return to the sign-in screen?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Log out",
+          style: "destructive",
+          onPress: async () => {
+            setLoggingOut(true);
+            try {
+              try {
+                await apiService.logoutAuth();
+              } catch {
+                await saveSettings({
+                  auth_token: null as any,
+                  auth_token_expires: null as any,
+                });
+              }
+              setActiveASN(null);
+              setActiveSession(null);
+              await saveSettings({
+                active_asn: null,
+                active_session: null,
+                auth_token: null as any,
+                auth_token_expires: null as any,
+              });
+              try {
+                await refreshSettings();
+              } catch {
+                /* still leave app auth UI */
+              }
+              try {
+                await refreshDeviceSessionStatus();
+              } catch {
+                /* ignore */
+              }
+              navigation.dispatch(
+                CommonActions.reset({
+                  index: 0,
+                  routes: [{ name: "Login" as never }],
+                })
+              );
+            } catch (e: any) {
+              Alert.alert(
+                "Log out",
+                e?.message || "Something went wrong. Try again."
+              );
+            } finally {
+              setLoggingOut(false);
+            }
+          },
+        },
+      ]
+    );
+  };
 
   return (
     <SafeAreaView
@@ -61,7 +131,53 @@ export default function HomeScreen() {
           contentContainerStyle={styles.scrollContent}
         >
         <View style={styles.banner}>
-        <Text style={styles.bannerTitle}>Active Session</Text>
+        <View style={styles.bannerHeaderRow}>
+          <Text style={styles.bannerTitle}>Active Session</Text>
+          <View style={styles.bannerLogoutColumn}>
+            <TouchableOpacity
+              style={[
+                styles.bannerLogoutButton,
+                loggingOut && styles.bannerLogoutButtonDisabled,
+              ]}
+              onPress={handleLogout}
+              disabled={loggingOut}
+              activeOpacity={0.85}
+            >
+              {loggingOut ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.bannerLogoutText}>Log out</Text>
+              )}
+            </TouchableOpacity>
+            {(settings?.user_code || settings?.user_id) ? (
+              <Text
+                style={styles.bannerMetaTiny}
+                numberOfLines={1}
+                ellipsizeMode="tail"
+              >
+                {settings?.user_code || settings?.user_id}
+              </Text>
+            ) : null}
+            {settings?.device_id ? (
+              <Text
+                style={styles.bannerMetaTiny}
+                numberOfLines={1}
+                ellipsizeMode="tail"
+              >
+                {settings.device_id}
+              </Text>
+            ) : null}
+          </View>
+        </View>
+        {deviceSessionRestricted && (
+          <View style={styles.pendingDeviceBanner}>
+            <Text style={styles.pendingDeviceText}>
+              {deviceSessionBlockReason === "disabled"
+                ? "This device was disabled by an administrator. Only Settings is available."
+                : "Device pending administrator approval. Only Settings is available."}
+            </Text>
+          </View>
+        )}
         {activeASN ? (
           <>
             <Text style={styles.bannerText}>ASN: {activeASN}</Text>
@@ -80,419 +196,224 @@ export default function HomeScreen() {
       </View>
 
       <View style={styles.menu}>
-        {/* Always show core menu items regardless of active session */}
+        {/* Core menu — disabled until device is approved (server mobile session API). */}
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#007AFF" }]}
-          onPress={() => navigation.navigate("StartInbound" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#007AFF" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("StartInbound")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Start Inbound</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Start Inbound
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#9C27B0" }]}
-          onPress={() => navigation.navigate("BoxManagement" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#9C27B0" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("BoxManagement")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>BOX Management</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            BOX Management
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#795548" }]}
-          onPress={() => navigation.navigate("PutAway" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#4CAF50" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("Dispatch")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Put Away</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Dispatch
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#FF9800" }]}
-          onPress={() => navigation.navigate("ASNList" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#795548" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("PutAway")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>ASN List</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Put Away
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#E91E63" }]}
-          onPress={() => navigation.navigate("RemainingItems" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#FF9800" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("ASNList")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Remaining Items</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            ASN List
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#2196F3" }]}
-          onPress={() => navigation.navigate("TransferInList" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#E91E63" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("RemainingItems")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Transfer In</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Remaining Items
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#4CAF50" }]}
-          onPress={() => navigation.navigate("StockLedgerList" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#2196F3" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("TransferInList")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Stock Ledger</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Transfer In
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#FF9800" }]}
-          onPress={() => navigation.navigate("MaterialRequestList" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#4CAF50" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("StockLedgerList")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Material Request</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Stock Ledger
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#9C27B0" }]}
-          onPress={() => navigation.navigate("CycleCountDashboard" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#FF9800" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("MaterialRequestList")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Cycle Count</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Material Request
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.menuItem, { borderLeftColor: "#607D8B" }]}
-          onPress={() => navigation.navigate("RelocationHome" as never)}
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#9C27B0" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("CycleCountDashboard")}
+          disabled={deviceSessionRestricted}
         >
-          <Text style={styles.menuItemText}>Relocation / Bin Transfer</Text>
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Cycle Count
+          </Text>
           <Text style={styles.menuItemArrow}>→</Text>
         </TouchableOpacity>
-        {(settings?.demo_mode === 1 || __DEV__) && (
-          <>
-            <TouchableOpacity
-              style={[styles.menuItem, { borderLeftColor: "#FF5722" }]}
-              onPress={async () => {
-                if (runningTest) {
-                  Alert.alert(
-                    "Test Running",
-                    "Automated test is already running. Please wait..."
-                  );
-                  return;
-                }
-
-                Alert.alert(
-                  "Run Automated Test",
-                  "This will simulate the complete workflow:\n\n1. Start ASN-00045\n2. Unload all cartons\n3. Lock CTN-001 and scan one item\n4. Return to home\n5. Resume and complete scanning\n\nContinue?",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Run Test",
-                      onPress: async () => {
-                        setRunningTest(true);
-                        try {
-                          const progress = await runAutomatedTest();
-
-                          // Refresh settings to get updated active ASN and session
-                          await refreshSettings();
-                          const updatedSettings = await import(
-                            "../services/settings.service"
-                          ).then((m) => m.getSettings());
-                          if (updatedSettings.active_asn) {
-                            setActiveASN(updatedSettings.active_asn);
-                          }
-                          if (updatedSettings.active_session) {
-                            setActiveSession(updatedSettings.active_session);
-                          }
-
-                          // Show results
-                          const completed = progress.filter(
-                            (p) => p.status === "completed"
-                          ).length;
-                          const failed = progress.filter(
-                            (p) => p.status === "failed"
-                          ).length;
-
-                          Alert.alert(
-                            "Test Completed",
-                            `Automated test finished!\n\nCompleted: ${completed} steps\nFailed: ${failed} steps\n\nCheck console logs for details.`,
-                            [{ text: "OK" }]
-                          );
-                        } catch (error: any) {
-                          Alert.alert(
-                            "Test Failed",
-                            error.message || "An error occurred during the test"
-                          );
-                        } finally {
-                          setRunningTest(false);
-                        }
-                      },
-                    },
-                  ]
-                );
-              }}
-              disabled={runningTest}
-            >
-              {runningTest ? (
-                <View style={{ flexDirection: "row", alignItems: "center" }}>
-                  <ActivityIndicator
-                    size="small"
-                    color="#FF5722"
-                    style={{ marginRight: 10 }}
-                  />
-                  <Text style={styles.menuItemText}>Running Test...</Text>
-                </View>
-              ) : (
-                <>
-                  <Text style={styles.menuItemText}>🧪 Run Automated Test</Text>
-                  <Text style={styles.menuItemArrow}>→</Text>
-                </>
-              )}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.menuItem, { borderLeftColor: "#E65100" }]}
-              onPress={() => {
-                if (runningTest) {
-                  Alert.alert(
-                    "Test Running",
-                    "Another test is running. Please wait..."
-                  );
-                  return;
-                }
-                Alert.alert(
-                  "Putaway scan test",
-                  "Requires an active inbound session (ASN + session in settings).\n\nCreates a test PAW-* box, writes one scanned_items row + events (same as Receive + Sort DB path). Use this to verify the device accepts putaway data.\n\nContinue?",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Run",
-                      onPress: async () => {
-                        setRunningTest(true);
-                        try {
-                          const steps = await runPutawayBoxScanAutomatedTest();
-                          const lines = steps
-                            .map((s) => `${s.status === "completed" ? "✅" : "❌"} ${s.step}: ${s.message}`)
-                            .join("\n");
-                          const failed = steps.some((s) => s.status === "failed");
-                          Alert.alert(
-                            failed ? "Putaway test: issues" : "Putaway test",
-                            lines || "No steps recorded.",
-                            [{ text: "OK" }]
-                          );
-                          await refreshSettings();
-                        } catch (error: any) {
-                          Alert.alert(
-                            "Putaway test failed",
-                            error?.message ?? String(error)
-                          );
-                        } finally {
-                          setRunningTest(false);
-                        }
-                      },
-                    },
-                  ]
-                );
-              }}
-              disabled={runningTest}
-            >
-              <Text style={styles.menuItemText}>
-                🧪 Test Putaway box scan (DB)
-              </Text>
-              <Text style={styles.menuItemArrow}>→</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.menuItem, { borderLeftColor: "#9C27B0" }]}
-              onPress={async () => {
-                if (runningTest) {
-                  Alert.alert(
-                    "Test Running",
-                    "Test is already running. Please wait..."
-                  );
-                  return;
-                }
-
-                Alert.alert(
-                  "Test All Cartons",
-                  "This will test the complete workflow for ALL cartons in ASN-00045:\n\n1. Start inbound session\n2. Unload all cartons\n3. Process each carton completely\n4. Verify all data is saved\n\nThis may take a few minutes. Continue?",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Run Test",
-                      onPress: async () => {
-                        setRunningTest(true);
-                        try {
-                          const results = await testAllCartonsInASN();
-
-                          // Refresh settings
-                          await refreshSettings();
-                          const updatedSettings = await import(
-                            "../services/settings.service"
-                          ).then((m) => m.getSettings());
-                          if (updatedSettings.active_asn) {
-                            setActiveASN(updatedSettings.active_asn);
-                          }
-                          if (updatedSettings.active_session) {
-                            setActiveSession(updatedSettings.active_session);
-                          }
-
-                          // Show results
-                          const success = results.filter(
-                            (r) => r.status === "success"
-                          ).length;
-                          const failed = results.filter(
-                            (r) => r.status === "failed"
-                          ).length;
-
-                          const summary = results
-                            .filter((r) => r.step.startsWith("4-"))
-                            .map(
-                              (r) =>
-                                `  ${r.step}: ${
-                                  r.status === "success" ? "✅" : "❌"
-                                } ${r.message}`
-                            )
-                            .join("\n");
-
-                          Alert.alert(
-                            "Test All Cartons Completed",
-                            `Test finished!\n\nSuccess: ${success} steps\nFailed: ${failed} steps\n\nCarton Results:\n${summary}\n\nCheck console logs for full details.`,
-                            [{ text: "OK" }]
-                          );
-                        } catch (error: any) {
-                          Alert.alert(
-                            "Test Failed",
-                            error.message ||
-                              "An error occurred during the test"
-                          );
-                        } finally {
-                          setRunningTest(false);
-                        }
-                      },
-                    },
-                  ]
-                );
-              }}
-              disabled={runningTest}
-            >
-              {runningTest ? (
-                <View style={{ flexDirection: "row", alignItems: "center" }}>
-                  <ActivityIndicator
-                    size="small"
-                    color="#9C27B0"
-                    style={{ marginRight: 10 }}
-                  />
-                  <Text style={styles.menuItemText}>
-                    Testing All Cartons...
-                  </Text>
-                </View>
-              ) : (
-                <>
-                  <Text style={styles.menuItemText}>
-                    🧪 Test All Cartons in ASN
-                  </Text>
-                  <Text style={styles.menuItemArrow}>→</Text>
-                </>
-              )}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.menuItem, { borderLeftColor: "#4CAF50" }]}
-              onPress={async () => {
-                Alert.alert(
-                  "Test ASN Format Correction",
-                  "This will test that ASN format is automatically corrected when loaded from settings.\n\nThis simulates the bug where ASN shows as 'ASN-2' instead of 'ASN-0002' and verifies the fix.\n\nContinue?",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Run Test",
-                      onPress: async () => {
-                        try {
-                          const { passed, failed, results } = await runASNFormatCorrectionTest();
-                          
-                          const summary = results
-                            .map((r) => `  ${r.step}: ${r.status === 'passed' ? '✅' : '❌'} ${r.message}`)
-                            .join('\n');
-                          
-                          Alert.alert(
-                            "ASN Format Correction Test",
-                            `Test completed!\n\n✅ Passed: ${passed}\n❌ Failed: ${failed}\n\nResults:\n${summary}\n\nCheck console for detailed logs.`,
-                            [{ text: "OK" }]
-                          );
-                        } catch (error: any) {
-                          Alert.alert(
-                            "Test Failed",
-                            error.message || "An error occurred during the test"
-                          );
-                        }
-                      },
-                    },
-                  ]
-                );
-              }}
-            >
-              <Text style={styles.menuItemText}>
-                🧪 Test ASN Format Correction
-              </Text>
-              <Text style={styles.menuItemArrow}>→</Text>
-            </TouchableOpacity>
-          </>
-        )}
+        <TouchableOpacity
+          style={[
+            styles.menuItem,
+            { borderLeftColor: "#607D8B" },
+            deviceSessionRestricted && styles.menuItemDisabled,
+          ]}
+          onPress={() => goMenu("RelocationHome")}
+          disabled={deviceSessionRestricted}
+        >
+          <Text
+            style={[
+              styles.menuItemText,
+              deviceSessionRestricted && styles.menuItemTextDisabled,
+            ]}
+          >
+            Relocation / Bin Transfer
+          </Text>
+          <Text style={styles.menuItemArrow}>→</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.menuItem, { borderLeftColor: "#546E7A" }]}
+          onPress={() => navigation.navigate("Settings" as never)}
+        >
+          <Text style={styles.menuItemText}>Settings</Text>
+          <Text style={styles.menuItemArrow}>→</Text>
+        </TouchableOpacity>
         </View>
-
-      <View style={styles.info}>
-        <Text style={styles.infoText}>
-          Mode: {settings?.demo_mode ? "Demo" : "Production"}
-        </Text>
-        {settings?.user_id && (
-          <Text style={styles.infoText}>User: {settings.user_id}</Text>
-        )}
-        {settings?.device_id && (
-          <Text style={styles.infoText}>Device: {settings.device_id}</Text>
-        )}
-        <Text style={styles.infoText}>Version: {getAppVersionDetails()}</Text>
-      </View>
-
-      <View style={styles.dangerZone}>
-        <Text style={styles.dangerZoneTitle}>⚠️ Data Management</Text>
-        <TouchableOpacity
-          style={[styles.dangerButton, clearingData && styles.buttonDisabled]}
-          onPress={() => {
-            Alert.alert(
-              "Clear All Transaction Data",
-              "This will permanently delete ALL transaction data:\n\n• All events\n• All scanned items\n• All workflow states\n• All carton statuses\n• All boxes\n• All transfer cartons\n• All cartons (CTN)\n• All ASN data\n• All transfer orders\n• All transfer in data\n• All material requests\n• All cycle count sessions\n• All cycle count lines\n• All cycle count cache\n• All stock ledger cache\n• All stock transactions\n• All putaway items\n• All inbound sessions\n• Active ASN and session\n\nMaster data will also be cleared:\n• Items, users, warehouses, locations\n• Bins, item barcode maps\n• Warehouse racks\n\n⚠️ Master data will be automatically repopulated from backend during next sync.\n\nThis action cannot be undone!\n\nSettings and demo data structure will be preserved.\n\nAre you sure?",
-              [
-                { text: "Cancel", style: "cancel" },
-                {
-                  text: "Clear All Data",
-                  style: "destructive",
-                  onPress: async () => {
-                    setClearingData(true);
-                    try {
-                      await dataService.clearAllTransactionData();
-                      // Clear active session from context
-                      setActiveASN(null);
-                      setActiveSession(null);
-                      // Refresh settings
-                      await refreshSettings();
-                      await refreshPendingEvents();
-                      Alert.alert(
-                        "Success",
-                        "All transaction data has been cleared successfully.",
-                        [{ text: "OK" }]
-                      );
-                    } catch (error: any) {
-                      Alert.alert(
-                        "Error",
-                        error.message || "Failed to clear transaction data"
-                      );
-                    } finally {
-                      setClearingData(false);
-                    }
-                  },
-                },
-              ]
-            );
-          }}
-          disabled={clearingData}
-        >
-          {clearingData ? (
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <ActivityIndicator
-                size="small"
-                color="#fff"
-                style={{ marginRight: 10 }}
-              />
-              <Text style={styles.dangerButtonText}>Clearing Data...</Text>
-            </View>
-          ) : (
-            <Text style={styles.dangerButtonText}>
-              🗑️ Clear All Transaction Data
-            </Text>
-          )}
-        </TouchableOpacity>
-      </View>
       </ScrollView>
       <ScreenFooterFrame />
       </View>
@@ -513,11 +434,51 @@ const styles = StyleSheet.create({
     padding: 20,
     marginBottom: 16,
   },
+  bannerHeaderRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    marginBottom: 10,
+    gap: 10,
+  },
+  bannerLogoutColumn: {
+    alignItems: "flex-end",
+    maxWidth: "52%",
+  },
   bannerTitle: {
+    flex: 1,
     fontSize: 18,
     fontWeight: "bold",
     color: "#fff",
-    marginBottom: 8,
+    marginBottom: 0,
+  },
+  bannerLogoutButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "rgba(183, 28, 28, 0.92)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    minWidth: 80,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  bannerLogoutButtonDisabled: {
+    opacity: 0.65,
+  },
+  bannerLogoutText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  bannerMetaTiny: {
+    marginTop: 3,
+    fontSize: 10,
+    lineHeight: 12,
+    fontWeight: "500",
+    color: "rgba(255, 255, 255, 0.82)",
+    textAlign: "right",
+    alignSelf: "stretch",
   },
   bannerText: {
     fontSize: 14,
@@ -532,6 +493,17 @@ const styles = StyleSheet.create({
   },
   pendingText: {
     color: "#fff",
+    fontWeight: "600",
+  },
+  pendingDeviceBanner: {
+    marginTop: 10,
+    padding: 10,
+    backgroundColor: "rgba(255, 193, 7, 0.95)",
+    borderRadius: 6,
+  },
+  pendingDeviceText: {
+    color: "#333",
+    fontSize: 14,
     fontWeight: "600",
   },
   menu: {
@@ -561,6 +533,12 @@ const styles = StyleSheet.create({
     fontSize: 24,
     color: "#999",
   },
+  menuItemDisabled: {
+    opacity: 0.45,
+  },
+  menuItemTextDisabled: {
+    color: "#999",
+  },
   continueButton: {
     backgroundColor: "#4CAF50",
     padding: 24,
@@ -582,46 +560,6 @@ const styles = StyleSheet.create({
   continueButtonSubtext: {
     fontSize: 14,
     color: "rgba(255, 255, 255, 0.9)",
-  },
-  info: {
-    padding: 16,
-    backgroundColor: "#fff",
-    margin: 16,
-    borderRadius: 8,
-  },
-  infoText: {
-    fontSize: 14,
-    color: "#666",
-    marginBottom: 4,
-  },
-  dangerZone: {
-    padding: 16,
-    backgroundColor: "#fff",
-    margin: 16,
-    borderRadius: 8,
-    borderWidth: 2,
-    borderColor: "#F44336",
-  },
-  dangerZoneTitle: {
-    fontSize: 16,
-    fontWeight: "bold",
-    color: "#F44336",
-    marginBottom: 12,
-    textAlign: "center",
-  },
-  dangerButton: {
-    backgroundColor: "#F44336",
-    padding: 16,
-    borderRadius: 8,
-    alignItems: "center",
-  },
-  dangerButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
-  buttonDisabled: {
-    opacity: 0.6,
   },
   workflowGroup: {
     marginBottom: 20,

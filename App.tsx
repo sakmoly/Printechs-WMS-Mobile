@@ -1,6 +1,11 @@
 import "react-native-gesture-handler";
-import React, { useEffect, useState } from "react";
-import { NavigationContainer, useNavigation } from "@react-navigation/native";
+/** Patch console before any other app modules load (reduces Metro / JS thread noise). */
+import "./src/utils/logger";
+import React, { useEffect, useState, useRef } from "react";
+import {
+  NavigationContainer,
+  useNavigationContainerRef,
+} from "@react-navigation/native";
 import * as NavigationBar from "expo-navigation-bar";
 import { createStackNavigator } from "@react-navigation/stack";
 import {
@@ -34,8 +39,6 @@ import DispatchScreen from "./src/screens/DispatchScreen";
 import SyncCenterScreen from "./src/screens/SyncCenterScreen";
 import PutAwayScreen from "./src/screens/PutAwayScreen";
 import ASNListScreen from "./src/screens/ASNListScreen";
-// Import logger first to suppress all logs except errors
-import "./src/utils/logger";
 
 import TransferInListScreen from "./src/screens/TransferInListScreen";
 import TransferInDetailScreen from "./src/screens/TransferInDetailScreen";
@@ -79,6 +82,8 @@ const SyncHeaderButton = () => {
     pendingEventsCount,
     activeASN,
     activeSession,
+    deviceSessionRestricted,
+    deviceSessionBlockReason,
   } = useApp();
   const [syncing, setSyncing] = useState(false);
   const [syncStatusLine, setSyncStatusLine] = useState("");
@@ -106,6 +111,17 @@ const SyncHeaderButton = () => {
   }, []);
 
   const handleSync = async () => {
+    if (deviceSessionRestricted) {
+      Alert.alert(
+        deviceSessionBlockReason === "disabled"
+          ? "Device disabled"
+          : "Device pending approval",
+        deviceSessionBlockReason === "disabled"
+          ? "This device was disabled by an administrator. Only Settings is available."
+          : "This device is not approved yet. Only Settings is available until an administrator approves it."
+      );
+      return;
+    }
     if (syncing) {
       return; // Prevent multiple simultaneous syncs
     }
@@ -351,6 +367,202 @@ const syncButtonStyles = StyleSheet.create({
   },
 });
 
+function AppNavigation() {
+  const navigationRef = useNavigationContainerRef();
+  const { deviceSessionRestricted, refreshDeviceSessionStatus } = useApp();
+  const redirectGuard = useRef(false);
+
+  useEffect(() => {
+    refreshDeviceSessionStatus();
+  }, [refreshDeviceSessionStatus]);
+
+  const onNavStateChange = () => {
+    if (!deviceSessionRestricted) return;
+    const nav = navigationRef as any;
+    if (!nav?.getCurrentRoute) return;
+    if (redirectGuard.current) return;
+    const name = nav.getCurrentRoute()?.name as string | undefined;
+    const allowed = new Set(["Login", "Home", "Settings"]);
+    if (name && !allowed.has(name)) {
+      redirectGuard.current = true;
+      nav.navigate("Home" as never);
+      setTimeout(() => {
+        redirectGuard.current = false;
+      }, 300);
+    }
+  };
+
+  return (
+    <NavigationContainer
+      ref={navigationRef}
+      onStateChange={onNavStateChange}
+    >
+      <Stack.Navigator
+        initialRouteName="Login"
+        screenOptions={({ navigation, route }) => ({
+          headerStyle: {
+            backgroundColor: "#007AFF",
+          },
+          headerTintColor: "#fff",
+          headerTitleStyle: {
+            fontWeight: "bold",
+          },
+          headerRight: () => {
+            if (route.name === "Login" || route.name === "BoxManagement") {
+              return null;
+            }
+            if (deviceSessionRestricted) {
+              return null;
+            }
+            return <SyncHeaderButton />;
+          },
+        })}
+      >
+        <Stack.Screen
+          name="Login"
+          component={LoginScreen}
+          options={{ headerShown: false }}
+        />
+        <Stack.Screen name="Settings" component={SettingsScreen} />
+        <Stack.Screen
+          name="Home"
+          component={HomeScreen}
+          options={{
+            headerLeft: () => null,
+            gestureEnabled: false,
+          }}
+        />
+        <Stack.Screen name="StartInbound" component={StartInboundScreen} />
+        <Stack.Screen name="Unload" component={UnloadScreen} />
+        <Stack.Screen name="ReceiveSort" component={ReceiveSortScreen} />
+        <Stack.Screen
+          name="BoxManagement"
+          component={BoxManagementScreen}
+          options={{ headerShown: false }}
+        />
+        <Stack.Screen name="Packing" component={PackingScreen} />
+        <Stack.Screen name="Dispatch" component={DispatchScreen} />
+        <Stack.Screen name="PutAway" component={PutAwayScreen} />
+        <Stack.Screen name="SyncCenter" component={SyncCenterScreen} />
+        <Stack.Screen name="ASNList" component={ASNListScreen} />
+        <Stack.Screen
+          name="TransferInList"
+          component={TransferInListScreen}
+        />
+        <Stack.Screen
+          name="TransferInDetail"
+          component={TransferInDetailScreen}
+        />
+        <Stack.Screen
+          name="TransferInReceiving"
+          component={TransferInReceivingScreen}
+        />
+        <Stack.Screen
+          name="TransferInReceivingScanCarton"
+          component={TransferInReceivingScanCartonScreen}
+        />
+        <Stack.Screen
+          name="TransferInReceivingScanItems"
+          component={TransferInReceivingScanItemsScreen}
+        />
+        <Stack.Screen
+          name="StockLedgerList"
+          component={StockLedgerListScreen}
+        />
+        <Stack.Screen name="StockDetail" component={StockDetailScreen} />
+        <Stack.Screen
+          name="StockTransactions"
+          component={StockTransactionHistoryScreen}
+        />
+        <Stack.Screen
+          name="MaterialRequestList"
+          component={MaterialRequestListScreen}
+        />
+        <Stack.Screen
+          name="MaterialRequestDetail"
+          component={MaterialRequestDetailScreen}
+        />
+        <Stack.Screen
+          name="MaterialRequestScanLocation"
+          component={MaterialRequestScanLocationScreen}
+        />
+        <Stack.Screen
+          name="MaterialRequestPacking"
+          component={MaterialRequestPackingScreen}
+        />
+        <Stack.Screen
+          name="PickingScanBin"
+          component={PickingScanBinScreen}
+        />
+        <Stack.Screen
+          name="PickingScanCarton"
+          component={PickingScanCartonScreen}
+        />
+        <Stack.Screen
+          name="PickingScanItems"
+          component={PickingScanItemsScreen}
+        />
+        <Stack.Screen
+          name="CycleCountList"
+          component={CycleCountListScreen}
+        />
+        <Stack.Screen
+          name="CycleCountDetail"
+          component={CycleCountDetailScreen}
+        />
+        <Stack.Screen
+          name="CycleCountCounting"
+          component={CycleCountCountingScreen}
+        />
+        <Stack.Screen
+          name="CycleCountDashboard"
+          component={CycleCountDashboardScreen}
+        />
+        <Stack.Screen
+          name="CycleCountScanBin"
+          component={CycleCountScanBinScreen}
+        />
+        <Stack.Screen
+          name="CycleCountBinCounting"
+          component={CycleCountBinCountingScreen}
+        />
+        <Stack.Screen
+          name="CycleCountDrafts"
+          component={CycleCountDraftsScreen}
+        />
+        <Stack.Screen
+          name="RemainingItems"
+          component={RemainingItemsScreen}
+        />
+        <Stack.Screen
+          name="RelocationHome"
+          component={RelocationHomeScreen}
+        />
+        <Stack.Screen
+          name="RelocationScanFromBin"
+          component={RelocationScanFromBinScreen}
+        />
+        <Stack.Screen
+          name="RelocationScanFromCarton"
+          component={RelocationScanFromCartonScreen}
+        />
+        <Stack.Screen
+          name="RelocationScanToBin"
+          component={RelocationScanToBinScreen}
+        />
+        <Stack.Screen
+          name="RelocationScanToCarton"
+          component={RelocationScanToCartonScreen}
+        />
+        <Stack.Screen
+          name="RelocationExecute"
+          component={RelocationExecuteScreen}
+        />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+
 export default function App() {
   useEffect(() => {
     initializeApp();
@@ -409,162 +621,7 @@ export default function App() {
 
   return (
     <AppProvider>
-      <NavigationContainer>
-        <Stack.Navigator
-          initialRouteName="Login"
-          screenOptions={({ navigation, route }) => ({
-            headerStyle: {
-              backgroundColor: "#007AFF",
-            },
-            headerTintColor: "#fff",
-            headerTitleStyle: {
-              fontWeight: "bold",
-            },
-            // Add Sync button to all screens except Login and BoxManagement
-            headerRight: () => {
-              // Don't show on Login (headerShown: false) or BoxManagement (headerShown: false)
-              if (route.name === "Login" || route.name === "BoxManagement") {
-                return null;
-              }
-              return <SyncHeaderButton />;
-            },
-          })}
-        >
-          <Stack.Screen
-            name="Login"
-            component={LoginScreen}
-            options={{ headerShown: false }}
-          />
-          <Stack.Screen name="Settings" component={SettingsScreen} />
-          <Stack.Screen name="Home" component={HomeScreen} />
-          <Stack.Screen name="StartInbound" component={StartInboundScreen} />
-          <Stack.Screen name="Unload" component={UnloadScreen} />
-          <Stack.Screen name="ReceiveSort" component={ReceiveSortScreen} />
-          <Stack.Screen
-            name="BoxManagement"
-            component={BoxManagementScreen}
-            options={{ headerShown: false }}
-          />
-          <Stack.Screen name="Packing" component={PackingScreen} />
-          <Stack.Screen name="Dispatch" component={DispatchScreen} />
-          <Stack.Screen name="PutAway" component={PutAwayScreen} />
-          <Stack.Screen name="SyncCenter" component={SyncCenterScreen} />
-          <Stack.Screen name="ASNList" component={ASNListScreen} />
-          <Stack.Screen
-            name="TransferInList"
-            component={TransferInListScreen}
-          />
-          <Stack.Screen
-            name="TransferInDetail"
-            component={TransferInDetailScreen}
-          />
-          <Stack.Screen
-            name="TransferInReceiving"
-            component={TransferInReceivingScreen}
-          />
-          <Stack.Screen
-            name="TransferInReceivingScanCarton"
-            component={TransferInReceivingScanCartonScreen}
-          />
-          <Stack.Screen
-            name="TransferInReceivingScanItems"
-            component={TransferInReceivingScanItemsScreen}
-          />
-          <Stack.Screen
-            name="StockLedgerList"
-            component={StockLedgerListScreen}
-          />
-          <Stack.Screen name="StockDetail" component={StockDetailScreen} />
-          <Stack.Screen
-            name="StockTransactions"
-            component={StockTransactionHistoryScreen}
-          />
-          <Stack.Screen
-            name="MaterialRequestList"
-            component={MaterialRequestListScreen}
-          />
-          <Stack.Screen
-            name="MaterialRequestDetail"
-            component={MaterialRequestDetailScreen}
-          />
-          <Stack.Screen
-            name="MaterialRequestScanLocation"
-            component={MaterialRequestScanLocationScreen}
-          />
-          <Stack.Screen
-            name="MaterialRequestPacking"
-            component={MaterialRequestPackingScreen}
-          />
-          <Stack.Screen
-            name="PickingScanBin"
-            component={PickingScanBinScreen}
-          />
-          <Stack.Screen
-            name="PickingScanCarton"
-            component={PickingScanCartonScreen}
-          />
-          <Stack.Screen
-            name="PickingScanItems"
-            component={PickingScanItemsScreen}
-          />
-          <Stack.Screen
-            name="CycleCountList"
-            component={CycleCountListScreen}
-          />
-          <Stack.Screen
-            name="CycleCountDetail"
-            component={CycleCountDetailScreen}
-          />
-          <Stack.Screen
-            name="CycleCountCounting"
-            component={CycleCountCountingScreen}
-          />
-          <Stack.Screen
-            name="CycleCountDashboard"
-            component={CycleCountDashboardScreen}
-          />
-          <Stack.Screen
-            name="CycleCountScanBin"
-            component={CycleCountScanBinScreen}
-          />
-          <Stack.Screen
-            name="CycleCountBinCounting"
-            component={CycleCountBinCountingScreen}
-          />
-          <Stack.Screen
-            name="CycleCountDrafts"
-            component={CycleCountDraftsScreen}
-          />
-          <Stack.Screen
-            name="RemainingItems"
-            component={RemainingItemsScreen}
-          />
-          <Stack.Screen
-            name="RelocationHome"
-            component={RelocationHomeScreen}
-          />
-          <Stack.Screen
-            name="RelocationScanFromBin"
-            component={RelocationScanFromBinScreen}
-          />
-          <Stack.Screen
-            name="RelocationScanFromCarton"
-            component={RelocationScanFromCartonScreen}
-          />
-          <Stack.Screen
-            name="RelocationScanToBin"
-            component={RelocationScanToBinScreen}
-          />
-          <Stack.Screen
-            name="RelocationScanToCarton"
-            component={RelocationScanToCartonScreen}
-          />
-          <Stack.Screen
-            name="RelocationExecute"
-            component={RelocationExecuteScreen}
-          />
-        </Stack.Navigator>
-      </NavigationContainer>
+      <AppNavigation />
     </AppProvider>
   );
 }

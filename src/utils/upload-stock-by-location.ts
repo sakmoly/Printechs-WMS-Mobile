@@ -70,7 +70,7 @@ export async function uploadStockData(
   total: number;
   uploaded: number;
   failed: number;
-  errors: Array<{ item_code: string; location_id: string; error: string }>;
+  errors: { item_code: string; location_id: string; error: string }[];
 }> {
   const batchSize = options?.batchSize || 100;
   const continueOnError = options?.continueOnError ?? true;
@@ -95,7 +95,7 @@ export async function uploadStockData(
     throw new Error("API URL not configured. Please set API URL in settings.");
   }
 
-  const errors: Array<{ item_code: string; location_id: string; error: string }> = [];
+  const errors: { item_code: string; location_id: string; error: string }[] = [];
   let uploaded = 0;
   let failed = 0;
 
@@ -108,45 +108,34 @@ export async function uploadStockData(
     console.log(`📦 Processing batch ${batchNumber}/${totalBatches} (${batch.length} records)...`);
 
     try {
-      const response = await apiService.uploadStockByLocation(batch);
-
-      if (response && (response.success || response.ok)) {
-        const batchUploaded = response.uploaded || batch.length;
-        const batchFailed = response.failed || 0;
-        uploaded += batchUploaded;
-        failed += batchFailed;
-
-        if (response.errors && Array.isArray(response.errors)) {
-          errors.push(...response.errors);
+      let batchFailed = 0;
+      for (const row of batch) {
+        try {
+          await apiService.updateStockByLocation({
+            location_id: row.location_id,
+            item_code: row.item_code,
+            qty: row.qty,
+          });
+          uploaded += 1;
+        } catch (rowErr: any) {
+          batchFailed += 1;
+          failed += 1;
+          errors.push({
+            item_code: row.item_code,
+            location_id: row.location_id,
+            error: rowErr?.message || String(rowErr),
+          });
         }
+      }
 
+      if (batchFailed === 0) {
         console.log(
-          `✅ Batch ${batchNumber} completed: ${batchUploaded} uploaded, ${batchFailed} failed`
+          `✅ Batch ${batchNumber} completed: ${batch.length} uploaded, 0 failed`
         );
       } else {
-        // If bulk upload fails, try individual uploads
-        console.warn(`⚠️ Bulk upload failed for batch ${batchNumber}, trying individual uploads...`);
-        
-        for (const record of batch) {
-          try {
-            await apiService.updateStockByLocation(record);
-            uploaded++;
-            console.log(`✅ Uploaded: ${record.item_code} at ${record.location_id}`);
-          } catch (error: any) {
-            failed++;
-            const errorMsg = error.message || "Unknown error";
-            errors.push({
-              item_code: record.item_code,
-              location_id: record.location_id,
-              error: errorMsg,
-            });
-            console.error(`❌ Failed: ${record.item_code} at ${record.location_id} - ${errorMsg}`);
-
-            if (!continueOnError) {
-              throw error;
-            }
-          }
-        }
+        console.warn(
+          `⚠️ Batch ${batchNumber} partial: ${batch.length - batchFailed} ok, ${batchFailed} failed`
+        );
       }
     } catch (error: any) {
       console.error(`❌ Batch ${batchNumber} failed:`, error.message);

@@ -156,7 +156,7 @@ export default function CycleCountScanBinScreen() {
       const now = new Date().toISOString();
 
       // Check if there's a pre-created session ID (from task creation)
-      let sessionId: string;
+      let sessionId: string | undefined;
       
       if (preCreatedSessionId) {
         // Use the pre-created session from task creation

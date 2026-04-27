@@ -3,9 +3,11 @@ import { View, Text, StyleSheet } from 'react-native';
 
 interface StatusBadgeProps {
   status?: string | null;
+  /** When set, overrides automatic status-based color */
+  color?: string;
 }
 
-export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
+export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, color }) => {
   // Handle undefined/null status
   const safeStatus = status || 'Unknown';
   
@@ -25,8 +27,8 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
         return '#4CAF50';
       case 'closed':
         return '#757575';
-      case 'sealed':
-        return '#FF9800';
+      case 'packed':
+        return '#4CAF50';
       case 'dispatched':
         return '#4CAF50';
       case 'submitted':
@@ -59,8 +61,10 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
     return status; // Return original status for all other cases
   };
 
+  const backgroundColor = color ?? getStatusColor(safeStatus);
+
   return (
-    <View style={[styles.badge, { backgroundColor: getStatusColor(safeStatus) }]}>
+    <View style={[styles.badge, { backgroundColor }]}>
       <Text style={styles.text}>{getDisplayStatus(safeStatus)}</Text>
     </View>
   );

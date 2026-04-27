@@ -542,7 +542,7 @@ export default function CycleCountBinCountingScreen() {
 
       // ✅ NEW: Priority 1: Try to load expected items from backend task lines first
       // This allows scanning the same bin/carton again and getting expected items from previous task
-      let expectedItems: Array<{ item_code: string; qty: number }> = [];
+      let expectedItems: { item_code: string; qty: number }[] = [];
       let loadedFromBackend = false;
 
       // First, try to load from current task title if available

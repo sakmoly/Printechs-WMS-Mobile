@@ -173,7 +173,7 @@ export const executeDemoDataMigration = async () => {
     );
     const cartonGroups: Record<
       string,
-      Array<{ item_code: string; shipped_qty: number }>
+      { item_code: string; shipped_qty: number }[]
     > = {};
     verifyCartons.forEach((c) => {
       if (!cartonGroups[c.carton_id]) {
@@ -332,17 +332,17 @@ export const executeDemoDataMigration = async () => {
     console.log("✅ Demo data migration completed successfully");
 
     // Verify data was inserted
-    const allocCount = await db.getAllAsync(
+    const allocCount = await db.getAllAsync<{ count: number }>(
       "SELECT COUNT(*) as count FROM transfer_order_cache WHERE asn_no = ?",
       [normalizedASN]
     );
 
-    const cartonCount = await db.getAllAsync(
+    const cartonCount = await db.getAllAsync<{ count: number }>(
       "SELECT COUNT(*) as count FROM asn_carton_map WHERE asn_no = ?",
       [normalizedASN]
     );
 
-    const boxCount = await db.getAllAsync(
+    const boxCount = await db.getAllAsync<{ count: number }>(
       "SELECT COUNT(*) as count FROM box_cache WHERE asn_no = ?",
       [normalizedASN]
     );

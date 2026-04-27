@@ -1,0 +1,16 @@
+﻿# Reduce Cursor indexing / file-watcher load
+node_modules
+.expo
+android
+ios
+build
+dist
+coverage
+src/backup_2026-01-25_163054
+backups
+**/*.backup*
+eslint-compact.txt
+tsc-errors.txt
+tsc-errors-final.txt
+tsc-errors-grouped.txt
+tsc-out.txt

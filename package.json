@@ -9,7 +9,9 @@
     "start:clear": "expo start --clear",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "test": "jest",
+    "lint": "expo lint -- --no-warn-ignored"
   },
   "dependencies": {
     "@react-navigation/bottom-tabs": "^6.6.1",
@@ -41,8 +43,13 @@
   },
   "devDependencies": {
     "@babel/core": "^7.23.0",
+    "@types/jest": "^29.5.14",
     "@types/react": "~19.1.10",
     "babel-preset-expo": "~54.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-expo": "~10.0.0",
+    "jest": "^29.7.0",
+    "jest-expo": "~54.0.16",
     "typescript": "~5.9.2"
   },
   "private": true

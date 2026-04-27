@@ -36,7 +36,7 @@ interface RequestedItem {
   has_scanned?: boolean; // True if item has been scanned at least once
   editable?: boolean; // Enable edit after first scan (deprecated, use has_scanned)
   last_scan_time?: string;
-  last_carton?: string;
+  last_carton?: string | null;
   uom?: string; // Unit of measure
 }
 
@@ -44,10 +44,10 @@ interface ItemLocation {
   item_code: string;
   warehouse: string;
   bin_location: string; // Location ID (e.g., "A1-R01-L3-B1")
-  cartons?: Array<{
+  cartons?: {
     carton_id: string;
     qty: number;
-  }> | null;
+  }[] | null;
   total_qty: number; // Total quantity at this location
   available_qty: number; // Available quantity (qty - reserved_qty)
   reserved_qty?: number; // Reserved quantity
@@ -398,7 +398,7 @@ export default function PickingScanItemsScreen() {
               remaining_qty: item.requested_qty - (item.picked_qty + 1),
               editable: true,
               last_scan_time: new Date().toISOString(),
-              last_carton: cartonId,
+              last_carton: cartonId ?? undefined,
             }
           : item
       );
@@ -423,7 +423,7 @@ export default function PickingScanItemsScreen() {
               },
             ],
             materialRequest?.from_warehouse || undefined,
-            settings.user_id || settings.user_code // ✅ user_id for created_by
+            settings.user_id || settings.user_code || undefined // ✅ user_id for created_by
           );
           console.log(`✅ Item scanned and stock updated: ${normalizedBarcode} from bin ${binLocation}`);
           
@@ -670,7 +670,7 @@ export default function PickingScanItemsScreen() {
               },
             ],
             materialRequest?.from_warehouse || undefined,
-            settings.user_id || settings.user_code // ✅ user_id for created_by
+            settings.user_id || settings.user_code || undefined // ✅ user_id for created_by
           );
           
           // Reload Material Request to get updated picked_qty from backend
@@ -1103,7 +1103,7 @@ export default function PickingScanItemsScreen() {
                   {
                     text: "Change",
                     onPress: () => {
-                      navigation.navigate("PickingScanBin", {
+                      (navigation as any).navigate("PickingScanBin", {
                         materialRequestTitle,
                         sessionId,
                       });
@@ -1127,7 +1127,7 @@ export default function PickingScanItemsScreen() {
                   {
                     text: "Change",
                     onPress: () => {
-                      navigation.navigate("PickingScanCarton", {
+                      (navigation as any).navigate("PickingScanCarton", {
                         materialRequestTitle,
                         sessionId,
                         binLocation,
@@ -1372,7 +1372,7 @@ export default function PickingScanItemsScreen() {
                     let totalQty = 0;
                     if (location.total_qty !== undefined && location.total_qty > 0) {
                       totalQty = location.total_qty;
-                    } else if (hasCartons) {
+                    } else if (hasCartons && location.cartons) {
                       totalQty = location.cartons.reduce((sum, carton) => sum + (carton.qty || 0), 0);
                     } else if (location.available_qty !== undefined && location.available_qty > 0) {
                       totalQty = location.available_qty;
@@ -1388,7 +1388,7 @@ export default function PickingScanItemsScreen() {
                           >
                             {location.bin_location || location.bin_code || location.bin_id || "Unknown Location"}
                           </Text>
-                          {hasCartons ? (
+                          {hasCartons && location.cartons ? (
                             <View style={styles.cartonsListUnderLocation}>
                               {location.cartons.map((carton, cartonIdx) => (
                                 <Text 
@@ -1882,6 +1882,15 @@ const styles = StyleSheet.create({
   modalSaveText: {
     ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
+    fontWeight: "600",
+  },
+  modalCloseButton: {
+    padding: PickingTheme.spacing.sm,
+    marginLeft: PickingTheme.spacing.sm,
+  },
+  modalCloseButtonText: {
+    fontSize: 22,
+    color: PickingTheme.colors.textSecondary,
     fontWeight: "600",
   },
   locationModalContent: {

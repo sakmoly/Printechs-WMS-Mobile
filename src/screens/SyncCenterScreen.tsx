@@ -162,12 +162,12 @@ Item Barcode Map: ${masterResult.itemBarcodeMap.synced} synced, ${masterResult.i
       const summary = (await dataService.getScannedItemsSummary(
         normalizedASN,
         activeSession || undefined
-      )) as Array<{
+      )) as {
         carton_id: string;
         item_code: string;
         box_id: string;
         total_qty: number;
-      }>;
+      }[];
 
       const message = `
 📊 Data Verification for ${normalizedASN}

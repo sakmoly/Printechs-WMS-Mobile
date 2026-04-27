@@ -311,9 +311,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   scanButtonText: {
+    ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
     fontWeight: "600",
-    ...PickingTheme.typography.body,
   },
   loadingContainer: {
     padding: PickingTheme.spacing.lg,

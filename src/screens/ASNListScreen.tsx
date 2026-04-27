@@ -7,14 +7,14 @@ import {
   ScrollView,
   FlatList,
   ActivityIndicator,
-} from "react-native";
+ Alert } from "react-native";
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
 import { dataService } from "../services/data.service";
 import { TransferCarton } from "../types";
 import { normalizeASN } from "../utils/asn";
 import { syncEvents } from "../services/event-queue.service";
-import { Alert } from "react-native";
+
 
 interface ASNRecord {
   asn_no: string; // Normalized 4-digit format for display
@@ -627,7 +627,10 @@ export default function ASNListScreen() {
             data={asnList}
             keyExtractor={(item) => item.asn_no_db || item.asn_no}
             renderItem={({ item }) => {
-              const isActiveASN = activeASN && normalizeASN(activeASN) === normalizeASN(item.asn_no);
+              const isActiveASN = Boolean(
+                activeASN &&
+                  normalizeASN(activeASN) === normalizeASN(item.asn_no)
+              );
               return (
                 <ASNCard
                   item={item}
@@ -754,7 +757,7 @@ export default function ASNListScreen() {
                         </View>
                         <Text style={styles.tcDetail}>
                           Updated:{" "}
-                          {new Date(item.updated_on).toLocaleDateString()}
+                          {new Date(item.updated_on ?? "").toLocaleDateString()}
                         </Text>
                         <Text style={styles.tapHint}>
                           Double tap to view boxes/cartons

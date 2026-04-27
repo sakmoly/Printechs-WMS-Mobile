@@ -8,17 +8,22 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
+  Image,
 } from "react-native";
-import { useNavigation, useFocusEffect } from "@react-navigation/native";
+import {
+  CommonActions,
+  useNavigation,
+  useFocusEffect,
+} from "@react-navigation/native";
 import { useApp } from "../context/AppContext";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
-import { getSettings } from "../services/settings.service";
+import { getSettings, saveSettings } from "../services/settings.service";
 import { apiService } from "../services/api.service";
 import { useNetworkStatus } from "../hooks/useNetworkStatus";
 
 export default function LoginScreen() {
   const navigation = useNavigation();
-  const { refreshSettings } = useApp();
+  const { refreshSettings, refreshDeviceSessionStatus } = useApp();
   const { isOnline, isChecking } = useNetworkStatus();
   const [userCode, setUserCode] = useState("");
   const [password, setPassword] = useState("");
@@ -47,7 +52,12 @@ export default function LoginScreen() {
     if (demoMode) {
       // In demo mode, go directly to home
       await refreshSettings();
-      navigation.navigate("Home" as never);
+      navigation.dispatch(
+        CommonActions.reset({
+          index: 0,
+          routes: [{ name: "Home" as never }],
+        })
+      );
       return;
     }
 
@@ -70,12 +80,11 @@ export default function LoginScreen() {
         return;
       }
 
-      // Combine both saveSettings calls into one to reduce database writes
-      const { saveSettings } = await import("../services/settings.service");
-
       // Update user_code, password, and clear token in a single database operation
+      const loginUser = userCode.trim();
       await saveSettings({
-        user_code: userCode.trim(),
+        user_code: loginUser,
+        user_id: loginUser,
         password: password,
         auth_token: undefined,
         auth_token_expires: undefined,
@@ -87,12 +96,83 @@ export default function LoginScreen() {
       if (token) {
         // Refresh settings to update context (this is quick, just one DB read)
         await refreshSettings();
-        navigation.navigate("Home" as never);
+        await refreshDeviceSessionStatus();
+        navigation.dispatch(
+          CommonActions.reset({
+            index: 0,
+            routes: [{ name: "Home" as never }],
+          })
+        );
       } else {
         Alert.alert("Login Failed", "Invalid credentials or server error");
       }
     } catch (error: any) {
       console.error("Login error:", error);
+
+      const errCode = (error as { code?: string }).code;
+      const isSessionExists =
+        errCode === "AUTH_SESSION_EXISTS" ||
+        String(error?.message || "").includes("Login session issue") ||
+        String(error?.message || "").includes(
+          "active mobile login for this user"
+        ) ||
+        String(error?.message || "").includes(
+          "already logged in on another mobile"
+        );
+
+      if (isSessionExists) {
+        Alert.alert(
+          "Login session issue",
+          error?.message ||
+            "The server still shows an active mobile login for this user.",
+          [
+            { text: "OK", style: "cancel" },
+            {
+              text: "Use this device",
+              onPress: async () => {
+                setLoggingIn(true);
+                try {
+                  await saveSettings({
+                    user_code: userCode.trim(),
+                    user_id: userCode.trim(),
+                    password: password,
+                    auth_token: undefined,
+                    auth_token_expires: undefined,
+                  });
+                  const token = await apiService.login(
+                    userCode.trim(),
+                    password,
+                    { replaceOtherMobileSession: true }
+                  );
+                  if (token) {
+                    await refreshSettings();
+                    await refreshDeviceSessionStatus();
+                    navigation.dispatch(
+                      CommonActions.reset({
+                        index: 0,
+                        routes: [{ name: "Home" as never }],
+                      })
+                    );
+                  } else {
+                    Alert.alert(
+                      "Login Failed",
+                      "Invalid credentials or server error"
+                    );
+                  }
+                } catch (e2: any) {
+                  Alert.alert(
+                    "Login Error",
+                    e2?.message || "Could not sign in on this device."
+                  );
+                } finally {
+                  setLoggingIn(false);
+                }
+              },
+            },
+          ]
+        );
+        return;
+      }
 
       // Provide more helpful error messages
       let errorMessage = error.message || "Failed to login";
@@ -112,6 +192,18 @@ export default function LoginScreen() {
         errorMessage = `Login timeout.\n\nThe server took too long to respond.\n\nPlease check:\n1. API URL is correct: ${
           currentSettings?.api_url || "Not configured"
         }\n2. Server is running and accessible\n3. Network connection is stable\n4. Firewall is not blocking the connection`;
+      } else if (
+        errorMessage.includes("Could not load bundle") ||
+        errorMessage.includes("Unable to resolve module")
+      ) {
+        errorMessage =
+          "The app could not load a code module (often seen as \"Could not load bundle\").\n\n" +
+          "If you are using Expo Go / a development build: the phone must reach your computer's Metro bundler, not only the API server.\n\n" +
+          "Try:\n" +
+          "• Same Wi‑Fi as the PC, or run: npx expo start --tunnel\n" +
+          "• In Expo Dev Tools, switch connection to Tunnel or LAN as appropriate\n" +
+          "• For a release APK/AAB, use a production build — dev clients need Metro\n\n" +
+          `Details: ${error.message || errorMessage}`;
       } else if (
         errorMessage.includes("Network request failed") ||
         errorMessage.includes("Network") ||
@@ -144,6 +236,10 @@ export default function LoginScreen() {
     <View style={{ flex: 1 }}>
       <ScrollView style={styles.container}>
       <View style={styles.header}>
+        <Image
+          source={require("../../assets/printechs-logo.png")}
+          style={styles.logo}
+        />
         <Text style={styles.title}>Printechs WMS</Text>
         <Text style={styles.subtitle}>Login</Text>
       </View>
@@ -235,6 +331,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#007AFF",
     padding: 48,
     alignItems: "center",
+  },
+  logo: {
+    width: 128,
+    height: 128,
+    resizeMode: "contain",
+    marginBottom: 16,
   },
   title: {
     fontSize: 36,

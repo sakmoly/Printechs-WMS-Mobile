@@ -43,6 +43,178 @@ interface PutAwayTransaction {
   asn_no?: string;
 }
 
+/** Backend TASK_MISMATCH: message ends with "(PUT-YYYYMMDD-####)" = task for this box */
+/** Backend may use Completed, Complete, Closed, Done, etc. */
+function isTerminalPutawayTaskStatus(status: string | undefined | null): boolean {
+  const u = String(status ?? "")
+    .trim()
+    .toUpperCase();
+  return (
+    u === "COMPLETED" ||
+    u === "COMPLETE" ||
+    u === "CLOSED" ||
+    u === "DONE" ||
+    u === "CANCELLED" ||
+    u === "CANCELED"
+  );
+}
+
+/** Remove open tasks whose box/TC refs match a completed putaway (orphan PUT-…0001 vs done PUT-…0002). */
+function removeStaleOpenPutawayTasksForCompletedBoxes(
+  backendPutawayTasks: TransferCarton[],
+  completedTaskBoxIds: Set<string>,
+  normalizeId: (id: string | null | undefined) => string,
+  backendTaskIds: Set<string>
+): void {
+  for (let i = backendPutawayTasks.length - 1; i >= 0; i--) {
+    const task = backendPutawayTasks[i] as any;
+    const refs = new Set<string>();
+    collectPutawayTaskBoxRefs(task, normalizeId, refs);
+    let drop = false;
+    for (const id of refs) {
+      if (id && completedTaskBoxIds.has(id)) {
+        drop = true;
+        break;
+      }
+    }
+    if (drop) {
+      const tid =
+        task.putaway_task || task.task_title || task.id || task.task_id;
+      console.warn(
+        `⚠️ PutAwayScreen: Removed stale open backend putaway task ${tid} — box/TC already completed (orphan task).`
+      );
+      backendPutawayTasks.splice(i, 1);
+    }
+  }
+  backendTaskIds.clear();
+  for (const t of backendPutawayTasks) {
+    collectPutawayTaskBoxRefs(t, normalizeId, backendTaskIds);
+  }
+}
+
+function collectPutawayTaskBoxRefs(
+  task: any,
+  normalizeId: (id: string | null | undefined) => string,
+  into: Set<string>
+): void {
+  const boxId = task?.box_id || task?.carton_id;
+  const tcId = task?.tc_id;
+  if (boxId) into.add(normalizeId(boxId));
+  if (tcId) into.add(normalizeId(tcId));
+  const lines = task?.lines;
+  if (lines && Array.isArray(lines)) {
+    for (const line of lines) {
+      const cid = line?.carton_id || line?.box_id;
+      const ltc = line?.tc_id;
+      if (cid) into.add(normalizeId(cid));
+      if (ltc) into.add(normalizeId(ltc));
+    }
+  }
+}
+
+function extractCorrectPutawayTaskFromTaskMismatch(
+  message: string
+): string | null {
+  if (!message) return null;
+  const jsonStart = message.indexOf("{");
+  if (jsonStart >= 0) {
+    try {
+      const j = JSON.parse(message.slice(jsonStart)) as {
+        code?: string;
+        message?: string;
+      };
+      const code = String(j?.code || "").toUpperCase();
+      const inner = String(j?.message || "");
+      if (code !== "TASK_MISMATCH" || !inner) return null;
+      const m = inner.match(/\(PUT-\d+-\d+\)/i);
+      if (m) return m[0].replace(/^\(|\)$/g, "");
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!/TASK_MISMATCH/i.test(message)) return null;
+  const m = message.match(/\(PUT-\d+-\d+\)/i);
+  return m ? m[0].replace(/^\(|\)$/g, "") : null;
+}
+
+/** First PUT-YYYYMMDD-#### in API message/body (success text often names the task). */
+function extractPutawayTaskIdFromApiText(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const m = String(text).match(/\bPUT-\d{8}-\d+\b/i);
+  return m ? m[0].toUpperCase() : null;
+}
+
+/**
+ * Which PUT-* task id to send for the selected box.
+ * 1) `selectedTCObj.putaway_task` — selection + TASK_MISMATCH correction from server (must win on resubmit).
+ * 2) Matching row in `sealedTCs` — list / loader truth when obj has no task (avoids stale global only).
+ * 3) Global `putawayTask` — last resort (can be stale from another box if obj and row lack a task).
+ */
+function resolvePutawayTaskIdForBoxSelection(
+  selectedTC: string | null | undefined,
+  sealedTCs: any[],
+  selectedTCObj: any,
+  putawayTaskState: string | null | undefined
+): string | null {
+  const u = (s: string | null | undefined) =>
+    String(s || "").trim().toUpperCase();
+  const fromObj = selectedTCObj?.putaway_task
+    ? String((selectedTCObj as any).putaway_task).trim()
+    : null;
+  if (fromObj) return fromObj;
+
+  const want = u(selectedTC);
+  if (want) {
+    const row = sealedTCs.find(
+      (tc: any) =>
+        u(tc.tc_id) === want ||
+        u((tc as any).box_id) === want ||
+        u((tc as any).transfer_carton_id) === want
+    );
+    const fromRow = row && (row as any).putaway_task
+      ? String((row as any).putaway_task).trim()
+      : null;
+    if (fromRow) return fromRow;
+  }
+
+  if (putawayTaskState) return String(putawayTaskState).trim();
+  return null;
+}
+
+/**
+ * ASN putaway: backend rejects INVALID_CARTON_FORMAT if carton_id is PAW-* / BOX-*.
+ * Same rule as scanTransferCarton — only CTN-* belongs in carton_id; use box_id (+ asn_no) otherwise.
+ */
+function normalizeAsnPutawayCompleteRequestBody(
+  requestBody: Record<string, any>,
+  isTransferIn: boolean,
+  asnNo?: string | null
+): void {
+  if (isTransferIn) return;
+  const badHeader = requestBody.carton_id as string | undefined;
+  const hu = String(badHeader || "").toUpperCase();
+  if (hu && !hu.startsWith("CTN-")) {
+    const prevBox = requestBody.box_id as string | undefined;
+    requestBody.box_id = prevBox || badHeader;
+    delete requestBody.carton_id;
+    requestBody.tc_id = null;
+  }
+  if (asnNo && requestBody.asn_no == null) {
+    requestBody.asn_no = asnNo;
+  }
+  const items = requestBody.items as any[] | undefined;
+  if (!items?.length) return;
+  requestBody.items = items.map((row) => {
+    const o = { ...row };
+    const cu = String(o.carton_id || "").toUpperCase();
+    if (cu && !cu.startsWith("CTN-")) {
+      o.box_id = o.box_id || o.carton_id;
+      delete o.carton_id;
+    }
+    return o;
+  });
+}
+
 export default function PutAwayScreen() {
   console.log("🔄 PutAwayScreen: Component rendered");
   const navigation = useNavigation();
@@ -101,6 +273,33 @@ export default function PutAwayScreen() {
   
   // ✅ Ref for Location ID TextInput to enable auto-focus
   const locationInputRef = useRef<TextInput>(null);
+
+  /** Latest selection for putaway_task resolution (avoids stale closures in async submit / Alert). */
+  const putawayResolveRef = useRef<{
+    selectedTC: string | null;
+    sealedTCs: TransferCarton[];
+    selectedTCObj: TransferCarton | null;
+    putawayTask: string | null;
+  }>({
+    selectedTC: null,
+    sealedTCs: [],
+    selectedTCObj: null,
+    putawayTask: null,
+  });
+  useEffect(() => {
+    putawayResolveRef.current = {
+      selectedTC,
+      sealedTCs,
+      selectedTCObj,
+      putawayTask,
+    };
+  }, [selectedTC, sealedTCs, selectedTCObj, putawayTask]);
+
+  const resolvePutawayTaskIdFromRefs = useCallback((): string | null => {
+    const { selectedTC: tc, sealedTCs: list, selectedTCObj: obj, putawayTask: pt } =
+      putawayResolveRef.current;
+    return resolvePutawayTaskIdForBoxSelection(tc, list, obj, pt);
+  }, []);
   
   // Source type filter for putaway tasks (ASN, TransferIn, or All)
   const [putawaySourceType, setPutawaySourceType] = useState<"ASN" | "TransferIn">("ASN");
@@ -204,6 +403,7 @@ export default function PutAwayScreen() {
           asn_no: box.asn_no,
           to_no: null,
           store: box.store,
+          purpose: box.purpose,
           // Use status from query (which prioritizes tc_cache status via COALESCE)
           status: box.status === "Sealed" || box.status === "SEALED" ? "Sealed" : "Closed",
           updated_on: box.updated_on,
@@ -372,10 +572,10 @@ export default function PutAwayScreen() {
                             taskASN.toUpperCase().trim() === activeASN.toUpperCase().trim() ||
                             taskASN.toUpperCase().trim().includes(activeASN.toUpperCase().trim())
                           );
-                          return isDraftOrInProgress && hasASN && matchesASN;
+                          return isDraftOpenOrInProgress && hasASN && matchesASN;
                         }
                         
-                        return isDraftOrInProgress && hasASN;
+                        return isDraftOpenOrInProgress && hasASN;
                       });
                       
                       putawayTasksResponse = filteredTasks;
@@ -778,11 +978,12 @@ export default function PutAwayScreen() {
           if (!packedIntoTC) {
             // Closed warehouse box not packed into TC - should appear if it has an "Open" putaway task
             // Create a TC-like object for the box so it can be scanned
-            const boxAsTC = {
+            const boxAsTC: TransferCarton = {
               tc_id: box.box_id, // Use box_id as tc_id for warehouse boxes
               asn_no: box.asn_no,
               store: box.store,
               status: "Closed", // Box is closed, but putaway task should be "Open"
+              updated_on: box.updated_on || new Date().toISOString(),
             };
             
             // Check if already in warehouseTCs (avoid duplicates)
@@ -802,7 +1003,7 @@ export default function PutAwayScreen() {
             // Skip if TC status is Completed or Closed (case-insensitive check)
             const tcStatusUpper = tc && tc.status ? tc.status.toUpperCase() : "";
             if (tcStatusUpper === "COMPLETED" || tcStatusUpper === "CLOSED") {
-              console.warn(`⚠️ PutAwayScreen: Skipped box ${box.box_id} - packed into ${tc.status} TC ${packedIntoTC.tc_id}`);
+              console.warn(`⚠️ PutAwayScreen: Skipped box ${box.box_id} - packed into ${tc?.status} TC ${packedIntoTC.tc_id}`);
               continue;
             }
             
@@ -831,6 +1032,36 @@ export default function PutAwayScreen() {
       // Fetch for ALL ASNs, not just activeASN, to catch all completed boxes
       let completedTaskBoxIds = new Set<string>();
       try {
+        // Local DB: after a successful location scan we mark box + tc Completed — include immediately
+        // so orphan "Open" tasks (e.g. PUT-…0001) for the same PAW do not keep the row visible.
+        try {
+          const lcBoxes = await db.getAllAsync<{ bid: string }>(
+            `SELECT UPPER(TRIM(box_id)) AS bid FROM box_cache
+             WHERE UPPER(TRIM(COALESCE(status,''))) = 'COMPLETED'
+               AND box_id IS NOT NULL AND TRIM(box_id) != ''`
+          );
+          for (const row of lcBoxes) {
+            if (row.bid) completedTaskBoxIds.add(row.bid);
+          }
+          const lcTcs = await db.getAllAsync<{ tid: string }>(
+            `SELECT UPPER(TRIM(tc_id)) AS tid FROM tc_cache
+             WHERE UPPER(TRIM(COALESCE(status,''))) = 'COMPLETED'
+               AND tc_id IS NOT NULL AND TRIM(tc_id) != ''`
+          );
+          for (const row of lcTcs) {
+            if (row.tid) completedTaskBoxIds.add(row.tid);
+          }
+          if (lcBoxes.length + lcTcs.length > 0) {
+            console.warn(
+              `📦 PutAwayScreen: Merged ${lcBoxes.length} box(es) + ${lcTcs.length} TC(s) with local Completed status into completedTaskBoxIds`
+            );
+          }
+        } catch (lcErr: any) {
+          console.warn(
+            `⚠️ PutAwayScreen: Could not read local Completed box/tc ids: ${lcErr.message}`
+          );
+        }
+
         const settings = await getSettings();
         if (settings.api_url && settings.demo_mode !== 1) {
           try {
@@ -889,11 +1120,10 @@ export default function PutAwayScreen() {
                   allTasksList = allTasksResponse.tasks;
                 }
                 
-                // Filter for completed or closed tasks
-                completedTasksList = allTasksList.filter((t: any) => {
-                  const taskStatus = (t.status || "").toUpperCase();
-                  return taskStatus === "COMPLETED" || taskStatus === "CLOSED";
-                });
+                // Filter for terminal tasks (status strings vary by backend)
+                completedTasksList = allTasksList.filter((t: any) =>
+                  isTerminalPutawayTaskStatus(t.status)
+                );
               } catch (allTasksError: any) {
                 console.warn(`⚠️ Could not fetch all tasks: ${allTasksError.message}`);
               }
@@ -943,6 +1173,46 @@ export default function PutAwayScreen() {
                 if (normalizedTCId) completedTaskBoxIds.add(normalizedTCId);
               }
             }
+
+            // Enrich: terminal-status tasks for active ASN (same PAW-* may have PUT-0002 Completed
+            // while PUT-0001 stays Open — first fetch may miss line-level refs or status spelling).
+            if (activeASN) {
+              try {
+                const asnTasksResponse = await apiService.getPutawayTasks({
+                  asn_no: activeASN,
+                });
+                let asnTasksList: any[] = [];
+                if (Array.isArray(asnTasksResponse)) {
+                  asnTasksList = asnTasksResponse;
+                } else if (
+                  asnTasksResponse?.data &&
+                  Array.isArray(asnTasksResponse.data)
+                ) {
+                  asnTasksList = asnTasksResponse.data;
+                } else if (
+                  asnTasksResponse?.tasks &&
+                  Array.isArray(asnTasksResponse.tasks)
+                ) {
+                  asnTasksList = asnTasksResponse.tasks;
+                }
+                const beforeEnrich = completedTaskBoxIds.size;
+                for (const task of asnTasksList) {
+                  if (!isTerminalPutawayTaskStatus(task.status)) continue;
+                  collectPutawayTaskBoxRefs(task, normalizeId, completedTaskBoxIds);
+                }
+                if (completedTaskBoxIds.size > beforeEnrich) {
+                  console.warn(
+                    `📦 PutAwayScreen: ASN terminal-task enrich added ${
+                      completedTaskBoxIds.size - beforeEnrich
+                    } box ref(s) for ${activeASN}`
+                  );
+                }
+              } catch (enrichErr: any) {
+                console.warn(
+                  `⚠️ PutAwayScreen: ASN enrich for completed box refs failed: ${enrichErr.message}`
+                );
+              }
+            }
             
             console.warn(`📦 PutAwayScreen: Found ${completedTaskBoxIds.size} completed boxes (${completedBoxesWithLocation.size} with location_id)`);
             
@@ -956,7 +1226,14 @@ export default function PutAwayScreen() {
         // Continue without completed tasks check
         console.warn(`⚠️ PutAwayScreen: Error fetching completed tasks: ${error.message}`);
       }
-      
+
+      removeStaleOpenPutawayTasksForCompletedBoxes(
+        backendPutawayTasks,
+        completedTaskBoxIds,
+        normalizeId,
+        backendTaskIds
+      );
+
       // Add Putaway boxes (filtered by ASN if needed)
       // Exclude Putaway boxes that have already been assigned a location
       for (const putawayTC of putawayTCs) {
@@ -989,9 +1266,7 @@ export default function PutAwayScreen() {
         }
         
         const taskStatus = (putawayTC as any).putaway_task_status;
-        const taskStatusUpper = taskStatus ? taskStatus.toUpperCase() : "";
-        const isTaskCompleted = taskStatusUpper === "COMPLETED";
-        const isTaskClosed = taskStatusUpper === "CLOSED";
+        const isTaskTerminal = isTerminalPutawayTaskStatus(taskStatus);
         const boxStatus = (putawayTC.status || "").toUpperCase();
         const isBoxClosed = boxStatus === "CLOSED";
         const hasLocationAssigned = !!(putawayTC as any).location_id || assignedTCSet.has(putawayTC.tc_id.toUpperCase());
@@ -1011,8 +1286,8 @@ export default function PutAwayScreen() {
           continue;
         }
         
-        // 3. Backend task is COMPLETED or CLOSED → filter out
-        if (hasBackendTask && (isTaskCompleted || isTaskClosed)) {
+        // 3. Backend task is terminal (Completed / Closed / etc.) → filter out
+        if (hasBackendTask && isTaskTerminal) {
           console.warn(`⚠️ PutAwayScreen: Skipped Putaway box ${putawayTC.tc_id} - putaway task is ${taskStatus}`);
           continue;
         }
@@ -1037,18 +1312,16 @@ export default function PutAwayScreen() {
           }
         }
         
-        // 5. ✅ NEW: Query backend directly for this box's task to check status and location_id
-        // This catches cases where the box has a completed task but wasn't in the bulk fetch
-        if (!hasBackendTask && !hasLocationAssigned && !completedTaskBoxIds.has(normalizedBoxIdForCheck)) {
+        // 5. Query ASN tasks for this box: skip if ANY matching task is terminal (e.g. PUT-0002 Done
+        // while stale PUT-0001 Open still appears in open-only list). Prefer latest open task id.
+        if (!hasLocationAssigned && !completedTaskBoxIds.has(normalizedBoxIdForCheck)) {
           try {
             const settings = await getSettings();
             if (settings.api_url && settings.demo_mode !== 1) {
-              // Try to find this box in any putaway task by querying with box_id/carton_id
-              // First try to get tasks for this ASN
               const boxTasksResponse = await apiService.getPutawayTasks({
                 asn_no: putawayTC.asn_no || activeASN || undefined,
               });
-              
+
               let allBoxTasks: any[] = [];
               if (Array.isArray(boxTasksResponse)) {
                 allBoxTasks = boxTasksResponse;
@@ -1057,53 +1330,105 @@ export default function PutAwayScreen() {
               } else if (boxTasksResponse?.tasks && Array.isArray(boxTasksResponse.tasks)) {
                 allBoxTasks = boxTasksResponse.tasks;
               }
-              
-              // Find task for this specific box by checking box_id, tc_id, or carton_id in task lines
-              const boxTask = allBoxTasks.find((task: any) => {
+
+              const taskMatchesBox = (task: any): boolean => {
                 const taskBoxId = normalizeId(task.box_id || task.carton_id);
                 const taskTCId = normalizeId(task.tc_id);
-                if (taskBoxId === normalizedBoxIdForCheck || taskTCId === normalizedBoxIdForCheck) {
+                if (
+                  taskBoxId === normalizedBoxIdForCheck ||
+                  taskTCId === normalizedBoxIdForCheck
+                ) {
                   return true;
                 }
-                // Also check task lines for carton_id
                 if (task.lines && Array.isArray(task.lines)) {
                   return task.lines.some((line: any) => {
-                    const lineCartonId = normalizeId(line.carton_id);
+                    const lineCartonId = normalizeId(
+                      line.carton_id || line.box_id
+                    );
                     return lineCartonId === normalizedBoxIdForCheck;
                   });
                 }
                 return false;
-              });
-              
-              if (boxTask) {
-                const boxTaskStatus = (boxTask.status || "").toUpperCase();
-                const hasLocationInTask = !!boxTask.location_id;
-                // Check if any task line has location_id for this specific carton
-                let hasLocationInLines = false;
-                if (boxTask.lines && Array.isArray(boxTask.lines)) {
-                  const matchingLine = boxTask.lines.find((line: any) => {
-                    const lineCartonId = normalizeId(line.carton_id || line.box_id);
-                    return lineCartonId === normalizedBoxIdForCheck;
+              };
+
+              const matchingTasks = allBoxTasks.filter(taskMatchesBox);
+
+              const putawaySortKey = (t: any): number => {
+                const id = String(
+                  t.putaway_task || t.task_title || t.id || t.task_id || ""
+                );
+                const m = id.match(/PUT-(\d+)-(\d+)/i);
+                if (!m) return 0;
+                return parseInt(m[1], 10) * 100000 + parseInt(m[2], 10);
+              };
+
+              const anyTerminalForBox = matchingTasks.some((task: any) => {
+                if (isTerminalPutawayTaskStatus(task.status)) return true;
+                if (task.location_id) return true;
+                if (task.lines && Array.isArray(task.lines)) {
+                  return task.lines.some((line: any) => {
+                    const cid = normalizeId(line.carton_id || line.box_id);
+                    if (cid !== normalizedBoxIdForCheck) return false;
+                    return !!line.location_id;
                   });
-                  hasLocationInLines = !!matchingLine?.location_id;
                 }
-                
-                if (boxTaskStatus === "COMPLETED" || boxTaskStatus === "CLOSED" || hasLocationInTask || hasLocationInLines) {
-                  console.warn(`⚠️ PutAwayScreen: Skipped Putaway box ${putawayTC.tc_id} - found completed/closed task with location via direct query: ${boxTask.putaway_task || boxTask.task_title} (status: ${boxTask.status}, hasLocation: ${hasLocationInTask || hasLocationInLines})`);
-                  
-                  // ✅ Update local database to reflect completed status
-                  try {
-                    await dataService.updateTransferCartonStatus(putawayTC.tc_id, "Completed");
-                    await dataService.updateBoxStatus(putawayTC.tc_id, "Completed");
-                    console.warn(`✅ PutAwayScreen: Updated local database status to Completed for box ${putawayTC.tc_id}`);
-                  } catch (updateError: any) {
-                    console.warn(`⚠️ PutAwayScreen: Could not update local database status: ${updateError.message}`);
-                  }
-                  
-                  continue;
+                return false;
+              });
+
+              if (anyTerminalForBox) {
+                const terminalRef = matchingTasks.find(
+                  (t) =>
+                    isTerminalPutawayTaskStatus(t.status) ||
+                    t.location_id ||
+                    (t.lines || []).some((line: any) => {
+                      const cid = normalizeId(line.carton_id || line.box_id);
+                      return (
+                        cid === normalizedBoxIdForCheck && !!line.location_id
+                      );
+                    })
+                );
+                console.warn(
+                  `⚠️ PutAwayScreen: Skipped Putaway box ${putawayTC.tc_id} - terminal or located task exists for this box (e.g. ${terminalRef?.putaway_task || terminalRef?.task_title || "?"}, status: ${terminalRef?.status})`
+                );
+                try {
+                  await dataService.updateTransferCartonStatus(
+                    putawayTC.tc_id,
+                    "Completed"
+                  );
+                  await dataService.updateBoxStatus(
+                    putawayTC.tc_id,
+                    "Completed"
+                  );
+                  console.warn(
+                    `✅ PutAwayScreen: Updated local DB to Completed for box ${putawayTC.tc_id}`
+                  );
+                } catch (updateError: any) {
+                  console.warn(
+                    `⚠️ PutAwayScreen: Could not update local DB: ${updateError.message}`
+                  );
                 }
-                // If task exists and is not completed, store it for later use
-                (putawayTC as any).putaway_task = boxTask.putaway_task || boxTask.task_title;
+                continue;
+              }
+
+              const openMatches = matchingTasks.filter((task: any) => {
+                const st = (task.status || "").toUpperCase();
+                return (
+                  st === "OPEN" ||
+                  st === "DRAFT" ||
+                  st === "IN PROGRESS" ||
+                  st === "INPROGRESS"
+                );
+              });
+              const boxTask =
+                openMatches.length > 0
+                  ? [...openMatches].sort(
+                      (a, b) => putawaySortKey(a) - putawaySortKey(b)
+                    )[openMatches.length - 1]
+                  : null;
+
+              if (boxTask) {
+                (putawayTC as any).putaway_task =
+                  boxTask.putaway_task || boxTask.task_title;
                 (putawayTC as any).putaway_task_status = boxTask.status;
                 if (boxTask.location_id) {
                   (putawayTC as any).location_id = boxTask.location_id;
@@ -1111,8 +1436,9 @@ export default function PutAwayScreen() {
               }
             }
           } catch (error: any) {
-            // Silently fail - continue without this check
-            console.warn(`⚠️ PutAwayScreen: Could not query backend for box ${putawayTC.tc_id} task status: ${error.message}`);
+            console.warn(
+              `⚠️ PutAwayScreen: Could not query backend for box ${putawayTC.tc_id} task status: ${error.message}`
+            );
           }
         }
         
@@ -1149,7 +1475,7 @@ export default function PutAwayScreen() {
         // ✅ Only show CLOSED boxes that are ready for putaway (no location assigned, task not completed)
         // These boxes are closed/sealed and waiting for putaway location to be scanned
         
-        if (hasBackendTask && !isTaskCompleted && !isTaskClosed) {
+        if (hasBackendTask && !isTaskTerminal) {
           console.warn(`ℹ️ PutAwayScreen: Including Putaway box ${putawayTC.tc_id} - has backend putaway task (status: ${taskStatus}) even though local event exists`);
         }
         
@@ -1185,89 +1511,6 @@ export default function PutAwayScreen() {
       try {
         const settings = await getSettings();
         if (settings.api_url && settings.demo_mode !== 1) {
-          // ✅ Removed "All" tab - this section is no longer needed
-          // ASN and Transfer In tabs fetch their own tasks separately
-          if (false) {
-            let allTasksResponse: any = null;
-            try {
-              console.warn(`📤 PutAwayScreen: Requesting ALL putaway tasks (ASN + Transfer In) - no source_type filter`);
-              // ✅ No source_type parameter = returns all types (ASN + Transfer In)
-              allTasksResponse = await apiService.getPutawayTasks({
-                status: "Draft,Open,In Progress", // ✅ Include Open status for all putaway tasks
-                // ✅ No source_type filter - backend returns all types
-              });
-              console.warn(`📥 PutAwayScreen: Received ALL putaway tasks response:`, {
-                isArray: Array.isArray(allTasksResponse),
-                hasData: !!allTasksResponse?.data,
-                hasTasks: !!allTasksResponse?.tasks,
-                dataLength: allTasksResponse?.data?.length,
-                tasksLength: allTasksResponse?.tasks?.length,
-                arrayLength: Array.isArray(allTasksResponse) ? allTasksResponse.length : undefined,
-              });
-              
-              // Parse response
-              let allTasksList: any[] = [];
-              if (Array.isArray(allTasksResponse)) {
-                allTasksList = allTasksResponse;
-              } else if (allTasksResponse?.data && Array.isArray(allTasksResponse.data)) {
-                allTasksList = allTasksResponse.data;
-              } else if (allTasksResponse?.tasks && Array.isArray(allTasksResponse.tasks)) {
-                allTasksList = allTasksResponse.tasks;
-              }
-              
-              // Filter out completed tasks (client-side safety check)
-              allTasksList = allTasksList.filter((task: any) => {
-                const taskStatus = (task.status || "").toUpperCase();
-                return taskStatus !== "COMPLETED" && taskStatus !== "CLOSED";
-              });
-              
-              console.warn(`📥 PutAwayScreen: Processed ${allTasksList.length} active putaway task(s) from ALL types (ASN + Transfer In)`);
-              
-              // ✅ Split tasks into ASN and Transfer In for processing
-              // ASN tasks will be processed in the existing ASN loop (if putawaySourceType === "ASN" or "All")
-              // Transfer In tasks will be processed in the existing Transfer In loop (if putawaySourceType === "TransferIn" or "All")
-              // For "All" tab, we need to process both types
-              
-              // Separate ASN and Transfer In tasks
-              const asnTasksFromAll = allTasksList.filter((task: any) => {
-                const hasASN = (task.asn_no || task.advance_shipping_notice) && !task.transfer_in;
-                const isASNSource = task.source_type === "ASN";
-                return hasASN || isASNSource;
-              });
-              
-              const transferInTasksFromAll = allTasksList.filter((task: any) => {
-                // ✅ Prioritize source_type first (most reliable indicator)
-                const isTransferInSource = task.source_type === "TransferIn";
-                if (isTransferInSource) {
-                  return true;
-                }
-                // ✅ Fallback: Check for transfer_in field (but some backends may set both asn_no and transfer_in)
-                const hasTransferIn = task.transfer_in && (task.source_type === "TransferIn" || (!task.asn_no && !task.advance_shipping_notice));
-                return hasTransferIn;
-              });
-              
-              console.warn(`📥 PutAwayScreen: Split ALL tasks - ASN: ${asnTasksFromAll.length}, Transfer In: ${transferInTasksFromAll.length}`);
-              
-              // ✅ Process ASN tasks (will be handled by existing ASN processing loop)
-              // Store ASN tasks in putawayTasksResponse for processing
-              if (asnTasksFromAll.length > 0) {
-                putawayTasksResponse = asnTasksFromAll;
-                console.warn(`📥 PutAwayScreen: Processing ${asnTasksFromAll.length} ASN task(s) from ALL response`);
-              }
-              
-              // ✅ Process Transfer In tasks (will be handled by existing Transfer In processing loop)
-              // Store Transfer In tasks in transferInTasksResponse for processing
-              if (transferInTasksFromAll.length > 0) {
-                transferInTasksResponse = transferInTasksFromAll;
-                console.warn(`📥 PutAwayScreen: Processing ${transferInTasksFromAll.length} Transfer In task(s) from ALL response`);
-              }
-            } catch (allTasksError: any) {
-              const errorMessage = allTasksError.message || "";
-              console.warn(`⚠️ PutAwayScreen: Error fetching ALL putaway tasks: ${errorMessage}`);
-              // Continue with separate ASN and Transfer In fetches as fallback
-            }
-          }
-          
           // Load Transfer In putaway tasks (if filter allows)
           // ✅ NOTE: ASN tasks were already loaded earlier (before filtering)
           if (putawaySourceType === "TransferIn") {
@@ -1789,7 +2032,14 @@ export default function PutAwayScreen() {
         console.warn(`⚠️ Error loading putaway tasks from backend:`, backendError.message);
         // Continue with local database fallback
       }
-      
+
+      removeStaleOpenPutawayTasksForCompletedBoxes(
+        backendPutawayTasks,
+        completedTaskBoxIds,
+        normalizeId,
+        backendTaskIds
+      );
+
       // Merge backend tasks with local TCs/boxes
       // Backend tasks take priority (they're the source of truth)
       // ✅ NOTE: backendTaskIds Set was already populated when loading ASN tasks earlier
@@ -2159,7 +2409,7 @@ export default function PutAwayScreen() {
     } finally {
       setLoading(false);
     }
-  }, [activeASN, loadRemainingItems, putawaySourceType]);
+  }, [activeASN, putawaySourceType]);
 
   // ============================================================================
   // ✅ SIMPLE TRANSFER IN LOADER - Guaranteed to work
@@ -2219,9 +2469,9 @@ export default function PutAwayScreen() {
         
         return {
           tc_id: cartonId,
-          asn_no: task.transfer_in || null,
+          asn_no: task.transfer_in || "",
           to_no: null,
-          store: task.warehouse || null,
+          store: task.warehouse || "",
           status: task.status || "Open",
           updated_on: task.updated_on || task.created_on || new Date().toISOString(),
           // Extended properties
@@ -2231,7 +2481,7 @@ export default function PutAwayScreen() {
           transfer_in: task.transfer_in,
           warehouse: task.warehouse,
           carton_id: cartonId,
-        } as TransferCarton & { [key: string]: any };
+        } as unknown as TransferCarton & { [key: string]: any };
       });
       
       console.warn(`✅ [SIMPLE] Created ${putawayItems.length} putaway items for display`);
@@ -2419,7 +2669,7 @@ export default function PutAwayScreen() {
   const verifyPutawayTransactionFromBackend = async (
     tcId: string,
     locationId: string,
-    asnNo?: string
+    asnNo?: string | null
   ): Promise<boolean> => {
     try {
       const settings = await getSettings();
@@ -2714,7 +2964,7 @@ export default function PutAwayScreen() {
       }
 
       // Step 2: Get items - prefer from task details (more accurate), fallback to local DB
-      let items: Array<{
+      let items: {
         item_code: string;
         qty: number;
         carton_id?: string;
@@ -2722,7 +2972,7 @@ export default function PutAwayScreen() {
         source_bin?: string;
         target_bin?: string;
         completed?: boolean;
-      }> = [];
+      }[] = [];
 
       // Try to get items from task details first (more reliable)
       if (taskDetails && (taskDetails.lines || taskDetails.data?.lines)) {
@@ -3097,10 +3347,18 @@ export default function PutAwayScreen() {
           // ✅ Priority 4: Try to fetch full task details (handle 404 gracefully)
           // Note: This endpoint might not exist (404), so we only try if we haven't found carton_id yet
           // and we don't already have task_lines loaded (to avoid unnecessary API calls)
-          if (!cartonIdForRequest && putawayTask && (!taskLines || taskLines.length === 0)) {
+          const taskIdForFetch =
+            (selectedTCObj as any).putaway_task || putawayTask || null;
+          if (
+            !cartonIdForRequest &&
+            taskIdForFetch &&
+            (!taskLines || taskLines.length === 0)
+          ) {
             try {
-              console.warn(`⚠️ ASN Putaway: Fetching full task details for ${putawayTask} to get carton_id...`);
-              const fullTask = await apiService.getPutawayTask(putawayTask);
+              console.warn(
+                `⚠️ ASN Putaway: Fetching full task details for ${taskIdForFetch} to get carton_id...`
+              );
+              const fullTask = await apiService.getPutawayTask(taskIdForFetch);
               // ✅ Handle response format: { ok: true, data: { items: [...] } }
               const fullTaskData = fullTask?.data || fullTask;
               const taskItems = fullTaskData?.items || fullTaskData?.lines || [];
@@ -3145,7 +3403,7 @@ export default function PutAwayScreen() {
                        AND item_code = ? 
                        AND asn_no = ? 
                      LIMIT 1`,
-                    [validatedData.box_id, firstItemCode, selectedTCObj.asn_no || '']
+                    [validatedData.box_id, firstItemCode, selectedTCObj?.asn_no || ""]
                   );
                   
                   if (boxIdFromDB && boxIdFromDB.box_id && (boxIdFromDB.box_id.startsWith("CTN-") || boxIdFromDB.box_id.startsWith("BOX-") || boxIdFromDB.box_id.startsWith("PAW-"))) {
@@ -3186,7 +3444,12 @@ export default function PutAwayScreen() {
           completed_by: settings.user_id || settings.user_code || undefined,
           performed_by: settings.user_id || settings.user_code || undefined,
           // Include putaway_task only if it exists (for backward compatibility with legacy workflow)
-          ...(putawayTask ? { putaway_task: putawayTask } : {}),
+          ...((selectedTCObj as any).putaway_task || putawayTask
+            ? {
+                putaway_task:
+                  (selectedTCObj as any).putaway_task || putawayTask,
+              }
+            : {}),
         };
         
         // ✅ Note: items array is optional - backend can get items from carton/box
@@ -3221,6 +3484,12 @@ export default function PutAwayScreen() {
         } else {
           console.warn(`⚠️ No items found - backend will get items from carton/box`);
         }
+
+        normalizeAsnPutawayCompleteRequestBody(
+          requestBody,
+          isTransferIn,
+          (selectedTCObj as any)?.asn_no || activeASN || undefined
+        );
 
         const response = await apiService.completePutaway(requestBody);
         console.log(`✅ Putaway completion API response:`, JSON.stringify(response).substring(0, 500));
@@ -3341,7 +3610,8 @@ export default function PutAwayScreen() {
         // For Transfer In, go directly to location scan (backend assigns location to all items)
         setWorkflowState("SCAN_LOCATION");
       } else {
-        setPutawayTask(null); // Reset putaway task when selecting new TC
+        // ASN: keep task from this row (second carton = new PUT-*); avoid stale global task
+        setPutawayTask((tc as any).putaway_task ?? null);
         // ✅ NEW: For validation-only workflow, we'll validate carton and location
         // For ASN tasks, go directly to location scan
         // The validation API will validate both carton and location when location is scanned
@@ -3452,8 +3722,9 @@ export default function PutAwayScreen() {
                   asn_no: box.asn_no,
                   store: box.store,
                   status: "Closed",
+                  updated_on: new Date().toISOString(),
                   source_type: sourceType, // ✅ NEW: Mark as TransferIn or ASN
-                };
+                } as TransferCarton & { source_type: string };
                 setSelectedTC(scannedValue);
                 setSelectedTCObj(boxAsTC);
                 setPutawayTask(null);
@@ -3510,11 +3781,12 @@ export default function PutAwayScreen() {
             } else {
               // NEW WORKFLOW: Regular warehouse box not packed into TC - can be used directly
               // Backend will handle creating/updating putaway task when location is scanned
-              const boxAsTC = {
+              const boxAsTC: TransferCarton = {
                 tc_id: scannedValue, // Use box_id as tc_id for warehouse boxes
                 asn_no: box.asn_no,
                 store: box.store,
                 status: "Closed",
+                updated_on: new Date().toISOString(),
               };
               setSelectedTC(scannedValue);
               setSelectedTCObj(boxAsTC);
@@ -3595,7 +3867,7 @@ export default function PutAwayScreen() {
       // For Transfer In, go directly to location scan (backend assigns location to all items)
       setWorkflowState("SCAN_LOCATION");
     } else {
-      setPutawayTask(null); // Reset putaway task when selecting new TC
+      setPutawayTask((tc as any).putaway_task ?? null);
       // For ASN tasks, go directly to location scan
       // Note: We don't fetch putaway task here because the API requires a location (rack)
       // Instead, we'll get the putaway_task when location is scanned (Workflow 1)
@@ -3676,21 +3948,30 @@ export default function PutAwayScreen() {
     const isTransferIn = sourceType === "TransferIn";
     const locationIdUpper = scannedLocationInput.trim().toUpperCase();
     
-    // ✅ NEW: Get putaway_task and box_id for confirmation
-    const putawayTaskId = putawayTask || (selectedTCObj as any).putaway_task;
+    // Prefer list row (`sealedTCs`) over global `putawayTask` so we never send a prior task id.
+    const putawayTaskId = resolvePutawayTaskIdFromRefs();
     // ✅ Get box_id (carton_id for Transfer In, or tc_id for ASN)
     const boxId = (selectedTCObj as any).carton_id || (selectedTCObj as any).box_id || selectedTC;
+
+    const taskPreview = putawayTaskId
+      ? `Task ID (putaway_task in POST /api/putaway/scan-transfer-carton):\n${putawayTaskId}\n\n`
+      : `Task ID: not resolved yet — box will be sent; ensure list/sync is up to date.\n\n`;
     
     // ✅ NEW: Show confirmation dialog before processing
     Alert.alert(
       "Confirm Location",
-      `Assign Location ID "${locationIdUpper}" to ${putawayTaskId ? `Putaway Task "${putawayTaskId}"` : `Box "${boxId}"`}?\n\nThis will update all items in this task.`,
+      `${taskPreview}` +
+        `Box / carton id (box_id): ${boxId}\n` +
+        `Location: ${locationIdUpper}\n\n` +
+        `Send this putaway scan now?`,
       [
         { text: "Cancel", style: "cancel" },
         {
           text: "Submit",
           onPress: async () => {
-            await processLocationSubmission(locationIdUpper, putawayTaskId, boxId, isTransferIn);
+            // Do not pass frozen task id — processLocationSubmission resolves from refs at API time
+            // so TASK_MISMATCH corrections apply on "Submit again" without reopening Confirm.
+            await processLocationSubmission(locationIdUpper, boxId, isTransferIn);
           },
         },
       ]
@@ -3700,7 +3981,6 @@ export default function PutAwayScreen() {
   // ✅ NEW: Process location submission (called after confirmation)
   const processLocationSubmission = async (
     locationIdUpper: string,
-    putawayTaskId: string | null,
     boxId: string | null,
     isTransferIn: boolean
   ) => {
@@ -3720,7 +4000,13 @@ export default function PutAwayScreen() {
     // For Transfer In tasks with putaway_task, we can skip carton/item scanning
     // The backend will assign the location to all items in the task automatically
     // Only require carton/item if we don't have a putaway_task (legacy workflow)
-    if (isTransferIn && !putawayTaskId && !selectedCartonOrItem && !selectedItemCode && !validatedData) {
+    if (
+      isTransferIn &&
+      !resolvePutawayTaskIdFromRefs() &&
+      !selectedCartonOrItem &&
+      !selectedItemCode &&
+      !validatedData
+    ) {
       Alert.alert("Error", "Please scan a carton ID or item code first, or select a putaway task");
       return;
     }
@@ -3827,21 +4113,23 @@ export default function PutAwayScreen() {
       setSelectedRack(rack);
       setSelectedBin(bin || null);
 
-      // ✅ FIX: Get warehouse_id from location or settings
-      // Priority: location.warehouse_id > location.warehouse > settings.warehouse_id > settings.warehouse
-      const warehouseId = 
-        location.warehouse_id || 
-        location.warehouse || 
-        settings.warehouse_id || 
-        settings.warehouse || 
+      // ✅ FIX: Get warehouse_id from location or settings (bin_location_cache shape varies)
+      const locAny = location as Record<string, unknown>;
+      const warehouseId =
+        (locAny.warehouse_id as string | undefined) ||
+        (locAny.warehouse as string | undefined) ||
+        settings.warehouse_id ||
+        settings.warehouse ||
         undefined;
-      
+
       if (!warehouseId) {
         console.warn(`⚠️ PutAwayScreen: No warehouse_id found in location or settings. Backend may require it.`);
-        console.warn(`   Location data:`, { warehouse_id: location.warehouse_id, warehouse: location.warehouse });
+        console.warn(`   Location data:`, { warehouse_id: locAny.warehouse_id, warehouse: locAny.warehouse });
         console.warn(`   Settings data:`, { warehouse_id: settings.warehouse_id, warehouse: settings.warehouse });
       } else {
-        console.warn(`✅ PutAwayScreen: Using warehouse_id: ${warehouseId} (from ${location.warehouse_id ? 'location' : 'settings'})`);
+        console.warn(
+          `✅ PutAwayScreen: Using warehouse_id: ${warehouseId} (from ${locAny.warehouse_id ? "location" : "settings"})`
+        );
       }
 
       // Try to call API to scan transfer carton and location
@@ -3853,16 +4141,23 @@ export default function PutAwayScreen() {
       let response: any = null;
       let apiErrorOccurred = false;
       let apiErrorMessage: string | null = null; // ✅ Store error message for final error handling
-      
+      let lastRequestedPutawayTaskId: string | null = null;
+      let boxIdToSend: string | null = null;
+      let cartonIdToSend: string | null = null;
+
       try {
         // Validate required fields before sending request
         if (!locationIdUpper || locationIdUpper.trim() === '') {
           throw new Error("Location ID is required to scan transfer carton for putaway");
         }
         
-        if (!putawayTask && !selectedTC) {
+        if (!resolvePutawayTaskIdFromRefs() && !putawayResolveRef.current.selectedTC) {
           throw new Error("Either putaway task or transfer carton ID is required");
         }
+
+        /** Backend: putaway_task (e.g. PUT-YYYYMMDD-####) + box_id must match tabPutawayTask.box_id for that task. */
+        const resolvePutawayTaskForScan = (): string | null =>
+          resolvePutawayTaskIdFromRefs();
         
         // ✅ NEW: Use putaway_task parameter when available (per user requirements)
         // ⚠️ IMPORTANT: Backend requires either carton_id/tc_id OR box_id even when putaway_task is provided
@@ -3875,11 +4170,92 @@ export default function PutAwayScreen() {
         // ✅ Determine source type and box_id/carton_id
         const sourceType = (selectedTCObj as any).source_type || "ASN";
         const isTransferIn = sourceType === "TransferIn";
+
+        let resolvedPutawayTaskId = resolvePutawayTaskForScan();
+        if (
+          !isTransferIn &&
+          !resolvedPutawayTaskId &&
+          activeASN &&
+          selectedTC
+        ) {
+          const sid = String(selectedTC).trim().toUpperCase();
+          if (!sid.startsWith("CTN-")) {
+            try {
+              const tasksResp = await apiService.getPutawayTasks({
+                status: "Draft,Open,In Progress",
+                source_type: "ASN",
+                asn_no: activeASN,
+              });
+              const list: any[] = Array.isArray(tasksResp)
+                ? tasksResp
+                : tasksResp?.data || tasksResp?.tasks || [];
+              const normBox = (id: string | null | undefined) =>
+                String(id || "").trim().toUpperCase();
+              const taskMatchesScannedBox = (t: any): boolean => {
+                const bid = normBox(t.box_id || t.transfer_carton_id || t.carton_id);
+                const tid = normBox(t.tc_id);
+                if (bid === sid || tid === sid) return true;
+                if (t.lines && Array.isArray(t.lines)) {
+                  return t.lines.some((line: any) => {
+                    const lineId = normBox(line.carton_id || line.box_id);
+                    return lineId === sid;
+                  });
+                }
+                return false;
+              };
+              const matchingForBox = list.filter(taskMatchesScannedBox);
+              const isOpenPutawayStatus = (t: any) => {
+                const st = String(t.status || "").trim().toUpperCase();
+                return (
+                  st === "OPEN" ||
+                  st === "DRAFT" ||
+                  st === "IN PROGRESS" ||
+                  st === "INPROGRESS"
+                );
+              };
+              const openForBox = matchingForBox.filter(isOpenPutawayStatus);
+              const putawaySortKeyPick = (t: any): number => {
+                const id = String(
+                  t.putaway_task || t.task_title || t.id || t.task_id || ""
+                );
+                const m = id.match(/PUT-(\d+)-(\d+)/i);
+                if (!m) return 0;
+                return parseInt(m[1], 10) * 100000 + parseInt(m[2], 10);
+              };
+              let hit: any = null;
+              if (openForBox.length > 0) {
+                const sorted = [...openForBox].sort(
+                  (a, b) => putawaySortKeyPick(a) - putawaySortKeyPick(b)
+                );
+                hit = sorted[sorted.length - 1];
+              }
+              if (hit) {
+                const taskTitle =
+                  hit.putaway_task ||
+                  hit.title ||
+                  hit.task_title ||
+                  hit.id ||
+                  null;
+                if (taskTitle) {
+                  resolvedPutawayTaskId = String(taskTitle);
+                  console.warn(
+                    `✅ PutAwayScreen: Resolved putaway_task via getPutawayTasks: ${resolvedPutawayTaskId}`
+                  );
+                  setSelectedTCObj((prev: any) =>
+                    prev ? { ...prev, putaway_task: resolvedPutawayTaskId } : prev
+                  );
+                  setPutawayTask(resolvedPutawayTaskId);
+                }
+              }
+            } catch (e: any) {
+              console.warn(
+                `⚠️ PutAwayScreen: getPutawayTasks fallback for putaway_task failed: ${e?.message || e}`
+              );
+            }
+          }
+        }
         
         // ✅ Get box_id/carton_id based on source type
-        let boxIdToSend: string | null = null;
-        let cartonIdToSend: string | null = null;
-        
         if (isTransferIn) {
           // ✅ Transfer In Putaway: box_id can be CTN-TI-* (new carton) or CTN-* (existing box e.g. CTN-A1-...)
           // Do NOT use TI-PUT-* / PUT-* (task ID) - backend expects carton/box ID
@@ -3892,7 +4268,8 @@ export default function PutAwayScreen() {
             selectedTCObj_carton_id: (selectedTCObj as any).carton_id,
             selectedTCObj_box_id: (selectedTCObj as any).box_id,
             selectedTCObj_tc_id: selectedTCObj.tc_id,
-            putawayTaskId: putawayTaskId,
+            putawayTaskId:
+              resolvedPutawayTaskId || resolvePutawayTaskIdFromRefs(),
             boxIdToSend_before_check: boxIdToSend,
           });
           
@@ -3960,7 +4337,14 @@ export default function PutAwayScreen() {
           }
         } else {
           // ✅ ASN Putaway: Use box_id (from sorting process) or carton_id from task lines
-          const isBoxId = selectedTC?.startsWith("BOX-") || selectedTC?.startsWith("PAW-");
+          const isPurposePutaway =
+            String((selectedTCObj as any).purpose || "").toUpperCase() === "PUTAWAY";
+          const isBackendPutawayBoxRow = !!resolvedPutawayTaskId;
+          const isBoxId =
+            selectedTC?.startsWith("BOX-") ||
+            selectedTC?.startsWith("PAW-") ||
+            isPurposePutaway ||
+            isBackendPutawayBoxRow;
           const isTaskId = selectedTC?.startsWith("PUT-");
           
           if (isBoxId) {
@@ -3976,31 +4360,45 @@ export default function PutAwayScreen() {
               const firstLine = taskLines[0];
               const cartonIdFromLine = firstLine.carton_id || firstLine.box_id;
               
-              if (cartonIdFromLine && (cartonIdFromLine.startsWith("CTN-") || cartonIdFromLine.startsWith("BOX-") || cartonIdFromLine.startsWith("PAW-"))) {
-                boxIdToSend = cartonIdFromLine;
-                cartonIdToSend = cartonIdFromLine;
-                console.warn(`✅ ASN Putaway: Found carton_id from task lines: ${cartonIdFromLine}`);
-              } else {
-                console.warn(`⚠️ ASN Putaway: carton_id from task lines is not in valid format: ${cartonIdFromLine}`);
+              if (cartonIdFromLine && String(cartonIdFromLine).trim()) {
+                const c = String(cartonIdFromLine).trim();
+                if (
+                  c.startsWith("CTN-") ||
+                  c.startsWith("BOX-") ||
+                  c.startsWith("PAW-") ||
+                  !!resolvedPutawayTaskId
+                ) {
+                  boxIdToSend = c;
+                  console.warn(`✅ ASN Putaway: Found box/carton id from task lines: ${c}`);
+                } else {
+                  console.warn(`⚠️ ASN Putaway: task line id not used (link putaway_task first): ${cartonIdFromLine}`);
+                }
               }
             }
             
             // If still no carton_id, try to get from box_id in selectedTCObj
             if (!boxIdToSend) {
               const boxIdFromObj = (selectedTCObj as any).box_id;
-              if (boxIdFromObj && (boxIdFromObj.startsWith("CTN-") || boxIdFromObj.startsWith("BOX-") || boxIdFromObj.startsWith("PAW-"))) {
-                boxIdToSend = boxIdFromObj;
-                cartonIdToSend = boxIdFromObj;
-                console.warn(`✅ ASN Putaway: Using box_id from selectedTCObj: ${boxIdFromObj}`);
+              if (boxIdFromObj && String(boxIdFromObj).trim()) {
+                const o = String(boxIdFromObj).trim();
+                if (
+                  o.startsWith("CTN-") ||
+                  o.startsWith("BOX-") ||
+                  o.startsWith("PAW-") ||
+                  !!resolvedPutawayTaskId
+                ) {
+                  boxIdToSend = o;
+                  console.warn(`✅ ASN Putaway: Using box_id from selectedTCObj: ${o}`);
+                }
               }
             }
             
             // If still no carton_id, try to fetch full task details
             // Note: This endpoint might not exist (404), so we handle it gracefully
-            if (!boxIdToSend && putawayTaskId) {
+            if (!boxIdToSend && resolvedPutawayTaskId) {
               try {
-                console.warn(`⚠️ ASN Putaway: Fetching full task details for ${putawayTaskId} to get carton_id...`);
-                const fullTask = await apiService.getPutawayTask(putawayTaskId);
+                console.warn(`⚠️ ASN Putaway: Fetching full task details for ${resolvedPutawayTaskId} to get box_id...`);
+                const fullTask = await apiService.getPutawayTask(resolvedPutawayTaskId);
                 const fullTaskData = fullTask?.data || fullTask;
                 
                 // ✅ Handle response format: { ok: true, data: { items: [...] } }
@@ -4009,29 +4407,46 @@ export default function PutAwayScreen() {
                   const firstItem = taskItems[0];
                   const cartonId = firstItem.carton_id || firstItem.box_id;
                   
-                  if (cartonId && (cartonId.startsWith("CTN-") || cartonId.startsWith("BOX-") || cartonId.startsWith("PAW-"))) {
-                    boxIdToSend = cartonId;
-                    cartonIdToSend = cartonId;
-                    console.warn(`✅ ASN Putaway: Found carton_id from full task details: ${cartonId}`);
+                  if (cartonId && String(cartonId).trim()) {
+                    const c = String(cartonId).trim();
+                    if (
+                      c.startsWith("CTN-") ||
+                      c.startsWith("BOX-") ||
+                      c.startsWith("PAW-") ||
+                      !!resolvedPutawayTaskId
+                    ) {
+                      boxIdToSend = c;
+                      console.warn(`✅ ASN Putaway: Found box/carton id from full task details: ${c}`);
+                    }
                   }
                 }
               } catch (fetchError: any) {
                 // ✅ Handle 404 gracefully - endpoint might not exist (don't log as error)
                 const errorMsg = fetchError.message || "";
                 if (errorMsg.includes("404") || errorMsg.includes("not found") || errorMsg.includes("Route")) {
-                  console.warn(`ℹ️ ASN Putaway: getPutawayTask endpoint not available (404) for ${putawayTaskId} - using other methods`);
+                  console.warn(`ℹ️ ASN Putaway: getPutawayTask endpoint not available (404) for ${resolvedPutawayTaskId} - using other methods`);
                 } else {
                   console.warn(`⚠️ ASN Putaway: Error fetching full task details: ${errorMsg}`);
                 }
               }
             }
             
-            // ✅ CRITICAL: If still no valid carton_id, throw error
-            if (!boxIdToSend || (!boxIdToSend.startsWith("CTN-") && !boxIdToSend.startsWith("BOX-") && !boxIdToSend.startsWith("PAW-"))) {
+            // ✅ CRITICAL: need a box/carton id for the task; custom ids allowed when putaway_task is known
+            if (!boxIdToSend) {
               throw new Error(
-                `Putaway requires carton ID (CTN-* format). Old format (TI-PUT-* or PUT-*) is no longer supported.\n\n` +
-                `Task ID: ${selectedTC}\n\n` +
-                `Please ensure the putaway task has a valid carton_id (CTN-*) in the task lines.`
+                `Could not resolve a box id for putaway task ${selectedTC}.\n\n` +
+                  `Ensure task lines or the backend task include box_id / carton_id matching tabPutawayTask.box_id.`
+              );
+            }
+            if (
+              !boxIdToSend.startsWith("CTN-") &&
+              !boxIdToSend.startsWith("BOX-") &&
+              !boxIdToSend.startsWith("PAW-") &&
+              !resolvedPutawayTaskId
+            ) {
+              throw new Error(
+                `Putaway task ${selectedTC} needs a linked putaway_task id (PUT-…) for custom box ids.\n\n` +
+                  `Refresh the Putaway list and select the row again.`
               );
             }
           } else {
@@ -4039,32 +4454,79 @@ export default function PutAwayScreen() {
             boxIdToSend = selectedTC;
           }
         }
+
+        // After async lookups, prefer in-function assignment; else latest ref (TASK_MISMATCH correction).
+        resolvedPutawayTaskId =
+          resolvedPutawayTaskId || resolvePutawayTaskIdFromRefs();
         
-        // ✅ Include putaway_task if available (preferred method)
-        if (putawayTaskId) {
-          requestBody.putaway_task = putawayTaskId;
-          console.warn(`📤 Using putaway_task: ${putawayTaskId}`);
+        // ✅ Transfer In: build request on mutable requestBody (carton_id path)
+        if (resolvedPutawayTaskId) {
+          requestBody.putaway_task = resolvedPutawayTaskId;
+          console.warn(`📤 Using putaway_task: ${resolvedPutawayTaskId}`);
         }
-        
-        // ✅ CRITICAL FIX: Always include box_id (backend requires it even with putaway_task)
         if (boxIdToSend) {
           requestBody.box_id = boxIdToSend;
           console.warn(`📤 Including box_id: ${boxIdToSend}`);
         }
-        
-        // ✅ Include carton_id for Transfer In (if available)
         if (cartonIdToSend && isTransferIn) {
           requestBody.carton_id = cartonIdToSend;
           console.warn(`📤 Including carton_id: ${cartonIdToSend}`);
         }
-        
-        // ✅ Don't send tc_id for Transfer In putaway
         if (isTransferIn) {
           requestBody.tc_id = null;
         }
-        
-        console.warn(`📤 Sending scan transfer carton request:`, JSON.stringify(requestBody, null, 2));
-        response = await apiService.scanTransferCarton(requestBody);
+
+        // ✅ ASN: send a minimal JSON body so nothing is mistaken for carton_id (INVALID_CARTON_FORMAT).
+        let scanBody: Record<string, any>;
+        if (isTransferIn) {
+          scanBody = requestBody;
+        } else {
+          scanBody = {
+            location_id: locationIdUpper,
+            user_id: settings.user_id || settings.user_code || undefined,
+            warehouse_id: warehouseId,
+          };
+          if (resolvedPutawayTaskId) {
+            scanBody.putaway_task = resolvedPutawayTaskId;
+          }
+          if (boxIdToSend) {
+            scanBody.box_id = String(boxIdToSend).trim();
+          }
+          const idU = String(boxIdToSend || "").toUpperCase();
+          if (!idU.startsWith("CTN-")) {
+            const asnForScan = selectedTCObj.asn_no || activeASN;
+            if (asnForScan) {
+              scanBody.asn_no = asnForScan;
+            }
+            scanBody.tc_id = null;
+            if (!resolvedPutawayTaskId) {
+              throw new Error(
+                "Putaway task id is required for this box (e.g. PUT-YYYYMMDD-####).\n\n" +
+                  "It must pair with the scanned box id so it matches the backend putaway task.\n\n" +
+                  "Open the Putaway list, pull to refresh, then select the row again."
+              );
+            }
+            console.warn(
+              `📤 ASN putaway scan: non-CTN "${boxIdToSend}" — only box_id + putaway_task + asn_no (no carton_id)`
+            );
+          } else {
+            const asnForScan = selectedTCObj.asn_no || activeASN;
+            if (asnForScan) {
+              scanBody.asn_no = asnForScan;
+            }
+          }
+          if (requestBody.item_code) {
+            scanBody.item_code = requestBody.item_code;
+          }
+        }
+
+        console.warn(
+          `📤 Sending scan transfer carton request:`,
+          JSON.stringify(scanBody, null, 2)
+        );
+        lastRequestedPutawayTaskId =
+          resolvedPutawayTaskId || resolvePutawayTaskIdFromRefs();
+        response = await apiService.scanTransferCarton(scanBody);
 
         // ✅ NEW: Handle validation-only response (not creation response)
         // The API now only validates - it does NOT create any database records
@@ -4084,7 +4546,7 @@ export default function PutAwayScreen() {
               location_id: locationIdUpper,
               zone: location?.zone || null,
               aisle: location?.aisle || null,
-              rack: location?.rack || locationIdUpper,
+              rack: (location as any)?.parent_rack || locationIdUpper,
               level: location?.level || null,
               bin: location?.bin_id || bin || "",
             },
@@ -4137,7 +4599,7 @@ export default function PutAwayScreen() {
                 location_id: respLocationId,
                 zone: location?.zone || null,
                 aisle: location?.aisle || null,
-                rack: location?.rack || respLocationId,
+                rack: (location as any)?.parent_rack || respLocationId,
                 level: location?.level || null,
                 bin: location?.bin_id || bin || "",
               },
@@ -4158,6 +4620,62 @@ export default function PutAwayScreen() {
         apiErrorMessage = apiError?.response?.data?.error?.message || 
                          apiError?.message || 
                          "Unknown error";
+
+        const correctedTask = extractCorrectPutawayTaskFromTaskMismatch(
+          String(apiErrorMessage)
+        );
+        if (correctedTask) {
+          setPutawayTask(correctedTask);
+          setSelectedTCObj((prev: any) =>
+            prev ? { ...prev, putaway_task: correctedTask } : prev
+          );
+          const pr = putawayResolveRef.current;
+          putawayResolveRef.current = {
+            ...pr,
+            putawayTask: correctedTask,
+            selectedTCObj: pr.selectedTCObj
+              ? ({ ...pr.selectedTCObj, putaway_task: correctedTask } as any)
+              : null,
+          };
+          const sid = String(selectedTC || "").trim().toUpperCase();
+          if (sid) {
+            setSealedTCs((prev) =>
+              prev.map((tc: any) => {
+                const uid = (x: string | null | undefined) =>
+                  String(x || "").trim().toUpperCase();
+                if (
+                  uid(tc.tc_id) === sid ||
+                  uid((tc as any).box_id) === sid ||
+                  uid((tc as any).transfer_carton_id) === sid
+                ) {
+                  return { ...tc, putaway_task: correctedTask };
+                }
+                return tc;
+              })
+            );
+            putawayResolveRef.current.sealedTCs =
+              putawayResolveRef.current.sealedTCs.map((tc: any) => {
+                const uid = (x: string | null | undefined) =>
+                  String(x || "").trim().toUpperCase();
+                if (
+                  uid(tc.tc_id) === sid ||
+                  uid((tc as any).box_id) === sid ||
+                  uid((tc as any).transfer_carton_id) === sid
+                ) {
+                  return { ...tc, putaway_task: correctedTask };
+                }
+                return tc;
+              });
+          }
+          Alert.alert(
+            "Putaway task corrected",
+            `The server expects ${correctedTask} for this box (the task id sent did not match the backend line for this box).\n\n` +
+              `Confirm Location will now use this task — tap Submit again to validate the location.\n\n` +
+              `If the backend list disagrees, refresh Putaway on the server and pull to refresh this list.`
+          );
+          setLoading(false);
+          return;
+        }
         
         // ✅ FIX: Mark location as NOT successfully scanned for this TC
         setLocationScannedSuccessfully(prev => {
@@ -4511,49 +5029,150 @@ export default function PutAwayScreen() {
 
       // ✅ FIX: Clear scanned location input after successful validation
       setScannedLocationInput("");
-      
-      // ✅ NEW: Only navigate to Complete if validation is ready
-      // Otherwise, stay on SCAN_LOCATION to allow user to scan location
-      if (isReadyForCompletion) {
+
+      // Derive "ready for complete" from THIS response — React state is still stale in this tick.
+      const validatedPayload = response?.validated;
+      const readyFromApi =
+        !!response &&
+        response.ok === true &&
+        !!validatedPayload?.location_id &&
+        !!response.ready_for_completion;
+      const readyFromLegacy =
+        !!response &&
+        (response.ok === true || response.success === true) &&
+        !!(response?.data?.location_id || response?.location_id);
+      const shouldGoToComplete = readyFromApi || readyFromLegacy;
+
+      const responsePutawayTaskId =
+        response?.data?.putaway_task || response?.putaway_task || null;
+      const apiMsgEarly = String(
+        response?.message || response?.data?.message || ""
+      );
+      const respondedTaskCanonical =
+        responsePutawayTaskId ||
+        extractPutawayTaskIdFromApiText(apiMsgEarly) ||
+        extractPutawayTaskIdFromApiText(
+          String(response?.message || response?.data?.message || "")
+        );
+      const normPutTask = (s: string | null | undefined) =>
+        String(s || "").replace(/\s+/g, "").toUpperCase();
+      const putawayTaskIdMismatch =
+        !!lastRequestedPutawayTaskId &&
+        !!respondedTaskCanonical &&
+        normPutTask(lastRequestedPutawayTaskId) !==
+          normPutTask(respondedTaskCanonical);
+
+      if (shouldGoToComplete && !putawayTaskIdMismatch) {
+        setIsReadyForCompletion(true);
         setWorkflowState("COMPLETE_PUTAWAY");
-      } else {
-        // Stay on SCAN_LOCATION - validation status is shown in UI
-        // User can continue scanning location
+      } else if (putawayTaskIdMismatch) {
+        setIsReadyForCompletion(false);
+        setWorkflowState("SCAN_LOCATION");
       }
-      
-      // Refresh the sealed TCs list to remove this TC (it's now assigned)
+
+      // Backend may complete PUT-…0002 while orphan PUT-…0001 stays Open — hide this PAW locally.
+      const shouldMarkLocalPutawayDone =
+        apiSuccess &&
+        !apiErrorOccurred &&
+        selectedTC &&
+        !putawayTaskIdMismatch &&
+        (shouldGoToComplete ||
+          !!responsePutawayTaskId ||
+          /assigned to all items/i.test(apiMsgEarly));
+
+      if (shouldMarkLocalPutawayDone) {
+        try {
+          await dataService.updateTransferCartonStatus(selectedTC, "Completed");
+          await dataService.updateBoxStatus(selectedTC, "Completed");
+          setCompletedTCs((prev) => new Set(prev).add(selectedTC));
+          if (responsePutawayTaskId) {
+            setSelectedTCObj((prev: any) =>
+              prev ? { ...prev, putaway_task: responsePutawayTaskId } : prev
+            );
+            setPutawayTask(responsePutawayTaskId);
+          }
+          console.warn(
+            `✅ PutAwayScreen: Marked ${selectedTC} Completed locally after successful location / task update`
+          );
+        } catch (markErr: any) {
+          console.warn(
+            `⚠️ PutAwayScreen: Local Completed patch failed: ${markErr.message}`
+          );
+        }
+      }
+
+      // Refresh list (twice if we patched local DB so SQL filters pick it up)
       await loadSealedTCs();
-      
+      if (shouldMarkLocalPutawayDone) {
+        await loadSealedTCs();
+      }
+
       if (apiSuccess && !apiErrorOccurred) {
         // ✅ NEW: Use API response message (per user requirements)
         const apiMessage = response?.message || response?.data?.message;
         const itemsCount = response?.data?.items_count || response?.items_count || 0;
-        const responsePutawayTaskId = response?.data?.putaway_task || response?.putaway_task;
-        
-        // ✅ Use API message if available, otherwise construct message
-        let successMessage = apiMessage || `Location ID "${locationIdUpper}" assigned to all items in putaway task.`;
-        
-        if (itemsCount > 0 && !apiMessage) {
-          successMessage += `\n\n${itemsCount} item(s) assigned.`;
+        const responsePutawayTaskIdForMsg =
+          response?.data?.putaway_task || response?.putaway_task;
+
+        const resetAfterPutawayDialog = async () => {
+          await loadSealedTCs();
+          setSelectedTC(null);
+          setSelectedTCObj(null);
+          setPutawayTask(null);
+          setValidatedData(null);
+          setIsReadyForCompletion(false);
+          setScannedLocationInput("");
+          setWorkflowState("PUTAWAY_LIST");
+        };
+
+        if (putawayTaskIdMismatch) {
+          Alert.alert(
+            "Verify backend task",
+            `Task ID sent in API (putaway_task):\n${lastRequestedPutawayTaskId || "—"}\n\n` +
+              `Server response task (message / payload):\n${respondedTaskCanonical}\n\n` +
+              `Box / TC: ${selectedTC}\n\n` +
+              `These do not match. Another line on the same ASN may still be Open in the backend. Open Putaway Tasks on the server, confirm which task owns this box, then sync the list on this device.\n\n` +
+              `This device did not mark the box Completed locally so you can retry after the list matches the server.`,
+            [{ text: "OK", onPress: resetAfterPutawayDialog }]
+          );
+        } else {
+          // ✅ Use API message if available, otherwise construct message
+          let successMessage =
+            `Task ID sent in API (putaway_task):\n${lastRequestedPutawayTaskId || "—"}\n\n` +
+            (apiMessage ||
+              `Location ID "${locationIdUpper}" assigned to all items in putaway task.`);
+
+          if (itemsCount > 0 && !apiMessage) {
+            successMessage += `\n\n${itemsCount} item(s) assigned.`;
+          }
+          if (responsePutawayTaskIdForMsg && !apiMessage) {
+            successMessage += `\n\nPutaway Task: ${responsePutawayTaskIdForMsg}`;
+          }
+          successMessage += `\n\nThis TC has been removed from the Putaway list.`;
+
+          const confirmedFromServer =
+            responsePutawayTaskIdForMsg ||
+            extractPutawayTaskIdFromApiText(String(apiMessage || "")) ||
+            respondedTaskCanonical ||
+            null;
+          const requestedForMsg = lastRequestedPutawayTaskId || null;
+          if (requestedForMsg || confirmedFromServer) {
+            successMessage += `\n\n— Task check —`;
+            successMessage += `\nRequested task: ${requestedForMsg || "—"}`;
+            successMessage += `\nServer response task: ${confirmedFromServer || "—"}`;
+            if (
+              requestedForMsg &&
+              confirmedFromServer &&
+              normPutTask(requestedForMsg) === normPutTask(confirmedFromServer)
+            ) {
+              successMessage += `\n(Requested and server task id match.)`;
+            }
+          }
+
+          Alert.alert("Success", successMessage, [
+            { text: "OK", onPress: resetAfterPutawayDialog },
+          ]);
         }
-        if (responsePutawayTaskId && !apiMessage) {
-          successMessage += `\n\nPutaway Task: ${responsePutawayTaskId}`;
-        }
-        successMessage += `\n\nThis TC has been removed from the Putaway list.`;
-        
-        Alert.alert(
-          "Success",
-          successMessage,
-          [
-            {
-              text: "OK",
-              onPress: () => {
-                // Navigate back or refresh list
-                setWorkflowState("PUTAWAY_LIST");
-              },
-            },
-          ]
-        );
       } else {
         // ✅ NEW: Show detailed error message from API (if available)
         // The error should have been caught and handled in the catch block above
@@ -4677,7 +5296,7 @@ export default function PutAwayScreen() {
       
       // Get items from the Transfer Carton
       // Items are in boxes that were packed into this TC via PACK_BOX_TO_TC events
-      let items: Array<{
+      let items: {
         item_code: string;
         qty: number;
         source_bin?: string;
@@ -4685,7 +5304,8 @@ export default function PutAwayScreen() {
         completed?: boolean;
         carton_id?: string;
         location_id?: string;
-      }> = [];
+        box_id?: string;
+      }[] = [];
       
       // ✅ FIX: Determine if this is a Putaway box (BOX ID = TC ID)
       // For Transfer In putaway, box ID format is TI-* or TI-PUT-* (from Box Management)
@@ -5092,8 +5712,9 @@ export default function PutAwayScreen() {
           if (!warehouseId) {
             // Try to get location from validatedData or fetch it
             let locationData: any = null;
-            if (validatedData?.location?.warehouse_id || validatedData?.location?.warehouse) {
-              locationData = validatedData.location;
+            const vLoc = validatedData?.location as Record<string, unknown> | undefined;
+            if (vLoc?.warehouse_id || vLoc?.warehouse) {
+              locationData = validatedData!.location;
             } else if (selectedLocationId) {
               // Fetch location from cache
               try {
@@ -5103,10 +5724,11 @@ export default function PutAwayScreen() {
               }
             }
             
-            warehouseId = 
-              locationData?.warehouse_id || 
-              locationData?.warehouse || 
-              settings.warehouse_id || 
+            const locRow = locationData as Record<string, unknown> | null;
+            warehouseId =
+              (locRow?.warehouse_id as string | undefined) ||
+              (locRow?.warehouse as string | undefined) ||
+              settings.warehouse_id ||
               settings.warehouse || 
               undefined;
             
@@ -5219,7 +5841,13 @@ export default function PutAwayScreen() {
           } else {
             console.warn(`⚠️ No items found for TC ${selectedTC} - sending completion without items array`);
           }
-          
+
+          normalizeAsnPutawayCompleteRequestBody(
+            requestBody,
+            isTransferIn,
+            asn || undefined
+          );
+
           const response = await apiService.completePutaway(requestBody);
           apiSuccess = true;
           apiErrorOccurred = false;
@@ -5481,6 +6109,7 @@ export default function PutAwayScreen() {
                 ]}
                 onPress={() => {
                   setPutawaySourceType("ASN");
+                  setPutawayTask(null);
                   loadSealedTCs();
                 }}
               >
@@ -5500,6 +6129,7 @@ export default function PutAwayScreen() {
                 ]}
                 onPress={() => {
                   setPutawaySourceType("TransferIn");
+                  setPutawayTask(null);
                   loadTransferInTasks(); // ✅ Use simple loader for Transfer In
                 }}
               >
@@ -5575,7 +6205,7 @@ export default function PutAwayScreen() {
                 {/* Transfer Cartons Section */}
                 {sealedTCs.length > 0 && (
                   <>
-                    <Text style={[styles.sectionTitle, { marginBottom: 12, marginTop: 0 }]}>
+                    <Text style={[styles.scanSectionTitle, { marginBottom: 12, marginTop: 0 }]}>
                       📦 Putaway boxes ({sealedTCs.length})
                     </Text>
                     <FlatList
@@ -5646,7 +6276,9 @@ export default function PutAwayScreen() {
                                 <Text style={styles.tcDetail}>ASN: {item.asn_no}</Text>
                                 <Text style={styles.tcDetail}>
                                   Store: {item.store} | Updated:{" "}
-                                  {new Date(item.updated_on).toLocaleDateString()}
+                                  {new Date(
+                                    item.updated_on ?? Date.now()
+                                  ).toLocaleDateString()}
                                 </Text>
                               </>
                             )}

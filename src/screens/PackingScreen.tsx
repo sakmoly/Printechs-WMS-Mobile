@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -19,9 +19,94 @@ import { StatusBadge } from "../components/StatusBadge";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import { dataService } from "../services/data.service";
 import { apiService } from "../services/api.service";
-import { addEvent } from "../services/event-queue.service";
+import { syncEvents } from "../services/event-queue.service";
+import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
 import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
+import { canonicalStoreForToLine } from "../utils/to-store-master";
+import { normalizeASN } from "../utils/asn";
+import {
+  storeFieldFromAllocationRow,
+  itemCodeFromAllocationRow,
+} from "../utils/allocation-row-fields";
+
+const storesMatch = (a: unknown, b: unknown): boolean =>
+  String(a || "").trim().toUpperCase() ===
+  String(b || "").trim().toUpperCase();
+
+const isPutawayBoxId = (boxId: unknown): boolean => {
+  const normalized = String(boxId || "").trim().toUpperCase();
+  return normalized.startsWith("PAW-");
+};
+
+const isPutawayPurpose = (purpose: unknown): boolean =>
+  String(purpose || "").trim().toUpperCase() === "PUTAWAY";
+
+const isPutawayBoxRow = (box: any): boolean =>
+  isPutawayBoxId(box?.box_id || box?.name) || isPutawayPurpose(box?.purpose);
+
+const cartonStockErrorMessage = (error: any): string | null => {
+  const raw = String(error?.message || JSON.stringify(error) || "");
+  if (!raw.includes("CARTON_NOT_IN_STOCK") && !raw.includes("tabCartonStock")) {
+    return null;
+  }
+
+  const cartonMatch = raw.match(/Carton\s+([^"\s]+)\s+not found/i);
+  const itemMatch = raw.match(/item\s+([^".\s}]+)/i);
+  const cartonText = cartonMatch?.[1] ? `Carton: ${cartonMatch[1]}\n` : "";
+  const itemText = itemMatch?.[1] ? `Item: ${itemMatch[1]}\n` : "";
+
+  return (
+    "Backend carton stock is not ready for this BOX yet.\n\n" +
+    cartonText +
+    itemText +
+    "\nThe app synced pending events and receive lines before packing, but the backend still cannot find this carton/item in carton stock.\n\nPlease confirm the carton was fully received/sorted on backend, then try packing again."
+  );
+};
+
+const extractCartonIds = (input: unknown): string[] => {
+  const cartonIds = new Set<string>();
+  const cartonKeys = [
+    "carton_id",
+    "source_carton_id",
+    "supplier_carton_id",
+    "ctn",
+    "carton",
+    "Carton",
+    "Supplier Carton",
+  ];
+  const arrayKeys = [
+    "items",
+    "lines",
+    "box_items",
+    "boxItems",
+    "carton_contents",
+    "contents",
+    "data",
+    "result",
+  ];
+
+  const scan = (value: unknown, depth = 0) => {
+    if (!value || depth > 6) return;
+    if (Array.isArray(value)) {
+      value.forEach((entry) => scan(entry, depth + 1));
+      return;
+    }
+    if (typeof value !== "object") return;
+
+    const row = value as Record<string, unknown>;
+    for (const key of cartonKeys) {
+      const text = String(row[key] || "").trim();
+      if (text) cartonIds.add(text.toUpperCase());
+    }
+    for (const key of arrayKeys) {
+      if (row[key] != null) scan(row[key], depth + 1);
+    }
+  };
+
+  scan(input);
+  return Array.from(cartonIds);
+};
 
 export default function PackingScreen() {
   const navigation = useNavigation();
@@ -29,14 +114,122 @@ export default function PackingScreen() {
   const { activeASN, activeSession } = useApp();
   const [selectedStore, setSelectedStore] = useState<string>("");
   const [transferCarton, setTransferCarton] = useState<string | null>(null);
+  const [transferCartonStatus, setTransferCartonStatus] = useState<string | null>(null);
   const [boxes, setBoxes] = useState<any[]>([]);
   const [packedBoxes, setPackedBoxes] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [isSealing, setIsSealing] = useState(false);
+  const [isReopening, setIsReopening] = useState(false);
   const [hasSealedTC, setHasSealedTC] = useState(false);
   const [availableStores, setAvailableStores] = useState<string[]>([]);
   const [transferOrder, setTransferOrder] = useState<string | null>(null);
+
+  /** Same action as scanning / Submit on BOX Barcode — updated every render */
+  const handleBoxScanRef = useRef<(barcode: string) => Promise<void>>(
+    async () => {}
+  );
+  /** Double-tap detector for packing from "Available Closed BOXes" without a scanner */
+  const closedBoxDoubleTapRef = useRef<{ boxId: string; t: number }>({
+    boxId: "",
+    t: 0,
+  });
+
+  const loadPackedBoxIdsForTC = async (tcId: string | null | undefined) => {
+    if (!tcId) return [];
+    const db = await getDatabase();
+    const rows = await db.getAllAsync<{ box_id: string }>(
+      `SELECT DISTINCT box_id
+       FROM event_queue
+       WHERE event_type = 'PACK_BOX_TO_TC'
+         AND tc_id = ?
+         AND box_id IS NOT NULL
+         AND box_id != ''`,
+      [tcId]
+    );
+    return rows.map((row) => row.box_id).filter(Boolean);
+  };
+
+  const packedBoxIdsFromTransferCarton = (tc: any): string[] => {
+    const result = new Set<string>();
+    const boxKeys = [
+      "box_id",
+      "source_box_id",
+      "sort_box",
+      "sort_box_id",
+      "sortBox",
+      "sortBoxId",
+      "box",
+      "Sort box (Box ID)",
+      "sort box (box id)",
+      "Sort Box",
+      "sort_box_box_id",
+    ];
+    const rowArrayKeys = [
+      "packed_boxes",
+      "packedBoxes",
+      "boxes_packed",
+      "items",
+      "lines",
+      "box_items",
+      "carton_contents",
+      "cartonContents",
+      "contents",
+      "scan_events",
+      "wms_scan_events",
+      "data",
+      "result",
+    ];
+
+    const addBoxId = (value: unknown) => {
+      const text = String(value || "").trim();
+      if (text) result.add(text);
+    };
+
+    const scan = (value: unknown, depth = 0) => {
+      if (!value || depth > 5) return;
+      if (typeof value === "string") {
+        addBoxId(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((entry) => scan(entry, depth + 1));
+        return;
+      }
+      if (typeof value !== "object") return;
+
+      const row = value as Record<string, unknown>;
+      for (const key of boxKeys) {
+        if (row[key] != null) addBoxId(row[key]);
+      }
+      for (const key of rowArrayKeys) {
+        if (row[key] != null) scan(row[key], depth + 1);
+      }
+    };
+
+    scan(tc);
+    return Array.from(result);
+  };
+
+  const loadPackedBoxIdsForTransferCarton = async (tc: any) => {
+    const fromBackend = packedBoxIdsFromTransferCarton(tc);
+    if (fromBackend.length > 0) return fromBackend;
+
+    if (tc?.tc_id) {
+      try {
+        const detail = await apiService.getTransferCarton(tc.tc_id);
+        const fromDetail = packedBoxIdsFromTransferCarton(detail);
+        if (fromDetail.length > 0) return fromDetail;
+      } catch (error: any) {
+        console.warn(
+          "⚠️ Could not load transfer carton packed boxes from backend:",
+          error?.message || error
+        );
+      }
+    }
+
+    return loadPackedBoxIdsForTC(tc?.tc_id);
+  };
 
   // Function to check and load existing Transfer Cartons
   const checkExistingTC = useCallback(async () => {
@@ -58,6 +251,7 @@ export default function PackingScreen() {
     );
 
     // First, try to fetch from backend API to ensure we have latest data
+    const latestBackendTCById = new Map<string, any>();
     try {
       const settings = await getSettings();
       if (settings.api_url && settings.demo_mode !== 1) {
@@ -91,6 +285,9 @@ export default function PackingScreen() {
         console.log(
           `📦 Extracted ${backendTCs.length} Transfer Carton(s) from backend response`
         );
+        backendTCs.forEach((tc) => {
+          if (tc?.tc_id) latestBackendTCById.set(String(tc.tc_id), tc);
+        });
 
         // Save backend Transfer Cartons to local database
         // First, check existing TCs to prevent duplicates
@@ -172,9 +369,13 @@ export default function PackingScreen() {
       activeASN,
       selectedStore
     );
+    const allTCsWithBackend = allTCsFromDB.map((tc) => ({
+      ...tc,
+      ...(latestBackendTCById.get(String(tc.tc_id)) || {}),
+    }));
 
     // Filter out completed/dispatched TCs - they should not be shown in Packing screen
-    const existingTCs = allTCsFromDB.filter(
+    const existingTCs = allTCsWithBackend.filter(
       (tc) =>
         tc.status !== "Sealed" &&
         tc.status !== "Dispatched" &&
@@ -186,7 +387,7 @@ export default function PackingScreen() {
       `📦 Found ${allTCsFromDB.length} Transfer Carton(s) in local DB (${
         existingTCs.length
       } active, ${
-        allTCsFromDB.length - existingTCs.length
+        allTCsWithBackend.length - existingTCs.length
       } completed) for ASN ${activeASN}, Store ${selectedStore}`,
       existingTCs.map((tc) => ({
         tc_id: tc.tc_id,
@@ -220,34 +421,51 @@ export default function PackingScreen() {
       (tc) =>
         tc.tc_id &&
         (tc.status === "Open" || tc.status === "Created") &&
-        tc.store === selectedStore
+        storesMatch(tc.store, selectedStore)
     );
 
     // Check for sealed or dispatched TCs from original query (for UI state, but don't use them)
     // These are filtered out from existingTCs, so we need to check allTCsFromDB
-    const sealedTC = allTCsFromDB.find(
+    const sealedTC = allTCsWithBackend.find(
       (tc) =>
         tc.tc_id &&
         (tc.status === "Sealed" || tc.status === "SEALED") &&
-        tc.store === selectedStore
+        storesMatch(tc.store, selectedStore)
     );
-    const dispatchedTC = allTCsFromDB.find(
+    const dispatchedTC = allTCsWithBackend.find(
       (tc) =>
         tc.tc_id &&
         (tc.status === "Dispatched" || tc.status === "DISPATCHED") &&
-        tc.store === selectedStore
+        storesMatch(tc.store, selectedStore)
     );
 
     if (activeTCs.length > 0 && activeTCs[0].tc_id) {
       const openTC = activeTCs[0];
       console.log(`✅ Found Open Transfer Carton: ${openTC.tc_id}`);
       setTransferCarton(openTC.tc_id);
+      setTransferCartonStatus(openTC.status || "Open");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(openTC));
       setHasSealedTC(false);
+    } else if (sealedTC?.tc_id) {
+      console.log(`ℹ️ Auto-assigning sealed Transfer Carton: ${sealedTC.tc_id}`);
+      setTransferCarton(sealedTC.tc_id);
+      setTransferCartonStatus(sealedTC.status || "Sealed");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(sealedTC));
+      setHasSealedTC(true);
+    } else if (dispatchedTC?.tc_id) {
+      console.log(
+        `ℹ️ Auto-assigning dispatched Transfer Carton: ${dispatchedTC.tc_id}`
+      );
+      setTransferCarton(dispatchedTC.tc_id);
+      setTransferCartonStatus(dispatchedTC.status || "Dispatched");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(dispatchedTC));
+      setHasSealedTC(true);
     } else {
       console.log(
         `ℹ️ No Open Transfer Carton found for store ${selectedStore}`
       );
       setTransferCarton(null);
+      setTransferCartonStatus(null);
 
       // Check if there are closed boxes that haven't been packed yet
       // Allow creating new TC if there are unpacked closed boxes, even if sealed/dispatched TC exists
@@ -256,6 +474,7 @@ export default function PackingScreen() {
 
       if (db) {
         try {
+          const settings = await getSettings();
           // Get all closed boxes for this store
           const closedBoxes = await dataService.getBoxes(
             activeASN,
@@ -324,21 +543,22 @@ export default function PackingScreen() {
           }
         } catch (error: any) {
           console.warn(`⚠️ Error checking unpacked boxes:`, error.message);
+          const settings = await getSettings();
           // On error, default to allowing creation if there are non-warehouse closed boxes
           const closedBoxes = await dataService.getBoxes(
             activeASN,
             selectedStore
           );
           const nonWarehouseBoxes = closedBoxes.filter((b) => {
-            // Skip Putaway boxes
-            if (b.box_id && b.box_id.startsWith("PAW-")) {
+            // Skip Putaway boxes - they belong in Put Away, not store packing.
+            if (isPutawayBoxRow(b)) {
               return false;
             }
             // Check if warehouse (async, but in error case we'll be conservative)
             return (
-              b.status === "Closed" ||
-              b.status === "CLOSED" ||
-              b.status === "closed"
+              (b.status === "Closed" ||
+                b.status === "CLOSED" ||
+                b.status === "closed")
             );
           });
           hasUnpackedBoxes = nonWarehouseBoxes.length > 0;
@@ -367,7 +587,6 @@ export default function PackingScreen() {
         );
       }
     }
-    setPackedBoxes([]);
   }, [activeASN, selectedStore]);
 
   useEffect(() => {
@@ -382,64 +601,11 @@ export default function PackingScreen() {
         "🔄 PackingScreen focused - refreshing Transfer Cartons and stores"
       );
       if (activeASN) {
-        // Check if there are any closed boxes before allowing access to Packing screen
-        const checkClosedBoxes = async () => {
-          try {
-            const allBoxes = await dataService.getBoxes(activeASN);
-            const closedBoxes = allBoxes.filter(
-              (b) =>
-                b.status === "Closed" ||
-                b.status === "CLOSED" ||
-                b.status === "closed"
-            );
-
-            // Filter out warehouse boxes and Putaway boxes
-            const nonWarehouseClosedBoxes: any[] = [];
-            for (const box of closedBoxes) {
-              // Skip Putaway boxes (PAW-*)
-              if (box.box_id && box.box_id.startsWith("PAW-")) {
-                continue;
-              }
-
-              // Check if box store is warehouse
-              const isWarehouse = await dataService.isWarehouse(
-                box.store || ""
-              );
-              if (!isWarehouse) {
-                nonWarehouseClosedBoxes.push(box);
-              }
-            }
-
-            if (nonWarehouseClosedBoxes.length === 0) {
-              Alert.alert(
-                "No Boxes Available",
-                "There are no closed boxes available for packing.\n\nPlease close some boxes first before accessing the Packing screen.",
-                [
-                  {
-                    text: "OK",
-                    onPress: () => {
-                      navigation.goBack();
-                    },
-                  },
-                ]
-              );
-              return;
-            }
-
-            // If there are closed boxes, proceed with normal loading
-            loadTransferOrderStores();
-            checkExistingTC();
-            loadBoxes();
-          } catch (error: any) {
-            console.error("❌ Error checking closed boxes:", error);
-            // On error, still allow access (don't block user)
-            loadTransferOrderStores();
-            checkExistingTC();
-            loadBoxes();
-          }
-        };
-
-        checkClosedBoxes();
+        // A store can have no Closed boxes because they were already packed.
+        // Do not block access; the screen still needs to show the assigned TC and packed BOXes.
+        loadTransferOrderStores();
+        checkExistingTC();
+        loadBoxes();
       }
     }, [activeASN, checkExistingTC, navigation])
   );
@@ -461,6 +627,101 @@ export default function PackingScreen() {
     console.log(
       `🔄 PackingScreen: loadBoxes called for ASN ${activeASN}, Store ${selectedStore}`
     );
+    const settings = await getSettings();
+    if (settings.api_url && settings.demo_mode !== 1) {
+      try {
+        const backendResponse = await apiService.getBoxes({
+          asn: activeASN,
+          store: selectedStore,
+          status: "Closed",
+        });
+        const backendBoxes = Array.isArray(backendResponse)
+          ? backendResponse
+          : Array.isArray(backendResponse?.data)
+            ? backendResponse.data
+            : Array.isArray(backendResponse?.data?.boxes)
+              ? backendResponse.data.boxes
+              : Array.isArray(backendResponse?.data?.items)
+                ? backendResponse.data.items
+            : Array.isArray(backendResponse?.items)
+              ? backendResponse.items
+              : Array.isArray(backendResponse?.boxes)
+                ? backendResponse.boxes
+                : [];
+
+        for (const row of backendBoxes) {
+          const boxId = String(row?.box_id || row?.name || "").trim();
+          if (!boxId) continue;
+          await dataService.saveBox({
+            box_id: boxId,
+            asn_no:
+              row?.asn_no ||
+              row?.advance_shipping_notice ||
+              row?.asn ||
+              activeASN,
+            to_no: row?.to_no || row?.transfer_order || null,
+            store: row?.store || selectedStore,
+            status: row?.status || "Open",
+            purpose: row?.purpose || "STORE",
+            updated_on:
+              row?.updated_on ||
+              row?.modified ||
+              row?.created_on ||
+              new Date().toISOString(),
+            created_by: row?.created_by || row?.owner || null,
+          });
+        }
+
+        if (backendBoxes.length > 0) {
+          console.log(
+            `✅ PackingScreen: synced ${backendBoxes.length} backend BOX row(s) for ${selectedStore}`
+          );
+        }
+
+        const apiAvailableBoxes: any[] = [];
+        for (const row of backendBoxes) {
+          const boxId = String(row?.box_id || row?.name || "").trim();
+          if (!boxId || isPutawayBoxRow(row)) continue;
+          const rowStore = String(row?.store || selectedStore).trim();
+          if (!storesMatch(rowStore, selectedStore)) continue;
+          if (await dataService.isWarehouse(rowStore)) continue;
+
+          const status = String(row?.status || "").trim().toUpperCase();
+          const hasEligibility = row?.pack_eligible !== undefined;
+          const isEligible = hasEligibility
+            ? row.pack_eligible === true
+            : status === "CLOSED" && !row?.packed_tc_id;
+
+          if (isEligible) {
+            apiAvailableBoxes.push({
+              ...row,
+              box_id: boxId,
+              store: rowStore,
+              status: row?.status || "Closed",
+            });
+          }
+        }
+
+        console.log(
+          `📦 PackingScreen: API-authoritative available closed BOXes: ${apiAvailableBoxes.length}`,
+          apiAvailableBoxes.map((box) => ({
+            box_id: box.box_id,
+            status: box.status,
+            packed_tc_id: box.packed_tc_id,
+            pack_eligible: box.pack_eligible,
+            pack_block_reason: box.pack_block_reason,
+          }))
+        );
+        setBoxes(apiAvailableBoxes);
+        return;
+      } catch (error: any) {
+        console.warn(
+          "⚠️ PackingScreen: could not refresh backend boxes:",
+          error?.message || error
+        );
+      }
+    }
+
     const boxList = await dataService.getBoxes(activeASN, selectedStore);
     console.log(
       `📦 PackingScreen: getBoxes returned ${boxList.length} total boxes for Store ${selectedStore}`
@@ -491,12 +752,10 @@ export default function PackingScreen() {
       }))
     );
 
-    // NEW WORKFLOW: Filter out warehouse boxes - they should go to Putaway screen, not Packing
-    // Also filter out Putaway boxes (PAW-*) - they should go to Putaway screen
+    // NEW WORKFLOW: Filter out warehouse/putaway boxes - they should go to Put Away, not Packing.
     const nonWarehouseBoxes: any[] = [];
     for (const box of closedBoxes) {
-      // Skip Putaway boxes (PAW-*)
-      if (box.box_id && box.box_id.startsWith("PAW-")) {
+      if (isPutawayBoxRow(box)) {
         console.log(
           `⏭️ PackingScreen: Skipping Putaway box ${box.box_id} - should go to Putaway screen`
         );
@@ -534,8 +793,10 @@ export default function PackingScreen() {
       return matches;
     });
 
+    const userFilteredBoxes = storeFilteredBoxes;
+
     console.log(
-      `📦 PackingScreen: After client-side store filter: ${storeFilteredBoxes.length} boxes match store ${selectedStore}`
+      `📦 PackingScreen: After store filter: ${userFilteredBoxes.length} boxes are available for packing`
     );
 
     // Get all Transfer Cartons for this ASN and store (excluding completed ones)
@@ -553,13 +814,38 @@ export default function PackingScreen() {
         tc.status === "DISPATCHED"
     );
 
+    const db = await getDatabase();
+    const allTcIds = allTCs.map((tc) => tc.tc_id).filter(Boolean);
+    let packedBoxIdsForStore = new Set<string>();
+    if (allTcIds.length > 0) {
+      const placeholders = allTcIds.map(() => "?").join(",");
+      const packedRows = await db.getAllAsync<{ box_id: string }>(
+        `SELECT DISTINCT box_id
+         FROM event_queue
+         WHERE event_type = 'PACK_BOX_TO_TC'
+           AND tc_id IN (${placeholders})
+           AND box_id IS NOT NULL
+           AND box_id != ''`,
+        allTcIds
+      );
+      packedBoxIdsForStore = new Set(
+        packedRows.map((row) => row.box_id).filter(Boolean)
+      );
+    }
+
+    const unpackedUserBoxes = userFilteredBoxes.filter(
+      (box) => !packedBoxIdsForStore.has(box.box_id)
+    );
+
     console.log(
       `📦 PackingScreen: Found ${completedTCs.length} completed TCs (Sealed/Dispatched) for ASN ${activeASN}, Store ${selectedStore}`
+    );
+    console.log(
+      `📦 PackingScreen: ${unpackedUserBoxes.length} unpacked boxes available after excluding ${packedBoxIdsForStore.size} packed box(es)`
     );
 
     if (completedTCs.length > 0) {
       // Get all box_ids that are already packed into sealed or dispatched TCs
-      const db = await getDatabase();
       const completedTCIds = completedTCs.map((tc) => tc.tc_id).filter(Boolean);
 
       if (completedTCIds.length > 0) {
@@ -588,12 +874,12 @@ export default function PackingScreen() {
         );
 
         // Filter out boxes that are already packed into sealed or dispatched TCs
-        const availableBoxes = storeFilteredBoxes.filter(
+        const availableBoxes = unpackedUserBoxes.filter(
           (box) => !packedBoxIds.has(box.box_id)
         );
 
         console.log(
-          `📦 Available boxes (excluding packed into sealed/dispatched TCs): ${availableBoxes.length} out of ${storeFilteredBoxes.length} store-filtered closed boxes`
+          `📦 Available boxes (excluding packed into TCs): ${availableBoxes.length} out of ${userFilteredBoxes.length} user/store-filtered closed boxes`
         );
         console.log(
           `📦 Available box IDs:`,
@@ -603,16 +889,16 @@ export default function PackingScreen() {
       } else {
         // No completed TC IDs found, show all store-filtered closed boxes
         console.log(
-          `📦 No completed TC IDs found, showing all ${storeFilteredBoxes.length} store-filtered closed boxes`
+          `📦 No completed TC IDs found, showing all ${unpackedUserBoxes.length} unpacked user/store-filtered closed boxes`
         );
-        setBoxes(storeFilteredBoxes);
+        setBoxes(unpackedUserBoxes);
       }
     } else {
       // No sealed or dispatched TCs, show all store-filtered closed boxes
       console.log(
-        `📦 No sealed/dispatched TCs found, showing all ${storeFilteredBoxes.length} store-filtered closed boxes`
+        `📦 No sealed/dispatched TCs found, showing all ${unpackedUserBoxes.length} unpacked user/store-filtered closed boxes`
       );
-      setBoxes(storeFilteredBoxes);
+      setBoxes(unpackedUserBoxes);
     }
   };
 
@@ -627,15 +913,55 @@ export default function PackingScreen() {
       return;
     }
 
-    // ✅ STRICT VALIDATION: Check for ANY existing TC for this store (except Dispatched)
-    // This prevents creating duplicate TCs for the same store
+    try {
+      const settings = await getSettings();
+      if (settings.api_url && settings.demo_mode !== 1) {
+        const backendResponse = await apiService.getTransferCartons({
+          asn: activeASN,
+          store: selectedStore,
+        });
+        let backendTCs: any[] = [];
+        if (Array.isArray(backendResponse)) {
+          backendTCs = backendResponse;
+        } else if (backendResponse && typeof backendResponse === "object") {
+          if (Array.isArray(backendResponse.data)) {
+            backendTCs = backendResponse.data;
+          } else if (Array.isArray(backendResponse.items)) {
+            backendTCs = backendResponse.items;
+          } else if (Array.isArray(backendResponse.transfer_cartons)) {
+            backendTCs = backendResponse.transfer_cartons;
+          }
+        }
+
+        for (const tc of backendTCs) {
+          if (!tc?.tc_id) continue;
+          await dataService.saveTransferCarton({
+            tc_id: tc.tc_id,
+            asn_no: tc.asn_no || tc.advance_shipping_notice || activeASN,
+            to_no: tc.to_no || tc.transfer_order || null,
+            store: tc.store || selectedStore,
+            status: tc.status === "Created" ? "Open" : tc.status || "Open",
+            updated_on: tc.updated_on || tc.updated_at || new Date().toISOString(),
+          });
+        }
+      }
+    } catch (error: any) {
+      console.warn(
+        "⚠️ Could not refresh Transfer Cartons before create:",
+        error?.message || error
+      );
+    }
+
+    // ✅ STRICT VALIDATION: one Transfer Carton per store/showroom.
     const allTCsFromDB = await dataService.getTransferCartons(
       activeASN,
       selectedStore
     );
 
     // Filter TCs for the selected store
-    const storeTCs = allTCsFromDB.filter((tc) => tc.store === selectedStore);
+    const storeTCs = allTCsFromDB.filter((tc) =>
+      storesMatch(tc.store, selectedStore)
+    );
 
     // Check for Open/Created TCs (active, can still pack items)
     const openTCs = storeTCs.filter(
@@ -659,9 +985,13 @@ export default function PackingScreen() {
     // ✅ PREVENT DUPLICATE: If there's an Open/Created TC, prevent creating a new one
     if (openTCs.length > 0) {
       const existingTC = openTCs[0];
+      setTransferCarton(existingTC.tc_id);
+      setTransferCartonStatus(existingTC.status || "Open");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(existingTC));
+      setHasSealedTC(false);
       Alert.alert(
-        "Transfer Carton Already Exists",
-        `An open Transfer Carton (${existingTC.tc_id}) already exists for ${selectedStore}.\n\nPlease use the existing Transfer Carton to pack items.\n\nYou cannot create another Transfer Carton for the same store.`,
+        "Using Existing Transfer Carton",
+        `Transfer Carton ${existingTC.tc_id} already exists for ${selectedStore}.\n\nAll BOXes for this store will be packed into this same Transfer Carton.`,
         [{ text: "OK" }]
       );
       return;
@@ -671,9 +1001,27 @@ export default function PackingScreen() {
     // Only allow new TC if all existing TCs are Dispatched
     if (sealedTCs.length > 0 && dispatchedTCs.length === 0) {
       const sealedTC = sealedTCs[0];
+      setTransferCarton(sealedTC.tc_id);
+      setTransferCartonStatus(sealedTC.status || "Sealed");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(sealedTC));
+      setHasSealedTC(true);
       Alert.alert(
-        "Transfer Carton Already Sealed",
-        `A Transfer Carton (${sealedTC.tc_id}) has already been sealed for ${selectedStore}.\n\nPlease dispatch the existing Transfer Carton before creating a new one.\n\nYou cannot create another Transfer Carton for the same store.`,
+        "Using Existing Transfer Carton",
+        `Transfer Carton ${sealedTC.tc_id} already exists for ${selectedStore} and is sealed.\n\nPlease continue to Dispatch. A new Transfer Carton is not required.`,
+        [{ text: "OK" }]
+      );
+      return;
+    }
+
+    if (dispatchedTCs.length > 0 && sealedTCs.length === 0) {
+      const dispatchedTC = dispatchedTCs[0];
+      setTransferCarton(dispatchedTC.tc_id);
+      setTransferCartonStatus(dispatchedTC.status || "Dispatched");
+      setPackedBoxes(await loadPackedBoxIdsForTransferCarton(dispatchedTC));
+      setHasSealedTC(true);
+      Alert.alert(
+        "Transfer Carton Already Dispatched",
+        `Transfer Carton ${dispatchedTC.tc_id} already exists for ${selectedStore} and has been dispatched.\n\nOnly one Transfer Carton is allowed per store.`,
         [{ text: "OK" }]
       );
       return;
@@ -692,11 +1040,10 @@ export default function PackingScreen() {
         b.status === "Closed" || b.status === "CLOSED" || b.status === "closed"
     );
 
-    // Filter out warehouse boxes and Putaway boxes - they should go to Putaway screen
+    // Filter out warehouse/putaway boxes - they should go to Put Away, not Packing.
     const nonWarehouseClosedBoxes: any[] = [];
     for (const box of closedBoxesFiltered) {
-      // Skip Putaway boxes (PAW-*)
-      if (box.box_id && box.box_id.startsWith("PAW-")) {
+      if (isPutawayBoxRow(box)) {
         continue;
       }
 
@@ -907,6 +1254,7 @@ export default function PackingScreen() {
       // Use the backend's tc_id if available, otherwise use the one we generated
       // Use the backend's tc_id if available, otherwise use the one we generated
       const finalTcId = returnedTcId || tc_id;
+      const finalStatus = "Open";
       
       if (returnedTcId && returnedTcId !== tc_id) {
         console.log(`✅ Backend returned different tc_id: ${returnedTcId} (we sent: ${tc_id})`);
@@ -950,6 +1298,7 @@ export default function PackingScreen() {
       await checkExistingTC();
 
       setTransferCarton(finalTcId); // ✅ Use finalTcId
+      setTransferCartonStatus(finalStatus);
       setPackedBoxes([]);
       Alert.alert("Success", `Transfer Carton ${finalTcId} created`);
     } catch (error: any) {
@@ -966,8 +1315,26 @@ export default function PackingScreen() {
       Alert.alert("Error", "Please create a Transfer Carton first");
       return;
     }
+    const tcStatus = String(transferCartonStatus || "").trim().toLowerCase();
+    if (tcStatus === "sealed" || tcStatus === "dispatched") {
+      Alert.alert(
+        tcStatus === "sealed"
+          ? "Transfer Carton Sealed"
+          : "Transfer Carton Dispatched",
+        `Transfer Carton ${transferCarton} is already ${transferCartonStatus}.\n\nYou cannot pack more BOXes into it. Please continue to Dispatch.`
+      );
+      return;
+    }
 
     const boxId = barcode.trim().toUpperCase();
+
+    if (isPutawayBoxId(boxId)) {
+      Alert.alert(
+        "Use Put Away",
+        `BOX ${boxId} is a Putaway box and cannot be packed into a store Transfer Carton.\n\nPlease continue this box from the Put Away screen.`
+      );
+      return;
+    }
 
     // Check if already packed
     if (packedBoxes.includes(boxId)) {
@@ -977,6 +1344,7 @@ export default function PackingScreen() {
 
     setLoading(true);
     try {
+      const settings = await getSettings();
       // Query the box directly from database to get accurate status
       // This ensures we check the actual box status, not just what's in the filtered list
       // First try with store filter
@@ -1047,7 +1415,35 @@ export default function PackingScreen() {
         return;
       }
 
+      if (isPutawayBoxRow(box)) {
+        Alert.alert(
+          "Use Put Away",
+          `BOX ${boxId} is a Putaway box and cannot be packed into a store Transfer Carton.\n\nPlease continue this box from the Put Away screen.`
+        );
+        setLoading(false);
+        return;
+      }
+
       // Check if box is closed (required for packing)
+      if ((box as any).pack_eligible === false) {
+        Alert.alert(
+          "BOX Not Available",
+          (box as any).pack_block_reason ||
+            `BOX ${boxId} is not eligible for packing.`
+        );
+        setLoading(false);
+        return;
+      }
+
+      if (String(box.status || "").trim().toLowerCase() === "packed") {
+        Alert.alert(
+          "Already Packed",
+          `BOX ${boxId} is already packed into a Transfer Carton.`
+        );
+        setLoading(false);
+        return;
+      }
+
       if (box.status !== "Closed") {
         Alert.alert(
           "Error",
@@ -1059,97 +1455,216 @@ export default function PackingScreen() {
         return;
       }
 
-      const settings = await getSettings();
+      try {
+        const syncResult = await syncEvents();
+        if (syncResult.failed > 0) {
+          console.warn(
+            `⚠️ ${syncResult.failed} event(s) failed to sync before packing BOX ${boxId}`
+          );
+        }
 
-      // Get all items in this box from scanned_items
-      const boxItems = (await dataService.getScannedItemsByBox(
-        boxId
-      )) as Array<{
-        carton_id?: string | null;
-        item_code?: string | null;
-        scanned_qty?: number | null;
-        [key: string]: any;
-      }>;
+        const syncAsn = activeASN || settings.active_asn;
+        const syncSession = activeSession || settings.active_session;
+        if (syncAsn && syncSession) {
+          await resendReceiveLinesToBackend(syncAsn, syncSession);
 
-      if (boxItems.length === 0) {
+          const db = await getDatabase();
+          const cartonRows = await db.getAllAsync<{ carton_id: string }>(
+            `SELECT DISTINCT carton_id
+             FROM scanned_items
+             WHERE UPPER(TRIM(box_id)) = UPPER(TRIM(?))
+               AND carton_id IS NOT NULL
+               AND TRIM(carton_id) != ''`,
+            [boxId]
+          );
+          const cartonIds = new Set(
+            cartonRows
+              .map((row) => String(row.carton_id || "").trim().toUpperCase())
+              .filter(Boolean)
+          );
+
+          try {
+            const backendBoxItems = await apiService.getBoxItems(boxId, {
+              asn: syncAsn,
+              store: selectedStore || undefined,
+            });
+            extractCartonIds(backendBoxItems).forEach((cartonId) =>
+              cartonIds.add(cartonId)
+            );
+          } catch (boxItemsError: any) {
+            console.warn(
+              `⚠️ Could not load backend BOX contents for ${boxId} before packing:`,
+              boxItemsError?.message || boxItemsError
+            );
+          }
+
+          for (const cartonId of cartonIds) {
+            if (!cartonId) continue;
+            try {
+              await apiService.completeCarton({
+                inbound_session: syncSession,
+                asn_no: normalizeASN(syncAsn),
+                carton_id: cartonId,
+                user_id: settings.user_id || settings.user_code || "",
+                device_id: settings.device_id || "",
+              });
+            } catch (completeError: any) {
+              const msg = String(completeError?.message || completeError || "");
+              if (
+                !msg.toLowerCase().includes("already") &&
+                !msg.toLowerCase().includes("received") &&
+                !msg.toLowerCase().includes("completed")
+              ) {
+                throw completeError;
+              }
+            }
+          }
+        } else {
+          throw new Error(
+            "No active inbound session is available to sync receive lines."
+          );
+        }
+      } catch (syncError: any) {
         Alert.alert(
-          "Warning",
-          `BOX ${boxId} has no items.\n\nThis box cannot be packed because it contains no scanned items.`
+          "Sync Required",
+          `Could not sync receiving data before packing BOX ${boxId}.\n\n${
+            syncError?.message || "Please sync and try again."
+          }`
         );
         setLoading(false);
         return;
       }
 
-      console.log(
-        `📦 Found ${boxItems.length} item(s) in box ${boxId} to pack to TC ${transferCarton}`
-      );
-
-      // ✅ PREVENT DUPLICATE: Check if this box is already packed into this TC
-      const db = await getDatabase();
-      if (db) {
-        const existingPackedBox = await db.getFirstAsync<{ box_id: string }>(
-          `SELECT box_id FROM event_queue 
-           WHERE event_type = 'PACK_BOX_TO_TC' 
-             AND tc_id = ? 
-             AND box_id = ? 
-             LIMIT 1`,
-          [transferCarton, boxId]
-        );
-
-        if (existingPackedBox) {
-          Alert.alert(
-            "Box Already Packed",
-            `BOX ${boxId} has already been packed into Transfer Carton ${transferCarton}.\n\nYou cannot pack the same box twice into the same Transfer Carton.`
-          );
-          setLoading(false);
-          return;
+      const packResponse = await apiService.packBoxIntoTransferCarton(
+        transferCarton,
+        {
+          asn_no: activeASN || "",
+          box_id: boxId,
+          store: selectedStore,
+          user_id: settings.user_id || settings.user_code || undefined,
+          device_id: settings.device_id || undefined,
         }
-      }
-
-      // Create one PACK_BOX_TO_TC event per item in the box
-      // Backend expects: carton_id, item_code, qty for each item
-      // IMPORTANT: box_id is stored as source carton to track which box the items came from
-      let eventsCreated = 0;
-      for (const item of boxItems) {
-        await addEvent({
-          event_type: "PACK_BOX_TO_TC",
-          asn_no: activeASN ?? undefined,
-          to_no: box.to_no ?? undefined,
-          inbound_session: activeSession ?? undefined,
-          carton_id: item.carton_id ?? undefined,
-          item_code: item.item_code ?? undefined,
-          qty: item.scanned_qty ?? undefined,
-          store: box.store,
-          box_id: boxId, // ✅ Source carton (box_id) - tracks which box items came from
-          tc_id: transferCarton,
-          device_id: settings.device_id ?? undefined,
-          user_id: settings.user_id ?? undefined,
-        });
-        eventsCreated++;
-      }
-
-      console.log(
-        `✅ Created ${eventsCreated} PACK_BOX_TO_TC event(s) for box ${boxId}`
       );
+      const packedQty =
+        Number(packResponse?.packed_qty ?? packResponse?.data?.packed_qty ?? 0) || 0;
+      const serverPackedBoxes =
+        packResponse?.packed_boxes || packResponse?.data?.packed_boxes;
 
-      setPackedBoxes([...packedBoxes, boxId]);
+      await dataService.updateBoxStatus(boxId, "Packed");
+      setPackedBoxes((prev) =>
+        Array.isArray(serverPackedBoxes)
+          ? Array.from(new Set([...prev, ...serverPackedBoxes]))
+          : prev.includes(boxId)
+            ? prev
+            : [...prev, boxId]
+      );
+      setBoxes((prev) => prev.filter((box) => box.box_id !== boxId));
 
       // Refresh the boxes list to update UI
       await loadBoxes();
 
       Alert.alert(
         "Success",
-        `BOX ${boxId} packed to ${transferCarton}\n\n${eventsCreated} item(s) added to Transfer Carton.`
+        `BOX ${boxId} packed to ${transferCarton}${
+          packedQty > 0 ? `\n\nPacked qty: ${packedQty}` : ""
+        }`
       );
     } catch (error: any) {
-      Alert.alert("Error", error.message || "Failed to pack BOX");
+      Alert.alert(
+        "Packing Blocked",
+        cartonStockErrorMessage(error) || error.message || "Failed to pack BOX"
+      );
     } finally {
       setLoading(false);
     }
   };
 
+  handleBoxScanRef.current = handleBoxScan;
+
+  const handleClosedBoxIdDoubleTap = useCallback((boxId: string) => {
+    if (loading || isSealing || isReopening) return;
+    const now = Date.now();
+    const WINDOW_MS = 350;
+    const prev = closedBoxDoubleTapRef.current;
+    if (prev.boxId === boxId && now - prev.t < WINDOW_MS) {
+      closedBoxDoubleTapRef.current = { boxId: "", t: 0 };
+      void handleBoxScanRef.current(boxId);
+      return;
+    }
+    closedBoxDoubleTapRef.current = { boxId, t: now };
+  }, [loading, isSealing, isReopening]);
+
+  const handleReopenTransferCarton = async () => {
+    if (!transferCarton) return;
+    if (isReopening || loading) return;
+
+    const tcStatus = String(transferCartonStatus || "").trim().toLowerCase();
+    if (tcStatus !== "sealed") {
+      Alert.alert(
+        "Cannot Reopen",
+        "Only sealed Transfer Cartons can be reopened from mobile."
+      );
+      return;
+    }
+
+    Alert.alert(
+      "Reopen Transfer Carton",
+      `Reopen ${transferCarton} so more BOXes can be packed?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Reopen",
+          onPress: async () => {
+            setIsReopening(true);
+            setLoading(true);
+            try {
+              const settings = await getSettings();
+              const response = await apiService.reopenTransferCarton({
+                tc_id: transferCarton,
+                reopened_by:
+                  settings.user_id || settings.user_code || undefined,
+                reason: "Need to add more boxes",
+              });
+              const reopenedStatus =
+                response?.data?.status || response?.status || "Open";
+
+              await dataService.updateTransferCartonStatus(
+                transferCarton,
+                reopenedStatus
+              );
+              setTransferCartonStatus(reopenedStatus);
+              setHasSealedTC(false);
+              await loadBoxes();
+
+              Alert.alert(
+                "Transfer Carton Reopened",
+                `Transfer Carton ${transferCarton} is now ${reopenedStatus}. You can pack more BOXes.`
+              );
+            } catch (error: any) {
+              Alert.alert(
+                "Reopen Failed",
+                error?.message || "Failed to reopen Transfer Carton"
+              );
+            } finally {
+              setLoading(false);
+              setIsReopening(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
   const handleSeal = async () => {
     if (!transferCarton) return;
+
+    if (packedBoxes.length === 0) {
+      Alert.alert(
+        "No BOXes Packed",
+        "Please pack at least one closed BOX into this Transfer Carton before sealing."
+      );
+      return;
+    }
 
     // Prevent multiple simultaneous seal operations
     if (isSealing || loading) {
@@ -1173,6 +1688,7 @@ export default function PackingScreen() {
               text: "OK",
               onPress: () => {
                 setTransferCarton(null);
+                setTransferCartonStatus(null);
                 setPackedBoxes([]);
                 loadBoxes();
               },
@@ -1227,6 +1743,20 @@ export default function PackingScreen() {
       }
 
       const isPutawayTC = isWarehouseTC || hasPutawayBox;
+
+      try {
+        const syncResult = await syncEvents();
+        if (syncResult.failed > 0) {
+          console.warn(
+            `⚠️ ${syncResult.failed} event(s) failed to sync before sealing TC ${transferCarton}`
+          );
+        }
+      } catch (syncError: any) {
+        console.warn(
+          "⚠️ Could not sync pending pack events before sealing:",
+          syncError?.message || syncError
+        );
+      }
 
       // Seal the Transfer Carton
       try {
@@ -1394,6 +1924,7 @@ export default function PackingScreen() {
               text: "OK",
               onPress: () => {
                 setTransferCarton(null);
+                setTransferCartonStatus(null);
                 setPackedBoxes([]);
                 loadBoxes();
               },
@@ -1409,6 +1940,7 @@ export default function PackingScreen() {
             text: "OK",
             onPress: () => {
               setTransferCarton(null);
+              setTransferCartonStatus(null);
               setPackedBoxes([]);
               loadBoxes();
             },
@@ -1512,8 +2044,20 @@ export default function PackingScreen() {
               console.log(
                 `💾 Saving ${allocations.length} TO allocations to local database...`
               );
+              let masterRows: { code: string }[] = [];
+              try {
+                masterRows = await dataService.getWarehouseStoreMasterRows();
+              } catch {
+                masterRows = [];
+              }
               for (const allocation of allocations) {
-                if (allocation.store && allocation.item_code) {
+                const rawStore = storeFieldFromAllocationRow(allocation);
+                const lineItem = itemCodeFromAllocationRow(allocation);
+                if (rawStore && lineItem) {
+                  const resolved = canonicalStoreForToLine(
+                    rawStore,
+                    masterRows
+                  );
                   await db.runAsync(
                     `INSERT OR REPLACE INTO transfer_order_cache 
                      (to_no, asn_no, store, item_code, allocated_qty) 
@@ -1521,8 +2065,8 @@ export default function PackingScreen() {
                     [
                       toNo,
                       activeASN,
-                      allocation.store || allocation.store_code,
-                      allocation.item_code,
+                      resolved.storeToPersist || rawStore,
+                      lineItem,
                       allocation.allocated_qty || allocation.qty || 0,
                     ]
                   );
@@ -1656,6 +2200,12 @@ export default function PackingScreen() {
 
   // Use stores from TO allocations, fallback to WH-MAIN if none found
   const stores = availableStores.length > 0 ? availableStores : ["WH-MAIN"];
+  const transferCartonStatusKey = String(transferCartonStatus || "")
+    .trim()
+    .toLowerCase();
+  const transferCartonSealed = transferCartonStatusKey === "sealed";
+  const transferCartonClosedForPacking =
+    transferCartonSealed || transferCartonStatusKey === "dispatched";
 
   return (
     <ScrollView style={styles.container}>
@@ -1679,6 +2229,7 @@ export default function PackingScreen() {
                 onPress={() => {
                   setSelectedStore(store);
                   setTransferCarton(null);
+                  setTransferCartonStatus(null);
                   setPackedBoxes([]);
                 }}
               >
@@ -1726,16 +2277,49 @@ export default function PackingScreen() {
             <View style={styles.tcInfo}>
               <Text style={styles.tcText}>TC: {transferCarton}</Text>
               <Text style={styles.tcText}>Store: {selectedStore}</Text>
+              {transferCartonStatus ? (
+                <Text style={styles.tcText}>Status: {transferCartonStatus}</Text>
+              ) : null}
             </View>
 
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Scan BOX to Pack</Text>
-              <BarcodeScanner
-                onScan={handleBoxScan}
-                placeholder="Scan BOX barcode"
-                title="BOX Barcode"
-              />
-            </View>
+            {transferCartonClosedForPacking ? (
+              <View style={styles.section}>
+                <Text style={styles.disabledHint}>
+                  This Transfer Carton is already {transferCartonStatus}. Use
+                  {transferCartonSealed
+                    ? boxes.length > 0
+                      ? " Reopen if you need to add the available BOXes below, or use Next to continue to Dispatch."
+                      : " Next to continue to Dispatch."
+                    : " Next to continue to Dispatch."}
+                </Text>
+                {transferCartonSealed && boxes.length > 0 ? (
+                  <TouchableOpacity
+                    style={[
+                      styles.button,
+                      styles.reopenButton,
+                      (loading || isReopening) && styles.buttonDisabled,
+                    ]}
+                    onPress={handleReopenTransferCarton}
+                    disabled={loading || isReopening}
+                  >
+                    <Text style={styles.buttonText}>
+                      {isReopening
+                        ? "Reopening..."
+                        : "Reopen Transfer Carton"}
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            ) : (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Scan BOX to Pack</Text>
+                <BarcodeScanner
+                  onScan={handleBoxScan}
+                  placeholder="Scan BOX barcode"
+                  title="BOX Barcode"
+                />
+              </View>
+            )}
 
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>Packed BOXes</Text>
@@ -1748,6 +2332,7 @@ export default function PackingScreen() {
                   renderItem={({ item }) => (
                     <View style={styles.packedItem}>
                       <Text style={styles.packedBoxId}>{item}</Text>
+                      <StatusBadge status="Packed" color="#4CAF50" />
                     </View>
                   )}
                   scrollEnabled={false}
@@ -1759,13 +2344,18 @@ export default function PackingScreen() {
               style={[
                 styles.button,
                 styles.sealButton,
-                (loading || isSealing) && styles.buttonDisabled,
+                (loading || isSealing || transferCartonClosedForPacking) &&
+                  styles.buttonDisabled,
               ]}
               onPress={handleSeal}
-              disabled={loading || isSealing}
+              disabled={loading || isSealing || transferCartonClosedForPacking}
             >
               <Text style={styles.buttonText}>
-                {loading || isSealing ? "Sealing..." : "Seal Transfer Carton"}
+                {loading || isSealing
+                  ? "Sealing..."
+                  : transferCartonClosedForPacking
+                  ? `Transfer Carton ${transferCartonStatus}`
+                  : "Seal Transfer Carton"}
               </Text>
             </TouchableOpacity>
           </>
@@ -1773,6 +2363,13 @@ export default function PackingScreen() {
 
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Available Closed BOXes</Text>
+          {boxes.length > 0 ? (
+            <Text style={styles.closedBoxesHint}>
+              {transferCartonClosedForPacking
+                ? `Reopen the ${transferCartonStatus} Transfer Carton before packing these BOXes.`
+                : "Double-tap a BOX ID to pack without scanning (after a Transfer Carton is created)."}
+            </Text>
+          ) : null}
           {boxes.length === 0 ? (
             <Text style={styles.emptyText}>No closed BOXes available</Text>
           ) : (
@@ -1781,7 +2378,21 @@ export default function PackingScreen() {
               keyExtractor={(item) => item.box_id}
               renderItem={({ item }) => (
                 <View style={styles.boxItem}>
-                  <Text style={styles.boxId}>{item.box_id}</Text>
+                  <TouchableOpacity
+                    activeOpacity={0.6}
+                    onPress={() => handleClosedBoxIdDoubleTap(item.box_id)}
+                    disabled={transferCartonClosedForPacking}
+                    hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
+                  >
+                    <Text
+                      style={[
+                        styles.boxId,
+                        transferCartonClosedForPacking && styles.boxIdDisabled,
+                      ]}
+                    >
+                      {item.box_id}
+                    </Text>
+                  </TouchableOpacity>
                   <StatusBadge status={item.status} />
                 </View>
               )}
@@ -1792,10 +2403,21 @@ export default function PackingScreen() {
 
         <TouchableOpacity
           style={styles.nextButton}
-          onPress={() => navigation.navigate("Dispatch" as never)}
+          onPress={() => {
+            Alert.alert(
+              "Packing Complete",
+              "Packing is complete for this operator. Dispatch can be handled separately from the Dispatch screen.",
+              [
+                {
+                  text: "OK",
+                  onPress: () => navigation.navigate("Home" as never),
+                },
+              ]
+            );
+          }}
         >
-          <Text style={styles.nextButtonText}>Next →</Text>
-          <Text style={styles.nextButtonSubtext}>Dispatch</Text>
+          <Text style={styles.nextButtonText}>Complete</Text>
+          <Text style={styles.nextButtonSubtext}>Dispatch separately</Text>
         </TouchableOpacity>
       </View>
     </ScrollView>
@@ -1873,6 +2495,10 @@ const styles = StyleSheet.create({
   sealButton: {
     backgroundColor: "#FF9800",
   },
+  reopenButton: {
+    backgroundColor: "#2196F3",
+    marginTop: 12,
+  },
   buttonDisabled: {
     opacity: 0.5,
   },
@@ -1882,6 +2508,9 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
   },
   packedItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
     padding: 12,
     backgroundColor: "#E8F5E9",
     borderRadius: 6,
@@ -1904,6 +2533,15 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: "#333",
+  },
+  boxIdDisabled: {
+    color: "#777",
+  },
+  closedBoxesHint: {
+    fontSize: 12,
+    color: "#666",
+    marginBottom: 12,
+    lineHeight: 18,
   },
   emptyText: {
     color: "#999",
