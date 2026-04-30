@@ -82,7 +82,6 @@ export default function CycleCountBinCountingScreen() {
   const [taskTitle, setTaskTitle] = useState<string | null>(null);
   const [cartonId, setCartonId] = useState<string | null>(null); // ✅ NEW: Carton ID will be scanned in this screen
   const [cartonIdInput, setCartonIdInput] = useState(""); // ✅ NEW: Input field for carton ID
-  const [showCartonScanner, setShowCartonScanner] = useState(false); // ✅ NEW: Scanner modal for carton ID
   const cartonIdInputRef = useRef<BarcodeInputHandle>(null); // ✅ NEW: Ref for carton ID input
   const skipCartonRestoreRef = useRef<boolean>(false); // ✅ NEW: Flag to skip carton ID restoration when user explicitly clears it
 
@@ -120,6 +119,24 @@ export default function CycleCountBinCountingScreen() {
   }, [cartonId, sessionId]);
 
   const barcodeInputRef = useRef<BarcodeInputHandle | null>(null);
+
+  const focusActiveBarcodeInput = useCallback(
+    (delayMs = 0) => {
+      const focus = () => {
+        if (!cartonId) {
+          cartonIdInputRef.current?.focus();
+        } else {
+          barcodeInputRef.current?.focus();
+        }
+      };
+      if (delayMs <= 0) {
+        focus();
+        return undefined;
+      }
+      return setTimeout(focus, delayMs);
+    },
+    [cartonId]
+  );
 
   useFocusEffect(
     useCallback(() => {
@@ -221,13 +238,7 @@ export default function CycleCountBinCountingScreen() {
       // Call the async function
       loadData();
       // ✅ NEW: Auto-focus carton ID input if not set, otherwise focus item barcode input
-      setTimeout(() => {
-        if (!cartonId) {
-          cartonIdInputRef.current?.focus();
-        } else {
-          barcodeInputRef.current?.focus();
-        }
-      }, 100);
+      focusActiveBarcodeInput(100);
 
       // Sync when screen loses focus (user navigates away)
       return () => {
@@ -256,16 +267,26 @@ export default function CycleCountBinCountingScreen() {
           }, 100); // Small delay to ensure navigation doesn't block sync
         }
       };
-    }, [sessionId, cartonId]) // ✅ FIX: Include cartonId in dependencies so it reloads when carton changes
+    }, [sessionId, cartonId, focusActiveBarcodeInput]) // ✅ FIX: Include cartonId in dependencies so it reloads when carton changes
   );
 
-  // Auto-focus on mount
+  // Auto-focus the active field on mount/state changes. When no carton is selected,
+  // keep focus on Carton ID so handheld scanner input always lands there.
   useEffect(() => {
-    const timer = setTimeout(() => {
-      barcodeInputRef.current?.focus();
-    }, 300);
-    return () => clearTimeout(timer);
-  }, []);
+    const timers = [80, 300, 700].map((delay) =>
+      focusActiveBarcodeInput(delay)
+    );
+    const focusInterval = !cartonId
+      ? setInterval(() => cartonIdInputRef.current?.focus(), 1500)
+      : undefined;
+
+    return () => {
+      timers.forEach((timer) => {
+        if (timer) clearTimeout(timer);
+      });
+      if (focusInterval) clearInterval(focusInterval);
+    };
+  }, [cartonId, focusActiveBarcodeInput]);
 
   // ✅ NEW: Load session with specific cartonId (can be passed as parameter)
   // ✅ Helper function to start task only if it's in "Draft" status
@@ -986,7 +1007,6 @@ export default function CycleCountBinCountingScreen() {
     console.log(`📦 Carton ID scanned: ${trimmedCartonId}`);
     setCartonId(trimmedCartonId);
     setCartonIdInput("");
-    setShowCartonScanner(false);
 
     // ✅ NEW: Start the task immediately after carton ID validation (before scanning items)
     // This ensures the task status is "Started/In Progress" before any items are counted
@@ -1978,39 +1998,23 @@ export default function CycleCountBinCountingScreen() {
                   onBarcodeScanned={(raw) =>
                     handleCartonIdScan(raw.trim().toUpperCase())
                   }
-                  containerStyle={{ flex: 1 }}
+                  containerStyle={styles.cartonIdInputStack}
                   inputStyle={styles.cartonIdInput}
+                  submitButtonStyle={styles.cartonIdSubmitButton}
+                  submitTextStyle={styles.cartonIdSubmitButtonText}
                 />
-                <TouchableOpacity
-                  style={styles.cartonIdScanButton}
-                  onPress={() => setShowCartonScanner(true)}
-                >
-                  <Text style={styles.cartonIdScanButtonText}>📷 Scan</Text>
-                </TouchableOpacity>
-                {cartonIdInput.trim() && (
-                  <TouchableOpacity
-                    style={styles.cartonIdSubmitButton}
-                    onPress={() => {
-                      const t =
-                        cartonIdInput.trim() ||
-                        cartonIdInputRef.current?.getLastText?.()?.trim() ||
-                        "";
-                      if (t) void handleCartonIdScan(t);
-                    }}
-                  >
-                    <Text style={styles.cartonIdSubmitButtonText}>✓</Text>
-                  </TouchableOpacity>
-                )}
               </View>
-              {/* ✅ NEW: Generate Carton ID Button */}
-              <TouchableOpacity
-                style={styles.generateCartonButton}
-                onPress={handleGenerateCartonId}
-              >
-                <Text style={styles.generateCartonButtonText}>
-                  🔧 Generate Carton ID
-                </Text>
-              </TouchableOpacity>
+              <View style={styles.cartonIdActionRow}>
+                {/* ✅ NEW: Generate Carton ID Button */}
+                <TouchableOpacity
+                  style={styles.generateCartonButton}
+                  onPress={handleGenerateCartonId}
+                >
+                  <Text style={styles.generateCartonButtonText}>
+                    🔧 Generate Carton ID
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </View>
           )}
 
@@ -2113,48 +2117,6 @@ export default function CycleCountBinCountingScreen() {
                     }, 200);
                   }}
                   title="Scan Item Barcode"
-                />
-              </View>
-            </View>
-          </Modal>
-        )}
-        {showCartonScanner && (
-          <Modal
-            visible={showCartonScanner}
-            transparent={true}
-            animationType="slide"
-            onRequestClose={() => {
-              setShowCartonScanner(false);
-              setTimeout(() => {
-                cartonIdInputRef.current?.focus();
-              }, 200);
-            }}
-          >
-            <View style={styles.modalOverlay}>
-              <View style={styles.modalContent}>
-                <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Scan Carton ID</Text>
-                  <TouchableOpacity
-                    onPress={() => {
-                      setShowCartonScanner(false);
-                      setTimeout(() => {
-                        cartonIdInputRef.current?.focus();
-                      }, 200);
-                    }}
-                    style={styles.modalCloseButton}
-                  >
-                    <Text style={styles.modalCloseButtonText}>✕</Text>
-                  </TouchableOpacity>
-                </View>
-                <BarcodeScanner
-                  onScan={(barcode) => {
-                    void handleCartonIdScan(barcode);
-                    setShowCartonScanner(false);
-                    setTimeout(() => {
-                      cartonIdInputRef.current?.focus();
-                    }, 200);
-                  }}
-                  title="Scan Carton ID"
                 />
               </View>
             </View>
@@ -2569,7 +2531,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   cartonIdCard: {
-    backgroundColor: "#FF9800",
+    backgroundColor: "#0F766E",
     marginHorizontal: 12,
     marginTop: 8,
     marginBottom: 8,
@@ -2594,53 +2556,58 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   cartonIdInputRow: {
-    flexDirection: "row",
-    gap: 8,
-    alignItems: "center",
+    alignSelf: "stretch",
+  },
+  cartonIdInputStack: {
+    alignSelf: "stretch",
+    flexDirection: "column",
+    alignItems: "stretch",
+    gap: 10,
   },
   cartonIdInput: {
-    flex: 1,
     backgroundColor: "#FFF",
     borderWidth: 2,
-    borderColor: "#FFF",
-    borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
+    borderColor: "#CCFBF1",
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    minHeight: 56,
+    fontSize: 17,
     fontWeight: "600",
   },
-  cartonIdScanButton: {
-    backgroundColor: "#2196F3",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 8,
-    justifyContent: "center",
-  },
-  cartonIdScanButtonText: {
-    color: "#FFF",
-    fontSize: 14,
-    fontWeight: "600",
+  cartonIdActionRow: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 10,
+    alignItems: "stretch",
   },
   cartonIdSubmitButton: {
-    backgroundColor: "#4CAF50",
+    alignSelf: "stretch",
+    backgroundColor: "#F97316",
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 8,
+    paddingVertical: 14,
+    borderRadius: 12,
     justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 0,
+    minHeight: 54,
   },
   cartonIdSubmitButtonText: {
     color: "#FFF",
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: "bold",
   },
   generateCartonButton: {
-    marginTop: 12,
-    backgroundColor: "rgba(255, 255, 255, 0.2)",
-    paddingVertical: 12,
+    flex: 1,
+    marginTop: 0,
+    backgroundColor: "rgba(255, 255, 255, 0.16)",
+    paddingVertical: 14,
     paddingHorizontal: 16,
-    borderRadius: 8,
+    borderRadius: 12,
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.3)",
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    justifyContent: "center",
   },
   generateCartonButtonText: {
     color: "#FFF",

@@ -30,6 +30,7 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, color }) => {
       case 'packed':
         return '#4CAF50';
       case 'dispatched':
+      case 'transferred':
         return '#4CAF50';
       case 'submitted':
         return '#2196F3';

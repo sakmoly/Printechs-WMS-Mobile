@@ -70,8 +70,6 @@ export default function PickingScanItemsScreen() {
   const [requestedItems, setRequestedItems] = useState<RequestedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
-  /** Mirrors BarcodeInput text for manual Submit enable state */
-  const [barcodeDraft, setBarcodeDraft] = useState("");
   // Camera not needed - handheld scanner inputs directly into text field
   const [binLocation, setBinLocation] = useState<string | null>(initialBinLocation || null);
   const [binInfo, setBinInfo] = useState<any>(initialBinInfo || null);
@@ -139,14 +137,45 @@ export default function PickingScanItemsScreen() {
     loadMaterialRequest();
   }, [materialRequestTitle, binLocation, cartonId]);
 
-  // Auto-focus barcode input
+  const focusBarcodeInput = useCallback(() => {
+    if (
+      !binLocation?.trim() ||
+      !cartonId?.trim() ||
+      editModal.visible ||
+      locationModal.visible
+    ) {
+      return;
+    }
+
+    barcodeInputRef.current?.focus();
+  }, [binLocation, cartonId, editModal.visible, locationModal.visible]);
+
+  const focusBarcodeInputSoon = useCallback(() => {
+    focusBarcodeInput();
+    const timers = [50, 150, 300, 600].map((delay) =>
+      setTimeout(focusBarcodeInput, delay)
+    );
+
+    return () => timers.forEach(clearTimeout);
+  }, [focusBarcodeInput]);
+
+  // Keep focus on the scanner textbox so handheld input always lands here.
   useFocusEffect(
     useCallback(() => {
-      setTimeout(() => {
-        barcodeInputRef.current?.focus();
-      }, 100);
-    }, [])
+      const clearFocusRetries = focusBarcodeInputSoon();
+      const focusInterval = setInterval(focusBarcodeInput, 1200);
+
+      return () => {
+        clearFocusRetries();
+        clearInterval(focusInterval);
+      };
+    }, [focusBarcodeInput, focusBarcodeInputSoon])
   );
+
+  useEffect(() => {
+    if (loading && !materialRequest) return;
+    return focusBarcodeInputSoon();
+  }, [loading, materialRequest, focusBarcodeInputSoon]);
 
   // Check for dirty state (offline queue)
   useEffect(() => {
@@ -487,9 +516,23 @@ export default function PickingScanItemsScreen() {
       return;
     }
 
-    const newQty = parseInt(qtyString, 10);
-    if (isNaN(newQty) || newQty < 0) {
+    if (!/^\d+$/.test(qtyString)) {
+      Alert.alert("Invalid Quantity", "Please enter a valid whole number.");
+      return;
+    }
+
+    const newQty = Number(qtyString);
+    if (Number.isNaN(newQty) || newQty < 0) {
       Alert.alert("Invalid Quantity", "Please enter a valid quantity.");
+      return;
+    }
+
+    const requestedQty = Number(editModal.item.requested_qty || 0);
+    if (newQty > requestedQty) {
+      Alert.alert(
+        "Over Quantity Not Allowed",
+        `You cannot pick more than requested.\n\nRequested: ${requestedQty}\nEntered: ${newQty}`
+      );
       return;
     }
 
@@ -1068,6 +1111,11 @@ export default function PickingScanItemsScreen() {
   const allItemsPicked = requestedItems.every(
     (item) => item.picked_qty >= item.requested_qty
   );
+  const totalRequestedQty = requestedItems.reduce(
+    (sum, item) => sum + (Number(item.requested_qty) || 0),
+    0
+  );
+  const totalRemainingQty = Math.max(totalRequestedQty - totalScanned, 0);
 
   if (loading && !materialRequest) {
     return (
@@ -1092,74 +1140,99 @@ export default function PickingScanItemsScreen() {
           </Text>
         </View>
         <View style={styles.headerInfoRow}>
-          <TouchableOpacity 
-            style={styles.binButton}
-            onPress={() => {
-              Alert.alert(
-                "Change Bin Location",
-                "Do you want to change the bin location?",
-                [
-                  { text: "Cancel", style: "cancel" },
-                  {
-                    text: "Change",
-                    onPress: () => {
-                      (navigation as any).navigate("PickingScanBin", {
-                        materialRequestTitle,
-                        sessionId,
-                      });
+          <View style={styles.locationInfoColumn}>
+            <TouchableOpacity
+              style={styles.binButton}
+              onPress={() => {
+                Alert.alert(
+                  "Change Bin Location",
+                  "Do you want to change the bin location?",
+                  [
+                    { text: "Cancel", style: "cancel" },
+                    {
+                      text: "Change",
+                      onPress: () => {
+                        (navigation as any).navigate("PickingScanBin", {
+                          materialRequestTitle,
+                          sessionId,
+                        });
+                      },
                     },
-                  },
-                ]
-              );
-            }}
-          >
-            <Text style={styles.binText}>Bin: {binLocation || "N/A"}</Text>
-            <Text style={styles.changeText}>Tap to change</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={styles.cartonBadge}
-            onPress={() => {
-              Alert.alert(
-                "Change Carton ID",
-                "Do you want to change the carton ID?",
-                [
-                  { text: "Cancel", style: "cancel" },
-                  {
-                    text: "Change",
-                    onPress: () => {
-                      (navigation as any).navigate("PickingScanCarton", {
-                        materialRequestTitle,
-                        sessionId,
-                        binLocation,
-                        binInfo,
-                      });
-                    },
-                  },
-                ]
-              );
-            }}
-          >
-            <Text style={styles.cartonText}>Carton: {cartonId || "N/A"}</Text>
-            <Text style={styles.changeTextSmall}>Tap to change</Text>
-          </TouchableOpacity>
+                  ]
+                );
+              }}
+            >
+              <Text style={styles.binText}>Bin: {binLocation || "N/A"}</Text>
+              <Text style={styles.changeText}>Tap to change</Text>
+            </TouchableOpacity>
+            <View style={styles.cartonActionRow}>
+              <TouchableOpacity
+                style={styles.cartonBadge}
+                onPress={() => {
+                  Alert.alert(
+                    "Change Carton ID",
+                    "Do you want to change the carton ID?",
+                    [
+                      { text: "Cancel", style: "cancel" },
+                      {
+                        text: "Change",
+                        onPress: () => {
+                          (navigation as any).navigate("PickingScanCarton", {
+                            materialRequestTitle,
+                            sessionId,
+                            binLocation,
+                            binInfo,
+                          });
+                        },
+                      },
+                    ]
+                  );
+                }}
+              >
+                <Text style={styles.cartonText}>Carton: {cartonId || "N/A"}</Text>
+                <Text style={styles.changeTextSmall}>Tap to change</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.completeButtonSmall,
+                  !allItemsPicked && styles.completeButtonSmallDisabled,
+                ]}
+                onPress={handleCompletePicking}
+                disabled={!allItemsPicked || loading}
+              >
+                <Text style={styles.completeButtonSmallText}>Complete</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         </View>
-        <View style={styles.headerActionsRow}>
-          {isDirty && (
+        <View style={styles.qtySummaryRow}>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Requested</Text>
+            <Text style={styles.qtySummaryValue}>{totalRequestedQty}</Text>
+          </View>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Scanned</Text>
+            <Text style={styles.qtySummaryValue}>{totalScanned}</Text>
+          </View>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Remaining</Text>
+            <Text
+              style={[
+                styles.qtySummaryValue,
+                totalRemainingQty === 0 && styles.qtySummaryDone,
+              ]}
+            >
+              {totalRemainingQty}
+            </Text>
+          </View>
+        </View>
+        {isDirty && (
+          <View style={styles.headerActionsRow}>
             <TouchableOpacity style={styles.syncButton} onPress={handleSync}>
               <Text style={styles.syncButtonText}>🔄 Sync</Text>
             </TouchableOpacity>
-          )}
-          <TouchableOpacity
-            style={[
-              styles.completeButtonSmall,
-              !allItemsPicked && styles.completeButtonSmallDisabled,
-            ]}
-            onPress={handleCompletePicking}
-            disabled={!allItemsPicked || loading}
-          >
-            <Text style={styles.completeButtonSmallText}>Complete</Text>
-          </TouchableOpacity>
-        </View>
+          </View>
+        )}
       </View>
 
       {/* Scan Item Card - Fixed at Top */}
@@ -1168,7 +1241,7 @@ export default function PickingScanItemsScreen() {
         <Text style={styles.scanCardSubtitle}>
           Scan repeatedly to increment quantity
         </Text>
-        <View style={styles.scanInputRow}>
+        <View style={styles.scanInputRow} onLayout={focusBarcodeInput}>
           <BarcodeInput
             ref={barcodeInputRef}
             autoFocus={!!binLocation && binLocation.trim() !== ""}
@@ -1178,7 +1251,6 @@ export default function PickingScanItemsScreen() {
                 ? "⚠️ Bin location required - Tap Bin above to scan"
                 : "Scan or enter barcode"
             }
-            onChangeText={setBarcodeDraft}
             onBarcodeScanned={async (raw) => {
               const cleaned = raw.trim();
               if (!cleaned) return false;
@@ -1203,25 +1275,20 @@ export default function PickingScanItemsScreen() {
               }
               return handleItemScan(cleaned);
             }}
-            containerStyle={{ flex: 1 }}
+            containerStyle={styles.scanInputStack}
             inputStyle={[
               styles.scanInput,
               (!binLocation || binLocation.trim() === "") && styles.scanInputDisabled,
             ]}
+            actionsContainerStyle={styles.scanInputActions}
+            submitButtonStyle={styles.scanSubmitButton}
+            submitTextStyle={styles.scanSubmitButtonText}
+            showSoftInputOnFocus={false}
+            showKeyboardButton
+            keyboardButtonStyle={styles.scanKeyboardButton}
+            keyboardButtonTextStyle={styles.scanKeyboardButtonText}
+            keyboardButtonLabel="Keyboard"
           />
-          <TouchableOpacity
-            style={styles.submitButton}
-            onPress={() => {
-              const b =
-                barcodeDraft.trim() ||
-                barcodeInputRef.current?.getLastText?.()?.trim() ||
-                "";
-              if (b) void handleItemScan(b);
-            }}
-            disabled={scanning || !barcodeDraft.trim()}
-          >
-            <Text style={styles.submitButtonText}>Submit</Text>
-          </TouchableOpacity>
         </View>
         {scanning && (
           <ActivityIndicator
@@ -1464,9 +1531,14 @@ const styles = StyleSheet.create({
   },
   headerInfoRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
     gap: PickingTheme.spacing.sm,
-    flexWrap: "wrap",
+  },
+  locationInfoColumn: {
+    flex: 1,
+    gap: 4,
+    paddingRight: PickingTheme.spacing.sm,
   },
   binButton: {
     flexDirection: "row",
@@ -1498,6 +1570,41 @@ const styles = StyleSheet.create({
     ...PickingTheme.typography.caption,
     fontSize: 11,
     color: PickingTheme.colors.textWhite,
+  },
+  cartonActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: PickingTheme.spacing.sm,
+  },
+  qtySummaryRow: {
+    flexDirection: "row",
+    gap: PickingTheme.spacing.sm,
+    marginTop: PickingTheme.spacing.sm,
+  },
+  qtySummaryCard: {
+    flex: 1,
+    backgroundColor: "rgba(255,255,255,0.16)",
+    borderRadius: PickingTheme.borderRadius.small,
+    paddingHorizontal: PickingTheme.spacing.sm,
+    paddingVertical: 6,
+    alignItems: "center",
+  },
+  qtySummaryLabel: {
+    ...PickingTheme.typography.caption,
+    fontSize: 9,
+    color: PickingTheme.colors.textWhite,
+    opacity: 0.78,
+    marginBottom: 2,
+  },
+  qtySummaryValue: {
+    fontSize: 18,
+    lineHeight: 22,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "800",
+  },
+  qtySummaryDone: {
+    color: "#8EF0A0",
   },
   changeTextSmall: {
     ...PickingTheme.typography.caption,
@@ -1536,7 +1643,7 @@ const styles = StyleSheet.create({
     justifyContent: "flex-end",
     alignItems: "center",
     gap: PickingTheme.spacing.sm,
-    marginTop: 4,
+    marginTop: 0,
   },
   syncButton: {
     backgroundColor: "rgba(255,255,255,0.2)",
@@ -1554,7 +1661,7 @@ const styles = StyleSheet.create({
     backgroundColor: PickingTheme.colors.statusDone,
     borderRadius: PickingTheme.borderRadius.small,
     paddingHorizontal: PickingTheme.spacing.md,
-    paddingVertical: 6,
+    paddingVertical: 8,
   },
   completeButtonSmallDisabled: {
     backgroundColor: "rgba(255,255,255,0.2)",
@@ -1568,8 +1675,9 @@ const styles = StyleSheet.create({
   },
   scanCard: {
     backgroundColor: PickingTheme.colors.buttonBlue,
-    padding: PickingTheme.spacing.md,
-    paddingVertical: PickingTheme.spacing.sm + 4,
+    paddingHorizontal: PickingTheme.spacing.md,
+    paddingTop: PickingTheme.spacing.sm,
+    paddingBottom: PickingTheme.spacing.lg,
     borderRadius: 0,
     borderBottomWidth: 2,
     borderBottomColor: "rgba(255,255,255,0.2)",
@@ -1586,18 +1694,29 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: PickingTheme.colors.textWhite,
     opacity: 0.9,
-    marginBottom: PickingTheme.spacing.sm,
+    marginBottom: 6,
   },
   scanInputRow: {
-    flexDirection: "row",
+    alignSelf: "stretch",
+  },
+  scanInputStack: {
+    alignSelf: "stretch",
+    flexDirection: "column",
+    alignItems: "stretch",
     gap: PickingTheme.spacing.sm,
   },
   scanInput: {
-    flex: 1,
+    alignSelf: "stretch",
     backgroundColor: PickingTheme.colors.backgroundWhite,
     borderRadius: PickingTheme.borderRadius.small,
     padding: PickingTheme.spacing.md,
+    minHeight: 56,
     ...PickingTheme.typography.body,
+  },
+  scanInputActions: {
+    alignSelf: "stretch",
+    flexDirection: "row",
+    marginBottom: PickingTheme.spacing.sm,
   },
   scanInputDisabled: {
     backgroundColor: PickingTheme.colors.backgroundLight,
@@ -1605,17 +1724,29 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     opacity: 0.6,
   },
-  submitButton: {
+  scanSubmitButton: {
+    flex: 1,
     backgroundColor: PickingTheme.colors.statusDone,
-    paddingHorizontal: PickingTheme.spacing.lg,
-    paddingVertical: PickingTheme.spacing.md,
+    borderColor: PickingTheme.colors.statusDone,
     borderRadius: PickingTheme.borderRadius.small,
-    justifyContent: "center",
+    minHeight: 52,
   },
-  submitButtonText: {
+  scanSubmitButtonText: {
     ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
-    fontWeight: "600",
+    fontWeight: "700",
+  },
+  scanKeyboardButton: {
+    flex: 1,
+    backgroundColor: "#F59E0B",
+    borderColor: "#F59E0B",
+    borderRadius: PickingTheme.borderRadius.small,
+    minHeight: 52,
+  },
+  scanKeyboardButtonText: {
+    ...PickingTheme.typography.body,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "700",
   },
   scanningIndicator: {
     marginTop: PickingTheme.spacing.sm,

@@ -13,6 +13,7 @@ import { useNavigation, useRoute } from "@react-navigation/native";
 import { apiService } from "../services/api.service";
 import { TransferIn } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
+import { getDatabase } from "../database/database";
 
 export default function TransferInDetailScreen() {
   const navigation = useNavigation();
@@ -64,13 +65,28 @@ export default function TransferInDetailScreen() {
 
   const handleStartReceiving = async () => {
     if (!transferIn) return;
+
+    const totalRequiredQty =
+      transferIn.total_qty ||
+      transferIn.items?.reduce((sum, i) => sum + (i.qty || 0), 0) ||
+      0;
+    const totalReceivedQty =
+      transferIn.items?.reduce((sum, i) => sum + (i.received_qty || 0), 0) ||
+      0;
+    const isReceivedButIncomplete =
+      transferIn.status === "Received" && totalReceivedQty < totalRequiredQty;
     
     // ✅ Allow receiving for: Submitted, In Transit, or Receiving (resume partial receive)
     // After backend fix, status will be "Receiving" when partial receive started
-    if (transferIn.status !== "Submitted" && transferIn.status !== "In Transit" && transferIn.status !== "Receiving") {
+    if (
+      transferIn.status !== "Submitted" &&
+      transferIn.status !== "In Transit" &&
+      transferIn.status !== "Receiving" &&
+      !isReceivedButIncomplete
+    ) {
       Alert.alert(
         "Cannot Start Receiving",
-        `Transfer In ${transferIn.title} is ${transferIn.status}. Only 'Submitted', 'In Transit', or 'Receiving' Transfer Ins can be received.`
+        `Transfer In ${transferIn.title} is ${transferIn.status}. Only 'Submitted', 'In Transit', 'Receiving', or incomplete 'Received' Transfer Ins can be received.`
       );
       return;
     }
@@ -82,6 +98,42 @@ export default function TransferInDetailScreen() {
       
       let session = await transferInReceivingSessionService.loadSession(transferIn.title);
       const settings = await getSettings();
+      const restoreCartonId = async (): Promise<string | null> => {
+        const fromItems = transferIn.items?.find((item: any) => item.carton_id)?.carton_id;
+        if (fromItems) return String(fromItems);
+
+        try {
+          const db = await getDatabase();
+          const local = await db.getFirstAsync<{ carton_id?: string; box_id?: string }>(
+            `SELECT carton_id, box_id
+             FROM scanned_items
+             WHERE asn_no = ?
+               AND (carton_id IS NOT NULL OR box_id IS NOT NULL)
+             ORDER BY scanned_on DESC
+             LIMIT 1`,
+            [transferIn.title]
+          );
+          if (local?.carton_id || local?.box_id) {
+            return local.carton_id || local.box_id || null;
+          }
+
+          const localBox = await db.getFirstAsync<{ box_id?: string }>(
+            `SELECT box_id
+             FROM box_cache
+             WHERE asn_no = ?
+               AND box_id IS NOT NULL
+               AND box_id != ''
+             ORDER BY updated_on DESC
+             LIMIT 1`,
+            [transferIn.title]
+          );
+          return localBox?.box_id || null;
+        } catch (error: any) {
+          console.warn("⚠️ Could not restore Transfer In carton from local scans:", error.message);
+          return null;
+        }
+      };
+      const restoredCartonId = session?.active_carton_id || await restoreCartonId();
       
       // Generate transaction number
       const transactionNo = `TXN-${transferIn.title}-${Date.now()}`;
@@ -93,7 +145,7 @@ export default function TransferInDetailScreen() {
           session_id: sessionId,
           transfer_in_no: transferIn.title,
           transaction_no: transactionNo,
-          active_carton_id: null,
+          active_carton_id: restoredCartonId,
           status: "Draft",
           started_by: settings.user_id || settings.user_code || "USER",
           started_at: new Date().toISOString(),
@@ -108,8 +160,8 @@ export default function TransferInDetailScreen() {
           session_id: sessionId,
           transfer_in_no: transferIn.title,
           transaction_no: transactionNo,
-          active_carton_id: null,
-          status: "Draft",
+          active_carton_id: restoredCartonId,
+          status: "In Progress",
           started_by: settings.user_id || settings.user_code || "USER",
           started_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -120,6 +172,11 @@ export default function TransferInDetailScreen() {
         // ✅ Resume existing session - update status to "In Progress" if it's "Draft"
         if (session.status === "Draft") {
           session.status = "In Progress";
+          session.updated_at = new Date().toISOString();
+          await transferInReceivingSessionService.saveSession(session);
+        }
+        if (!session.active_carton_id && restoredCartonId) {
+          session.active_carton_id = restoredCartonId;
           session.updated_at = new Date().toISOString();
           await transferInReceivingSessionService.saveSession(session);
         }
@@ -136,6 +193,7 @@ export default function TransferInDetailScreen() {
         transferInNo: transferIn.title,
         sessionId: session.session_id,
         transactionNo: session.transaction_no || transactionNo,
+        activeCartonId: session.active_carton_id || restoredCartonId || null,
       });
     } catch (error: any) {
       console.error("❌ Error starting receiving:", error);
@@ -280,6 +338,7 @@ export default function TransferInDetailScreen() {
   const totalQty = transferIn.total_qty || transferIn.items?.reduce((sum, i) => sum + (i.qty || 0), 0) || 0;
   const receivedQty = transferIn.items?.reduce((sum, i) => sum + (i.received_qty || 0), 0) || 0;
   const overallProgress = totalQty > 0 ? (receivedQty / totalQty) * 100 : 0;
+  const isReceivedButIncomplete = transferIn.status === "Received" && receivedQty < totalQty;
 
   return (
     <ScrollView style={styles.container}>
@@ -298,6 +357,20 @@ export default function TransferInDetailScreen() {
           >
             <Text style={styles.startButtonText}>Start Receiving</Text>
           </TouchableOpacity>
+        </View>
+      )}
+
+      {isReceivedButIncomplete && (
+        <View style={styles.actionSection}>
+          <TouchableOpacity
+            style={styles.warningButton}
+            onPress={handleStartReceiving}
+          >
+            <Text style={styles.startButtonText}>Continue Receiving / Repair Qty</Text>
+          </TouchableOpacity>
+          <Text style={styles.hintText}>
+            This Transfer In is marked Received, but received quantity is still incomplete. Continue receiving to sync the missing quantity before putaway.
+          </Text>
         </View>
       )}
 
@@ -397,7 +470,7 @@ export default function TransferInDetailScreen() {
         />
       </View>
 
-      {transferIn.status === "Received" && (
+      {transferIn.status === "Received" && !isReceivedButIncomplete && (
         <View style={styles.actionSection}>
           <TouchableOpacity
             style={styles.startButton}
@@ -581,6 +654,12 @@ const styles = StyleSheet.create({
   },
   startButton: {
     backgroundColor: "#2196F3",
+    padding: 16,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  warningButton: {
+    backgroundColor: "#FF9800",
     padding: 16,
     borderRadius: 8,
     alignItems: "center",

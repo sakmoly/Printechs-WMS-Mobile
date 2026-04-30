@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
@@ -15,6 +16,7 @@ import { getDatabase } from "../database/database";
 import { MaterialRequest } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
+import { formatDateOnly } from "../utils/date";
 
 // Helper function to get status sort order
 const getStatusSortOrder = (status: string | undefined): number => {
@@ -23,12 +25,31 @@ const getStatusSortOrder = (status: string | undefined): number => {
     return 1; // In Progress first
   } else if (statusLower === "submitted") {
     return 2; // Submitted second
-  } else if (statusLower === "dispatched") {
-    return 3; // Dispatched third
+  } else if (statusLower === "picked") {
+    return 3; // Picked next
+  } else if (isFinalStatus(status)) {
+    return 5; // Final statuses last
   } else {
     return 4; // All other statuses last
   }
 };
+
+const isFinalStatus = (status: string | undefined): boolean => {
+  const normalized = (status || "").trim().toLowerCase();
+  return normalized === "dispatched" || normalized === "transferred";
+};
+
+const isPickedStatus = (status: string | undefined): boolean => {
+  return (status || "").trim().toLowerCase() === "picked";
+};
+
+const normalizeMaterialRequestStatus = (status: string | undefined): string => {
+  return (status || "").trim().toLowerCase() === "dispatched"
+    ? "Transferred"
+    : status || "Draft";
+};
+
+type MaterialRequestFilter = "active" | "picked" | "final" | "all";
 
 // Calculate picked quantities from event queue
 const calculatePickedQuantities = async (mr: any): Promise<any> => {
@@ -151,6 +172,29 @@ export default function MaterialRequestListScreen() {
   );
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [statusFilter, setStatusFilter] =
+    useState<MaterialRequestFilter>("active");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  const visibleMaterialRequests = useMemo(() => {
+    const normalizedSearch = searchQuery.trim().toLowerCase();
+    const filteredBySearch = normalizedSearch
+      ? materialRequests.filter((mr) =>
+          String(mr.title || "").toLowerCase().includes(normalizedSearch)
+        )
+      : materialRequests;
+
+    if (statusFilter === "all") return filteredBySearch;
+    if (statusFilter === "picked") {
+      return filteredBySearch.filter((mr) => isPickedStatus(mr.status));
+    }
+    if (statusFilter === "final") {
+      return filteredBySearch.filter((mr) => isFinalStatus(mr.status));
+    }
+    return filteredBySearch.filter(
+      (mr) => !isFinalStatus(mr.status) && !isPickedStatus(mr.status)
+    );
+  }, [materialRequests, searchQuery, statusFilter]);
 
   // Load Material Requests from backend and cache locally
   const loadMaterialRequests = useCallback(async () => {
@@ -205,6 +249,11 @@ export default function MaterialRequestListScreen() {
       );
 
       // No date filtering - show all Material Requests
+      mrList = mrList.map((mr) => ({
+        ...mr,
+        status: normalizeMaterialRequestStatus(mr.status),
+      }));
+
       // Cache in local database
       const db = await getDatabase();
       for (const mr of mrList) {
@@ -241,7 +290,7 @@ export default function MaterialRequestListScreen() {
         })
       );
 
-      // Sort by status: In Progress -> Submitted -> Dispatched -> Others
+      // Sort by status: In Progress -> Submitted -> Picked -> final statuses -> Others
       const sortedMaterialRequests = [...mrListWithPickedQty].sort((a, b) => {
         const orderA = getStatusSortOrder(a.status);
         const orderB = getStatusSortOrder(b.status);
@@ -305,6 +354,7 @@ export default function MaterialRequestListScreen() {
         );
         const parsed = cached.map((row) => ({
           ...row,
+          status: normalizeMaterialRequestStatus(row.status),
           items: row.items_json ? JSON.parse(row.items_json) : [],
         }));
 
@@ -325,7 +375,7 @@ export default function MaterialRequestListScreen() {
             })
           );
 
-          // Sort by status: In Progress -> Submitted -> Dispatched -> Others
+          // Sort by status: In Progress -> Submitted -> Picked -> final statuses -> Others
           const sortedCachedMaterialRequests = [...parsedWithPickedQty].sort(
             (a, b) => {
               const orderA = getStatusSortOrder(a.status);
@@ -418,6 +468,41 @@ export default function MaterialRequestListScreen() {
     });
   };
 
+  const filterOptions: {
+    key: MaterialRequestFilter;
+    label: string;
+    count: number;
+  }[] = [
+    {
+      key: "active",
+      label: "Active",
+      count: materialRequests.filter(
+        (mr) => !isFinalStatus(mr.status) && !isPickedStatus(mr.status)
+      ).length,
+    },
+    {
+      key: "picked",
+      label: "Picked",
+      count: materialRequests.filter((mr) => isPickedStatus(mr.status)).length,
+    },
+    {
+      key: "final",
+      label: "Transferred",
+      count: materialRequests.filter((mr) => isFinalStatus(mr.status)).length,
+    },
+    {
+      key: "all",
+      label: "All",
+      count: materialRequests.length,
+    },
+  ];
+
+  const getFilterChipFlex = (key: MaterialRequestFilter) => {
+    if (key === "final") return 1.2;
+    if (key === "all") return 0.55;
+    return 1;
+  };
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case "Draft":
@@ -439,8 +524,21 @@ export default function MaterialRequestListScreen() {
     const totalItems = item.items?.length || 0;
     const totalRequestedQty =
       item.items?.reduce((sum, i) => sum + (i.requested_qty || 0), 0) || 0;
+    const shouldTreatAsPicked = (lineStatus?: string) => {
+      const normalized = (lineStatus || "").trim().toLowerCase();
+      return (
+        normalized === "picked" ||
+        normalized === "sealed" ||
+        isPickedStatus(item.status) ||
+        isFinalStatus(item.status)
+      );
+    };
     const totalPickedQty =
-      item.items?.reduce((sum, i) => sum + (i.picked_qty || 0), 0) || 0;
+      item.items?.reduce((sum, i) => {
+        const pickedQty = Number(i.picked_qty || 0);
+        if (pickedQty > 0) return sum + pickedQty;
+        return sum + (shouldTreatAsPicked(i.status) ? i.requested_qty || 0 : 0);
+      }, 0) || 0;
     const progress =
       totalRequestedQty > 0 ? (totalPickedQty / totalRequestedQty) * 100 : 0;
 
@@ -466,9 +564,7 @@ export default function MaterialRequestListScreen() {
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Date:</Text>
             <Text style={styles.detailValue}>
-              {item.request_date
-                ? new Date(item.request_date).toLocaleDateString()
-                : "N/A"}
+              {formatDateOnly(item.request_date)}
             </Text>
           </View>
           <View style={styles.detailRow}>
@@ -516,18 +612,64 @@ export default function MaterialRequestListScreen() {
   return (
     <View style={styles.container}>
       <ScrollView style={styles.scrollView}>
+        <View style={styles.filterContainer}>
+          <Text style={styles.filterTitle}>Filter</Text>
+          <View style={styles.filterOptions}>
+            {filterOptions.map((option) => {
+              const selected = statusFilter === option.key;
+              return (
+                <TouchableOpacity
+                  key={option.key}
+                  style={[
+                    styles.filterChip,
+                    { flex: getFilterChipFlex(option.key) },
+                    selected && styles.filterChipSelected,
+                  ]}
+                  onPress={() => setStatusFilter(option.key)}
+                >
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.75}
+                    style={[
+                      styles.filterChipText,
+                      selected && styles.filterChipTextSelected,
+                    ]}
+                  >
+                    {option.label} ({option.count})
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <TextInput
+            style={styles.searchInput}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Scan or enter Material Request No"
+            placeholderTextColor="#888"
+            autoCapitalize="characters"
+            autoCorrect={false}
+            returnKeyType="search"
+            selectTextOnFocus
+          />
+        </View>
         {loading && !refreshing ? (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#FF9800" />
             <Text style={styles.loadingText}>Loading Material Requests...</Text>
           </View>
-        ) : materialRequests.length === 0 ? (
+        ) : visibleMaterialRequests.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>No Material Requests found</Text>
             <Text style={styles.emptySubtext}>
               {loading
                 ? "Loading..."
-                : "Material Requests will appear here once they are created in the system."}
+                : statusFilter === "active"
+                  ? "No active Material Requests found. Picked and Transferred requests have their own filters."
+                  : statusFilter === "picked"
+                    ? "No Picked Material Requests found."
+                  : "No Material Requests found for the selected filter."}
             </Text>
             <TouchableOpacity
               style={styles.refreshButton}
@@ -538,7 +680,7 @@ export default function MaterialRequestListScreen() {
           </View>
         ) : (
           <FlatList
-            data={materialRequests}
+            data={visibleMaterialRequests}
             keyExtractor={(item) => item.title}
             renderItem={renderMaterialRequest}
             refreshing={refreshing}
@@ -559,6 +701,69 @@ const styles = StyleSheet.create({
   },
   scrollView: {
     flex: 1,
+  },
+  filterContainer: {
+    backgroundColor: "#FFF",
+    margin: 12,
+    marginBottom: 4,
+    padding: 10,
+    borderRadius: 8,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  searchInput: {
+    height: 42,
+    backgroundColor: "#F7F8FA",
+    borderWidth: 1,
+    borderColor: "#DADDE3",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#222",
+    marginTop: 10,
+  },
+  filterTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#333",
+    marginBottom: 8,
+  },
+  filterOptions: {
+    flexDirection: "row",
+    gap: 4,
+    flexWrap: "nowrap",
+    alignItems: "center",
+  },
+  filterChip: {
+    height: 36,
+    minWidth: 0,
+    paddingHorizontal: 2,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: "#F5F5F5",
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 1,
+  },
+  filterChipSelected: {
+    backgroundColor: "#FF9800",
+    borderColor: "#FF9800",
+  },
+  filterChipText: {
+    fontSize: 10.5,
+    fontWeight: "600",
+    color: "#555",
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  filterChipTextSelected: {
+    color: "#FFF",
   },
   loadingContainer: {
     flex: 1,

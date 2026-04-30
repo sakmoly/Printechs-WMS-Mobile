@@ -2,7 +2,7 @@
   "expo": {
     "name": "Printechs WMS Mobile",
     "slug": "printechs-wms-mobile",
-    "version": "1.2.3",
+    "version": "1.2.6",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

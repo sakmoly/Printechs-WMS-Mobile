@@ -1,14 +1,13 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
   FlatList,
   ActivityIndicator,
-  Alert,
-  Modal,
 } from "react-native";
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { apiService } from "../services/api.service";
@@ -16,28 +15,57 @@ import { getDatabase } from "../database/database";
 import { TransferIn } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 
+type TransferInFilter = "active" | "receiving" | "received" | "all";
+
+const normalizeStatus = (status: string | undefined): string =>
+  (status || "").trim().toLowerCase();
+
+const isReceivingStatus = (status: string | undefined): boolean =>
+  normalizeStatus(status) === "receiving" || normalizeStatus(status) === "in transit";
+
+const isReceivedStatus = (status: string | undefined): boolean => {
+  const normalized = normalizeStatus(status);
+  return normalized === "received" || normalized === "completed";
+};
+
 export default function TransferInListScreen() {
   const navigation = useNavigation();
   const [transferIns, setTransferIns] = useState<TransferIn[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [showFilters, setShowFilters] = useState(false);
-  const [filterStatus, setFilterStatus] = useState<string | undefined>(undefined);
-  const [filterFromShowroom, setFilterFromShowroom] = useState<string | undefined>(undefined);
-  const [filterToWarehouse, setFilterToWarehouse] = useState<string | undefined>(undefined);
+  const [statusFilter, setStatusFilter] = useState<TransferInFilter>("active");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  const visibleTransferIns = useMemo(() => {
+    const normalizedSearch = searchQuery.trim().toLowerCase();
+    const filteredBySearch = normalizedSearch
+      ? transferIns.filter((ti) =>
+          String(ti.title || "").toLowerCase().includes(normalizedSearch)
+        )
+      : transferIns;
+
+    if (statusFilter === "all") return filteredBySearch;
+    if (statusFilter === "receiving") {
+      return filteredBySearch.filter((ti) => isReceivingStatus(ti.status));
+    }
+    if (statusFilter === "received") {
+      return filteredBySearch.filter((ti) => isReceivedStatus(ti.status));
+    }
+    return filteredBySearch.filter(
+      (ti) =>
+        !isReceivingStatus(ti.status) &&
+        !isReceivedStatus(ti.status) &&
+        normalizeStatus(ti.status) !== "cancelled"
+    );
+  }, [searchQuery, statusFilter, transferIns]);
 
   // Load Transfer Ins from backend and cache locally
   const loadTransferIns = useCallback(async () => {
     console.log("🔄 TransferInListScreen: Loading Transfer Ins...");
     setLoading(true);
     try {
-      // Fetch from backend with filters
-      const filters: any = {};
-      if (filterStatus) filters.status = filterStatus;
-      if (filterFromShowroom) filters.from_showroom = filterFromShowroom;
-      if (filterToWarehouse) filters.to_warehouse = filterToWarehouse;
-      const response = await apiService.getTransferIns(filters);
+      const response = await apiService.getTransferIns();
       
       // Handle different response formats
       let transferInsList: any[] = [];
@@ -278,34 +306,92 @@ export default function TransferInListScreen() {
     );
   };
 
-  const clearFilters = () => {
-    setFilterStatus(undefined);
-    setFilterFromShowroom(undefined);
-    setFilterToWarehouse(undefined);
-    setShowFilters(false);
-  };
+  const filterOptions: {
+    key: TransferInFilter;
+    label: string;
+    count: number;
+  }[] = [
+    {
+      key: "active",
+      label: "Active",
+      count: transferIns.filter(
+        (ti) =>
+          !isReceivingStatus(ti.status) &&
+          !isReceivedStatus(ti.status) &&
+          normalizeStatus(ti.status) !== "cancelled"
+      ).length,
+    },
+    {
+      key: "receiving",
+      label: "Receiving",
+      count: transferIns.filter((ti) => isReceivingStatus(ti.status)).length,
+    },
+    {
+      key: "received",
+      label: "Received",
+      count: transferIns.filter((ti) => isReceivedStatus(ti.status)).length,
+    },
+    {
+      key: "all",
+      label: "All",
+      count: transferIns.length,
+    },
+  ];
 
-  const applyFilters = () => {
-    setShowFilters(false);
-    loadTransferIns();
+  const getFilterChipFlex = (key: TransferInFilter) => {
+    if (key === "receiving") return 1.2;
+    if (key === "all") return 0.55;
+    return 1;
   };
-
-  const hasActiveFilters = filterStatus || filterFromShowroom || filterToWarehouse;
 
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Transfer In</Text>
-        <TouchableOpacity
-          style={[styles.filterButton, hasActiveFilters && styles.filterButtonActive]}
-          onPress={() => setShowFilters(true)}
-        >
-          <Text style={styles.filterButtonText}>
-            Filters {hasActiveFilters ? "●" : ""}
-          </Text>
-        </TouchableOpacity>
       </View>
       <ScrollView style={styles.scrollView}>
+        <View style={styles.filterContainer}>
+          <Text style={styles.filterTitle}>Filter</Text>
+          <View style={styles.filterOptionsRow}>
+            {filterOptions.map((option) => {
+              const selected = statusFilter === option.key;
+              return (
+                <TouchableOpacity
+                  key={option.key}
+                  style={[
+                    styles.filterChip,
+                    { flex: getFilterChipFlex(option.key) },
+                    selected && styles.filterChipSelected,
+                  ]}
+                  onPress={() => setStatusFilter(option.key)}
+                >
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.75}
+                    style={[
+                      styles.filterChipText,
+                      selected && styles.filterChipTextSelected,
+                    ]}
+                  >
+                    {option.label} ({option.count})
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <TextInput
+            style={styles.searchInput}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Scan or enter Transfer In No"
+            placeholderTextColor="#888"
+            autoCapitalize="characters"
+            autoCorrect={false}
+            returnKeyType="search"
+            selectTextOnFocus
+          />
+        </View>
         {loading && !refreshing ? (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#007AFF" />
@@ -318,39 +404,7 @@ export default function TransferInListScreen() {
                 <Text style={styles.errorText}>{errorMessage}</Text>
               </View>
             )}
-            {hasActiveFilters && (
-              <View style={styles.activeFiltersContainer}>
-                <Text style={styles.activeFiltersText}>Active Filters:</Text>
-                {filterStatus && (
-                  <View style={styles.filterTag}>
-                    <Text style={styles.filterTagText}>Status: {filterStatus}</Text>
-                    <TouchableOpacity onPress={() => setFilterStatus(undefined)}>
-                      <Text style={styles.filterTagClose}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-                {filterFromShowroom && (
-                  <View style={styles.filterTag}>
-                    <Text style={styles.filterTagText}>From: {filterFromShowroom}</Text>
-                    <TouchableOpacity onPress={() => setFilterFromShowroom(undefined)}>
-                      <Text style={styles.filterTagClose}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-                {filterToWarehouse && (
-                  <View style={styles.filterTag}>
-                    <Text style={styles.filterTagText}>To: {filterToWarehouse}</Text>
-                    <TouchableOpacity onPress={() => setFilterToWarehouse(undefined)}>
-                      <Text style={styles.filterTagClose}>×</Text>
-                    </TouchableOpacity>
-                  </View>
-                )}
-                <TouchableOpacity onPress={clearFilters} style={styles.clearFiltersButton}>
-                  <Text style={styles.clearFiltersText}>Clear All</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-            {transferIns.length === 0 ? (
+            {visibleTransferIns.length === 0 ? (
               <View style={styles.emptyContainer}>
                 <Text style={styles.emptyText}>No Transfer Ins found</Text>
                 <TouchableOpacity
@@ -362,7 +416,7 @@ export default function TransferInListScreen() {
               </View>
             ) : (
           <FlatList
-            data={transferIns}
+            data={visibleTransferIns}
             keyExtractor={(item) => item.title}
             renderItem={renderTransferIn}
             refreshing={refreshing}
@@ -373,64 +427,6 @@ export default function TransferInListScreen() {
           </>
         )}
       </ScrollView>
-
-      <Modal
-        visible={showFilters}
-        transparent={true}
-        animationType="slide"
-        onRequestClose={() => setShowFilters(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Filters</Text>
-              <TouchableOpacity onPress={() => setShowFilters(false)}>
-                <Text style={styles.modalClose}>✕</Text>
-              </TouchableOpacity>
-            </View>
-            <ScrollView style={styles.modalBody}>
-              <View style={styles.filterSection}>
-                <Text style={styles.filterLabel}>Status</Text>
-                <View style={styles.filterOptions}>
-                  {["Draft", "Submitted", "In Transit", "Received", "Completed", "Cancelled"].map((status) => (
-                    <TouchableOpacity
-                      key={status}
-                      style={[
-                        styles.filterOption,
-                        filterStatus === status && styles.filterOptionActive,
-                      ]}
-                      onPress={() => setFilterStatus(filterStatus === status ? undefined : status)}
-                    >
-                      <Text
-                        style={[
-                          styles.filterOptionText,
-                          filterStatus === status && styles.filterOptionTextActive,
-                        ]}
-                      >
-                        {status}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              </View>
-            </ScrollView>
-            <View style={styles.modalFooter}>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonSecondary]}
-                onPress={clearFilters}
-              >
-                <Text style={styles.modalButtonTextSecondary}>Clear</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalButton, styles.modalButtonPrimary]}
-                onPress={applyFilters}
-              >
-                <Text style={styles.modalButtonTextPrimary}>Apply</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
@@ -442,6 +438,69 @@ const styles = StyleSheet.create({
   },
   scrollView: {
     flex: 1,
+  },
+  filterContainer: {
+    backgroundColor: "#FFF",
+    margin: 12,
+    marginBottom: 4,
+    padding: 10,
+    borderRadius: 8,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  filterTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#333",
+    marginBottom: 8,
+  },
+  filterOptionsRow: {
+    flexDirection: "row",
+    gap: 4,
+    flexWrap: "nowrap",
+    alignItems: "center",
+  },
+  filterChip: {
+    height: 36,
+    minWidth: 0,
+    paddingHorizontal: 2,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: "#F5F5F5",
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 1,
+  },
+  filterChipSelected: {
+    backgroundColor: "#2196F3",
+    borderColor: "#2196F3",
+  },
+  filterChipText: {
+    fontSize: 10.5,
+    fontWeight: "600",
+    color: "#555",
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  filterChipTextSelected: {
+    color: "#FFF",
+  },
+  searchInput: {
+    height: 42,
+    backgroundColor: "#F7F8FA",
+    borderWidth: 1,
+    borderColor: "#DADDE3",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#222",
+    marginTop: 10,
   },
   loadingContainer: {
     flex: 1,

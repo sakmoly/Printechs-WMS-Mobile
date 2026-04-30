@@ -383,11 +383,49 @@ export const syncEvents = async (): Promise<{
   isSyncing = true;
 
   try {
-    // Normalize events: ensure qty is a number (SQLite may return it as string)
-    const normalizedEvents = unsynced.map((event) => ({
-      ...event,
-      qty: event.qty != null ? Number(event.qty) : undefined,
-    }));
+    const settings = await getSettings();
+
+    // Normalize and repair events before sending. Some customer devices can have
+    // old queued rows created before login/device settings were restored.
+    const normalizedEvents = await Promise.all(
+      unsynced.map(async (event) => {
+        const repaired = {
+          ...event,
+          offline_uuid: event.offline_uuid || generateUUID(),
+          event_time: event.event_time || new Date().toISOString(),
+          device_id: event.device_id || settings.device_id || "UNKNOWN_DEVICE",
+          user_id: event.user_id || settings.user_id || settings.user_code || "USER",
+          qty: event.qty != null ? Number(event.qty) : undefined,
+        };
+
+        if (
+          repaired.offline_uuid !== event.offline_uuid ||
+          repaired.event_time !== event.event_time ||
+          repaired.device_id !== event.device_id ||
+          repaired.user_id !== event.user_id
+        ) {
+          await getDatabase().then((db) =>
+            db.runAsync(
+              `UPDATE event_queue
+               SET offline_uuid = ?,
+                   event_time = ?,
+                   device_id = ?,
+                   user_id = ?
+               WHERE offline_uuid = ?`,
+              [
+                repaired.offline_uuid,
+                repaired.event_time,
+                repaired.device_id,
+                repaired.user_id,
+                event.offline_uuid,
+              ]
+            )
+          );
+        }
+
+        return repaired;
+      })
+    );
 
     // ✅ FIX: Deduplicate PUTAWAY_TO_RACK events before sending
     // Group by event_type + tc_id + rack to identify duplicates

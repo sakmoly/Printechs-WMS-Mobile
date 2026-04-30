@@ -30,6 +30,8 @@ export type BarcodeInputProps = {
   autoFocus?: boolean;
   /** Idle debounce when scanner does not send Enter (default 220ms). */
   debounceMs?: number;
+  /** Do not auto-submit scanner input shorter than this length. Useful for devices that send Enter too early. */
+  minBarcodeLength?: number;
   /**
    * Called after trim. Return `false` to keep the field text (validation failed).
    * Return `true` or `undefined` to clear and refocus after success.
@@ -44,6 +46,16 @@ export type BarcodeInputProps = {
   /** Layout */
   containerStyle?: object;
   inputStyle?: object;
+  actionsContainerStyle?: object;
+  submitButtonStyle?: object;
+  submitTextStyle?: object;
+  /** Keep false for handheld-scanner flows where focus should not open soft keyboard. */
+  showSoftInputOnFocus?: boolean;
+  /** Optional manual keyboard button for scanner-first flows. */
+  showKeyboardButton?: boolean;
+  keyboardButtonStyle?: object;
+  keyboardButtonTextStyle?: object;
+  keyboardButtonLabel?: string;
   /** Label for the manual submit control (default "Submit"). */
   submitLabel?: string;
 };
@@ -83,12 +95,21 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       placeholder = "Scan or enter barcode",
       autoFocus = false,
       debounceMs = DEFAULT_DEBOUNCE_MS,
+      minBarcodeLength = 1,
       onBarcodeScanned,
       onError,
       disabled = false,
       onChangeText,
       containerStyle,
       inputStyle,
+      actionsContainerStyle,
+      submitButtonStyle,
+      submitTextStyle,
+      showSoftInputOnFocus = true,
+      showKeyboardButton = false,
+      keyboardButtonStyle,
+      keyboardButtonTextStyle,
+      keyboardButtonLabel = "Keyboard",
       submitLabel = "Submit",
     },
     ref
@@ -97,6 +118,9 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
     const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const latestTextRef = useRef("");
     const [internalText, setInternalText] = useState("");
+    const [softKeyboardEnabled, setSoftKeyboardEnabled] = useState(
+      showSoftInputOnFocus
+    );
     const isControlled = controlledValue !== undefined;
     const text = isControlled ? controlledValue : internalText;
 
@@ -112,6 +136,7 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
      */
     const commitLockRef = useRef(false);
     const pendingBarcodeRef = useRef<string | null>(null);
+    const manualKeyboardRequestRef = useRef(false);
     /** Payload currently being processed (guards duplicate \n path + onSubmitEditing). */
     const inFlightPayloadRef = useRef<string | null>(null);
     const lastClosedPayloadRef = useRef<{ payload: string; at: number }>({
@@ -209,6 +234,15 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       ReturnType<typeof setTimeout> | null
     >;
 
+    useEffect(() => {
+      if (showSoftInputOnFocus) {
+        setSoftKeyboardEnabled(true);
+        return;
+      }
+
+      setSoftKeyboardEnabled(false);
+    }, [showSoftInputOnFocus]);
+
     const handleChangeText = useCallback(
       (next: string) => {
         // Must mirror native text immediately — onSubmitEditing/onKeyPress often run before the next render,
@@ -227,6 +261,20 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
           return;
         }
 
+        if (/[\r\n\t]/.test(next) && cleanedNext.length > 0 && cleanedNext.length < minBarcodeLength) {
+          setText(cleanedNext);
+          clearScannerTimer(timerRefMutable);
+          timerRefMutable.current = setTimeout(() => {
+            timerRefMutable.current = null;
+            const latest = latestTextRef.current.replace(/[\r\n\t\u0000]+/g, "").trim();
+            if (latest.length >= minBarcodeLength) {
+              setText("");
+              void processBarcode(latest);
+            }
+          }, debounceMs);
+          return;
+        }
+
         onScannerTextChange(
           next,
           setText,
@@ -237,7 +285,7 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
           { delayMs: debounceMs, autoIdleSubmit: true }
         );
       },
-      [debounceMs, processBarcode, setText, flushInputClear]
+      [debounceMs, minBarcodeLength, processBarcode, setText, flushInputClear]
     );
 
     useLayoutEffect(() => {
@@ -257,11 +305,23 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       (e: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
         const key = e.nativeEvent.key;
         if (key === "Enter" || key === "\n" || key === "\r") {
+          const latest = latestTextRef.current.replace(/[\r\n\t\u0000]+/g, "").trim();
+          if (latest.length > 0 && latest.length < minBarcodeLength) {
+            clearScannerTimer(timerRefMutable);
+            timerRefMutable.current = setTimeout(() => {
+              timerRefMutable.current = null;
+              const delayedLatest = latestTextRef.current.replace(/[\r\n\t\u0000]+/g, "").trim();
+              if (delayedLatest.length >= minBarcodeLength) {
+                void processBarcode(delayedLatest);
+              }
+            }, debounceMs);
+            return;
+          }
           clearScannerTimer(timerRefMutable);
           void processBarcode(latestTextRef.current);
         }
       },
-      [processBarcode]
+      [debounceMs, minBarcodeLength, processBarcode]
     );
 
     const handleManualSubmit = useCallback(() => {
@@ -269,6 +329,31 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       clearScannerTimer(timerRefMutable);
       void processBarcode(latestTextRef.current);
     }, [disabled, processBarcode]);
+
+    const handleEnableKeyboard = useCallback(() => {
+      if (disabled) return;
+      manualKeyboardRequestRef.current = true;
+      setSoftKeyboardEnabled(true);
+      inputRef.current?.blur();
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }, [disabled]);
+
+    const handleInputFocus = useCallback(() => {
+      if (showSoftInputOnFocus || manualKeyboardRequestRef.current) return;
+      setSoftKeyboardEnabled(false);
+    }, [showSoftInputOnFocus]);
+
+    const handleInputPressIn = useCallback(() => {
+      if (showSoftInputOnFocus || manualKeyboardRequestRef.current) return;
+      setSoftKeyboardEnabled(false);
+    }, [showSoftInputOnFocus]);
+
+    const handleInputBlur = useCallback(() => {
+      manualKeyboardRequestRef.current = false;
+      if (!showSoftInputOnFocus) {
+        setSoftKeyboardEnabled(false);
+      }
+    }, [showSoftInputOnFocus]);
 
     useEffect(() => {
       return () => clearScannerTimer(timerRefMutable);
@@ -290,8 +375,11 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
           autoCorrect={false}
           blurOnSubmit={false}
           returnKeyType="done"
-          showSoftInputOnFocus
+          showSoftInputOnFocus={softKeyboardEnabled}
           keyboardType="default"
+          onFocus={handleInputFocus}
+          onPressIn={handleInputPressIn}
+          onBlur={handleInputBlur}
           onSubmitEditing={onSubmitEditing}
           onKeyPress={onKeyPress}
           {...(Platform.OS === "ios" ||
@@ -301,15 +389,32 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
             : {})}
         />
 
-        {/* Manual submit if wedge idle-debounce did not fire or Enter was not sent */}
-        <TouchableOpacity
-          style={[styles.iconBtn, styles.submitBtn]}
-          onPress={handleManualSubmit}
-          accessibilityLabel="Submit barcode"
-          disabled={disabled}
-        >
-          <Text style={styles.submitBtnText}>{submitLabel}</Text>
-        </TouchableOpacity>
+        <View style={[styles.actions, actionsContainerStyle]}>
+          {showKeyboardButton ? (
+            <TouchableOpacity
+              style={[styles.iconBtn, styles.keyboardBtn, keyboardButtonStyle]}
+              onPress={handleEnableKeyboard}
+              accessibilityLabel="Enable manual keyboard"
+              disabled={disabled}
+            >
+              <Text style={[styles.keyboardBtnText, keyboardButtonTextStyle]}>
+                {keyboardButtonLabel}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
+
+          {/* Manual submit if wedge idle-debounce did not fire or Enter was not sent */}
+          <TouchableOpacity
+            style={[styles.iconBtn, styles.submitBtn, submitButtonStyle]}
+            onPress={handleManualSubmit}
+            accessibilityLabel="Submit barcode"
+            disabled={disabled}
+          >
+            <Text style={[styles.submitBtnText, submitTextStyle]}>
+              {submitLabel}
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
     );
   }
@@ -317,6 +422,11 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
 
 const styles = StyleSheet.create({
   row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  actions: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
@@ -352,5 +462,17 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: "#333",
+  },
+  keyboardBtn: {
+    minWidth: 84,
+    paddingHorizontal: 10,
+    flexShrink: 0,
+    backgroundColor: "#E3F2FD",
+    borderColor: "#BBDEFB",
+  },
+  keyboardBtnText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#1976D2",
   },
 });

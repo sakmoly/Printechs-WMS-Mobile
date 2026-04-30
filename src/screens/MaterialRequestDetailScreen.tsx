@@ -23,6 +23,7 @@ import { getDatabase } from "../database/database";
 import { dataService } from "../services/data.service";
 import { getSettings } from "../services/settings.service";
 import { pickingSessionService, PickingSession } from "../services/picking-session.service";
+import { formatDateOnly } from "../utils/date";
 
 export default function MaterialRequestDetailScreen() {
   const navigation = useNavigation();
@@ -95,16 +96,6 @@ export default function MaterialRequestDetailScreen() {
       return () => clearInterval(interval);
     }
   }, [materialRequest?.status, materialRequestTitle, materialRequest]);
-
-  // Check for Transfer Carton when status changes to "Picked"
-  useEffect(() => {
-    if (materialRequest?.status === "Picked" && materialRequestTitle) {
-      console.log(`🔍 Status is "Picked" - checking for Transfer Carton...`);
-      checkExistingTC().then(() => {
-        console.log(`✅ checkExistingTC completed. hasTransferCarton: ${hasTransferCarton}, transferCarton: ${transferCarton}`);
-      });
-    }
-  }, [materialRequest?.status, materialRequestTitle]);
 
   // Helper function to clear Material Request cache and related data
   const clearMaterialRequestCache = async (mrTitle: string) => {
@@ -213,9 +204,6 @@ export default function MaterialRequestDetailScreen() {
           console.log(`📊 Using status from backend: ${newMR.status}`);
           return newMR;
         });
-        
-          // Check for existing sealed TC
-          await checkExistingTC();
         } else {
         // Material Request not found in API response - check if it was deleted
         console.log(`⚠️ Material Request not found in API response, checking if deleted...`);
@@ -280,9 +268,6 @@ export default function MaterialRequestDetailScreen() {
             }
             return newMR;
           });
-          
-          // Check for existing sealed TC
-          await checkExistingTC();
         } else {
           Alert.alert(
             "Error",
@@ -497,6 +482,44 @@ export default function MaterialRequestDetailScreen() {
     }
   };
 
+  const resumePickingSession = async () => {
+    if (!materialRequest) return;
+
+    const session = await pickingSessionService.loadSession(materialRequest.title);
+    if (session && session.status !== "Completed") {
+      const activeSession: PickingSession = {
+        ...session,
+        status: "In Progress",
+        updated_at: new Date().toISOString(),
+      };
+      await pickingSessionService.saveSession(activeSession);
+
+      if (activeSession.bin_location && activeSession.carton_id) {
+        (navigation as any).navigate("PickingScanItems", {
+          materialRequestTitle: materialRequest.title,
+          sessionId: activeSession.session_id,
+          binLocation: activeSession.bin_location,
+          cartonId: activeSession.carton_id,
+        });
+        return;
+      }
+
+      if (activeSession.bin_location) {
+        (navigation as any).navigate("PickingScanCarton", {
+          materialRequestTitle: materialRequest.title,
+          sessionId: activeSession.session_id,
+          binLocation: activeSession.bin_location,
+        });
+        return;
+      }
+    }
+
+    (navigation as any).navigate("PickingScanBin", {
+      materialRequestTitle: materialRequest.title,
+      sessionId: session?.session_id,
+    });
+  };
+
   // Start Picking - Update status to "In Progress"
   const handleStartPicking = async () => {
     if (!materialRequest) return;
@@ -520,26 +543,10 @@ export default function MaterialRequestDetailScreen() {
       if (response?.ok !== false) {
         // Reload Material Request to get updated status
         await loadMaterialRequest();
-        
-        // ❌ DO NOT use cached bin_location or carton_id - always require fresh scan
-        // Clear session's bin_location and carton_id to force fresh scanning
-        const session = await pickingSessionService.loadSession(materialRequest.title);
-        if (session) {
-          // Clear bin_location and carton_id from session to force fresh scans
-          const clearedSession: PickingSession = {
-            ...session,
-            bin_location: null,
-            carton_id: null,
-            status: "In Progress",
-            updated_at: new Date().toISOString(),
-          };
-          await pickingSessionService.saveSession(clearedSession);
-        }
-        
-        // Always start from Bin scanning screen - require fresh Location ID scan
+
         (navigation as any).navigate("PickingScanBin", {
-      materialRequestTitle: materialRequest.title,
-    });
+          materialRequestTitle: materialRequest.title,
+        });
       } else {
         Alert.alert(
           "Error",
@@ -619,14 +626,10 @@ export default function MaterialRequestDetailScreen() {
         // Reload from backend to get the latest status and data
         // This will now use backend status (we removed "Picked" from preservation logic)
         await loadMaterialRequest();
-        
-        // After reload, check for Transfer Carton again (in case status changed)
-        await checkExistingTC();
-        
         // Verify status was updated by checking the state after a brief moment
         await new Promise((resolve) => setTimeout(resolve, 200));
         const finalStatus = materialRequest?.status;
-        console.log(`📊 Final status after reload: ${finalStatus}, hasTransferCarton: ${hasTransferCarton}`);
+        console.log(`📊 Final status after reload: ${finalStatus}`);
         
         if (finalStatus === "Picked") {
           Alert.alert("Success", "Material Request marked as Picked");
@@ -678,6 +681,63 @@ export default function MaterialRequestDetailScreen() {
     } finally {
       setIsCompletingPicking(false);
     }
+  };
+
+  const dispatchMaterialRequest = async () => {
+    if (!materialRequest) return;
+
+    if (materialRequest.status !== "Picked") {
+      Alert.alert(
+        "Cannot Transfer",
+        "Material Request must be Picked before it can be transferred."
+      );
+      return;
+    }
+
+    const stockEntryNo = String(materialRequest.stock_entry_no || "").trim();
+    if (!stockEntryNo) {
+      Alert.alert(
+        "Stock Entry Required",
+        "Stock Entry Number is not available yet.\n\nPlease push/create the ERP Stock Entry from Desktop first, then refresh this Material Request."
+      );
+      return;
+    }
+
+    Alert.alert(
+      "Confirm Transfer",
+      `Change Material Request ${materialRequest.title} status to Transferred?\n\nStock Entry: ${stockEntryNo}`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Transfer",
+          onPress: async () => {
+            try {
+              setIsDispatching(true);
+              await apiService.updateMaterialRequestStatus(
+                materialRequest.title,
+                "Transferred"
+              );
+              setMaterialRequest((prev) =>
+                prev ? { ...prev, status: "Transferred" } : prev
+              );
+              await loadMaterialRequest();
+              Alert.alert(
+                "Success",
+                "Material Request status updated to Transferred."
+              );
+            } catch (error: any) {
+              console.error("❌ Failed to transfer Material Request:", error);
+              Alert.alert(
+                "Error",
+                error.message || "Failed to update Material Request status to Transferred"
+              );
+            } finally {
+              setIsDispatching(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
   // Create Transfer Carton - Called when status is "Picked"
@@ -1349,27 +1409,25 @@ export default function MaterialRequestDetailScreen() {
 
               setHasDispatchedTC(true);
 
-              // Update Material Request status from "Picked" to "Dispatched"
+              // Update Material Request status from "Picked" to "Dispatched".
+              // Do not show success unless this second backend update also succeeds.
               if (materialRequestTitle) {
-                try {
-                  await apiService.updateMaterialRequestStatus(
-                    materialRequestTitle,
-                    "Dispatched"
-                  );
-                  console.log(
-                    `✅ Updated Material Request ${materialRequestTitle} status to Dispatched`
-                  );
-                } catch (error: any) {
-                  console.warn(
-                    `⚠️ Failed to update MR status to Dispatched:`,
-                    error.message
-                  );
-                }
+                await apiService.updateMaterialRequestStatus(
+                  materialRequestTitle,
+                  "Dispatched"
+                );
+                console.log(
+                  `✅ Updated Material Request ${materialRequestTitle} status to Dispatched`
+                );
               }
+
+              setMaterialRequest((prev) =>
+                prev ? { ...prev, status: "Dispatched" } : prev
+              );
 
               Alert.alert(
                 "Success",
-                `Transfer Carton ${transferCarton} dispatched successfully`
+                `Transfer Carton ${transferCarton} dispatched successfully.\n\nMaterial Request status updated to Dispatched.`
               );
 
               // Reload Material Request to refresh data
@@ -1414,16 +1472,112 @@ export default function MaterialRequestDetailScreen() {
     setLoadingStock(true);
     setStockData([]);
 
+    const warehouse = String(materialRequest.from_warehouse || "").trim();
+    const extractStockEntries = (responseToUse: any): any[] => {
+      if (Array.isArray(responseToUse)) return responseToUse;
+      if (!responseToUse || typeof responseToUse !== "object") return [];
+
+      const data = responseToUse.data;
+      const candidates = [
+        responseToUse.data,
+        responseToUse.stock,
+        responseToUse.locations,
+        responseToUse.stock_ledger,
+        responseToUse.ledger,
+        responseToUse.rows,
+        responseToUse.items,
+        responseToUse.entries,
+        data?.locations,
+        data?.stock,
+        data?.stock_ledger,
+        data?.ledger,
+        data?.rows,
+        data?.items,
+        data?.entries,
+      ];
+      const found = candidates.find((candidate) => Array.isArray(candidate));
+      if (Array.isArray(found)) return found;
+
+      if (
+        responseToUse.location_id ||
+        responseToUse["Location ID"] ||
+        responseToUse.Location_ID ||
+        responseToUse.bin_location ||
+        responseToUse.Bin_Location ||
+        responseToUse.binLocation ||
+        responseToUse.bin_code ||
+        responseToUse.Bin_Code ||
+        responseToUse.location ||
+        responseToUse.warehouse
+      ) {
+        return [responseToUse];
+      }
+      if (
+        data &&
+        typeof data === "object" &&
+        (data.location_id ||
+          data["Location ID"] ||
+          data.Location_ID ||
+          data.bin_location ||
+          data.Bin_Location ||
+          data.binLocation ||
+          data.bin_code ||
+          data.Bin_Code ||
+          data.location ||
+          data.warehouse)
+      ) {
+        return [data];
+      }
+
+      return [];
+    };
+
+    const normalizeLocationId = (entry: any): string => {
+      return String(
+        entry.location_id ||
+          entry["Location ID"] ||
+          entry.Location_ID ||
+          entry.locationId ||
+          entry.location ||
+          entry.bin_location ||
+          entry.Bin_Location ||
+          entry.binLocation ||
+          entry.bin_code ||
+          entry.Bin_Code ||
+          entry.binCode ||
+          entry.bin_id ||
+          entry.Bin_ID ||
+          entry.binId ||
+          entry.rack_location ||
+          entry.rackLocation ||
+          entry.warehouse_location ||
+          entry.warehouseLocation ||
+          (entry.zone && entry.aisle && entry.rack && entry.level && entry.bin
+            ? `${entry.zone}-${entry.aisle}-${entry.rack}-${entry.level}-${entry.bin}`
+            : "") ||
+          entry.warehouse ||
+          "Unknown"
+      ).trim();
+    };
+
     try {
       console.log(
-        `📦 Loading stock for item: ${itemCode} in warehouse: ${materialRequest.from_warehouse}`
+        `📦 Loading stock for item: ${itemCode} in warehouse: ${warehouse || "ALL"}`
       );
 
-      // Fetch stock by item and warehouse
-      const response = await apiService.getStockByItemAndWarehouse(
-        itemCode,
-        materialRequest.from_warehouse
-      );
+      // Fetch stock by item and warehouse. If this endpoint is missing or rejects,
+      // continue to the desktop-compatible fallback endpoints below.
+      let response: any = null;
+      try {
+        response = warehouse
+          ? await apiService.getStockByItemAndWarehouse(itemCode, warehouse)
+          : null;
+      } catch (primaryError: any) {
+        console.warn(
+          `⚠️ Primary stock item endpoint failed for ${itemCode}; trying fallbacks:`,
+          primaryError?.message || primaryError
+        );
+      }
 
       // Handle 404 (endpoint not found) gracefully - try alternative endpoint
       let responseToUse: any = response;
@@ -1432,7 +1586,7 @@ export default function MaterialRequestDetailScreen() {
           `ℹ️ Stock item endpoint not found (404) for ${itemCode}, trying getItemLocations...`
         );
         const altResponse = await apiService.getItemLocations(
-          materialRequest.from_warehouse,
+          warehouse,
           itemCode
         );
         if (Array.isArray(altResponse) && altResponse.length > 0) {
@@ -1445,11 +1599,6 @@ export default function MaterialRequestDetailScreen() {
             console.log(`📦 getItemLocations (wrapped) returned ${arr.length} entries`);
           }
         }
-        if (responseToUse === null) {
-          setStockData([]);
-          setLoadingStock(false);
-          return;
-        }
       }
 
       console.log(`📦 Stock API response for ${itemCode}:`, {
@@ -1461,55 +1610,55 @@ export default function MaterialRequestDetailScreen() {
       });
 
       // Handle different response formats (support all known backend shapes so no locations/cartons are missed)
-      let stockEntries: any[] = [];
-      if (Array.isArray(responseToUse)) {
-        stockEntries = responseToUse;
-        console.log(`📦 Response is array with ${stockEntries.length} entries`);
-      } else if (responseToUse && typeof responseToUse === "object") {
-        const data = responseToUse.data;
-        if (Array.isArray(responseToUse.data)) {
-          stockEntries = responseToUse.data;
-        } else if (Array.isArray(responseToUse.stock)) {
-          stockEntries = responseToUse.stock;
-        } else if (Array.isArray(responseToUse.locations)) {
-          stockEntries = responseToUse.locations;
-        } else if (Array.isArray(responseToUse.stock_ledger)) {
-          stockEntries = responseToUse.stock_ledger;
-        } else if (Array.isArray(responseToUse.items)) {
-          stockEntries = responseToUse.items;
-        } else if (Array.isArray(responseToUse.entries)) {
-          stockEntries = responseToUse.entries;
-        } else if (data && typeof data === "object") {
-          if (Array.isArray(data.locations)) stockEntries = data.locations;
-          else if (Array.isArray(data.stock)) stockEntries = data.stock;
-          else if (Array.isArray(data.items)) stockEntries = data.items;
-          else if (Array.isArray(data)) stockEntries = data;
+      let stockEntries: any[] = extractStockEntries(responseToUse);
+      console.log(`📦 Extracted stock entries: ${stockEntries.length}`);
+
+      if (stockEntries.length === 0) {
+        console.warn(`⚠️ No stock array found in item endpoint, trying item locations and stock ledger fallback`);
+
+        const altResponse = await apiService.getItemLocations(warehouse, itemCode);
+        stockEntries = extractStockEntries(altResponse);
+        if (stockEntries.length > 0) {
+          console.log(`📦 Fallback getItemLocations returned ${stockEntries.length} entries`);
         }
-        if (stockEntries.length === 0 && (responseToUse.location_id || responseToUse.bin_location)) {
-          stockEntries = [responseToUse];
-        }
-        console.log(
-          `📦 Extracted stock entries: ${stockEntries.length} (keys checked: data, stock, locations, stock_ledger, items, entries, data.locations, data.stock, data.items)`
-        );
-        if (stockEntries.length === 0) {
-          console.warn(`⚠️ No array found in response, keys:`, Object.keys(responseToUse));
-          const altResponse = await apiService.getItemLocations(
-            materialRequest.from_warehouse,
-            itemCode
+      }
+
+      if (stockEntries.length === 0) {
+        try {
+          const ledgerResponse = await apiService.getStockLedger({
+            item_code: itemCode,
+            warehouse: warehouse || undefined,
+          });
+          stockEntries = extractStockEntries(ledgerResponse);
+          console.log(`📦 Fallback stock ledger returned ${stockEntries.length} entries`);
+        } catch (ledgerError: any) {
+          console.warn(
+            `⚠️ Stock ledger fallback failed:`,
+            ledgerError?.message || ledgerError
           );
-          if (Array.isArray(altResponse) && altResponse.length > 0) {
-            stockEntries = altResponse;
-            console.log(`📦 Fallback getItemLocations: ${stockEntries.length} entries`);
-          } else if (altResponse && typeof altResponse === "object") {
-            const arr = (altResponse as any).data ?? (altResponse as any).locations ?? (altResponse as any).stock;
-            if (Array.isArray(arr) && arr.length > 0) {
-              stockEntries = arr;
-              console.log(`📦 Fallback getItemLocations (wrapped): ${stockEntries.length} entries`);
-            }
-          }
         }
-      } else {
-        console.warn(`⚠️ Unexpected response type:`, typeof response);
+      }
+
+      if (stockEntries.length === 0 && warehouse) {
+        try {
+          const ledgerAllWarehouseResponse = await apiService.getStockLedger({
+            item_code: itemCode,
+          });
+          stockEntries = extractStockEntries(ledgerAllWarehouseResponse).filter(
+            (entry) =>
+              !entry.warehouse ||
+              String(entry.warehouse).trim().toUpperCase() ===
+                warehouse.toUpperCase()
+          );
+          console.log(
+            `📦 Fallback stock ledger without warehouse returned ${stockEntries.length} matching entries`
+          );
+        } catch (ledgerError: any) {
+          console.warn(
+            `⚠️ Stock ledger all-warehouse fallback failed:`,
+            ledgerError?.message || ledgerError
+          );
+        }
       }
 
       console.log(
@@ -1532,12 +1681,28 @@ export default function MaterialRequestDetailScreen() {
 
       // Helper: get quantity from entry (backend may use balance_qty, in_qty/out_qty, qty, etc.)
       const getQty = (entry: any): number => {
-        const balance = entry.balance_qty ?? entry.balance_Qty ?? entry.Balance_Qty;
+        const balance =
+          entry.balance_qty ??
+          entry.balance_Qty ??
+          entry.Balance_Qty ??
+          entry["Balance Qty"] ??
+          entry["Balance_Qty"] ??
+          entry.balanceQty;
         if (balance !== undefined && balance !== null && !Number.isNaN(Number(balance))) {
           return Number(balance);
         }
-        const inQty = entry.in_qty ?? entry.in_Qty ?? entry.In_Qty ?? 0;
-        const outQty = entry.out_qty ?? entry.out_Qty ?? entry.Out_Qty ?? 0;
+        const inQty =
+          entry.in_qty ??
+          entry.in_Qty ??
+          entry.In_Qty ??
+          entry["In Qty"] ??
+          entry["In_Qty"];
+        const outQty =
+          entry.out_qty ??
+          entry.out_Qty ??
+          entry.Out_Qty ??
+          entry["Out Qty"] ??
+          entry["Out_Qty"];
         if (inQty !== undefined || outQty !== undefined) {
           return (Number(inQty) || 0) - (Number(outQty) || 0);
         }
@@ -1545,21 +1710,39 @@ export default function MaterialRequestDetailScreen() {
           entry.qty ??
           entry.quantity ??
           entry.available_qty ??
+          entry.availableQty ??
           entry.Available_Qty ??
+          entry.actual_qty ??
+          entry.actualQty ??
+          entry.on_hand_qty ??
+          entry.onHandQty ??
           entry.stock_qty ??
           entry.stock_quantity ??
           entry.available_quantity ??
+          entry.balance ??
+          entry.balanceQty ??
           entry.total_qty ??
+          entry.totalQty ??
+          entry.counted_qty ??
+          entry["Qty"] ??
+          entry["Quantity"] ??
           0
         );
       };
 
       // Check format: grouped (has cartons array) vs flat (has carton_id directly)
       const hasCartonId = (e: any) =>
-        !!(e.carton_id || e.carton_ID || e.Carton_ID || e.cartonId);
+        !!(
+          e.carton_id ||
+          e.carton_ID ||
+          e.Carton_ID ||
+          e.cartonId ||
+          e["Carton ID"] ||
+          e["Carton_ID"]
+        );
       const isGroupedFormat =
         stockEntries.length > 0 &&
-        stockEntries[0].bin_location &&
+        normalizeLocationId(stockEntries[0]) !== "Unknown" &&
         Array.isArray(stockEntries[0].cartons) &&
         (stockEntries[0].total_qty !== undefined || (Array.isArray(stockEntries[0].cartons) && stockEntries[0].cartons.length > 0));
 
@@ -1578,14 +1761,14 @@ export default function MaterialRequestDetailScreen() {
         // New grouped format: { bin_location, cartons: [{ carton_id, qty }], total_qty }
         formattedStock = stockEntries
           .filter((entry) => {
-            const hasLocation = entry && entry.bin_location;
+            const hasLocation = entry && normalizeLocationId(entry) !== "Unknown";
             if (!hasLocation) {
               console.warn(`⚠️ Entry missing bin_location:`, entry);
             }
             return hasLocation;
           })
           .map((entry) => {
-            const locationId = entry.bin_location || "Unknown";
+            const locationId = normalizeLocationId(entry);
             const totalQty =
               entry.total_qty ?? getQty(entry) ??
               (Array.isArray(entry.cartons)
@@ -1593,7 +1776,14 @@ export default function MaterialRequestDetailScreen() {
                 : 0);
             const cartons = Array.isArray(entry.cartons)
               ? entry.cartons.map((c: any) => ({
-                  carton_id: c.carton_id ?? c.carton_ID ?? c.Carton_ID ?? "",
+                  carton_id:
+                    c.carton_id ??
+                    c.carton_ID ??
+                    c.Carton_ID ??
+                    c.cartonId ??
+                    c["Carton ID"] ??
+                    c["Carton_ID"] ??
+                    "",
                   qty: c.qty ?? c.quantity ?? getQty(c) ?? 0,
                 }))
               : [];
@@ -1634,15 +1824,7 @@ export default function MaterialRequestDetailScreen() {
 
         stockEntries.forEach((entry) => {
           // Try multiple field names for location
-          const locationId =
-            entry.location_id ||
-            entry.bin_location ||
-            entry.Location_ID ||
-            entry.Bin_Location ||
-            (entry.zone && entry.aisle && entry.rack && entry.level && entry.bin
-              ? `${entry.zone}-${entry.aisle}-${entry.rack}-${entry.level}-${entry.bin}`
-              : null) ||
-            "Unknown";
+          const locationId = normalizeLocationId(entry);
 
           // Try multiple field names for carton_id
           const cartonId =
@@ -1650,6 +1832,8 @@ export default function MaterialRequestDetailScreen() {
             entry.carton_ID ||
             entry.Carton_ID ||
             entry.cartonId ||
+            entry["Carton ID"] ||
+            entry["Carton_ID"] ||
             null;
 
           const qty = getQty(entry);
@@ -1690,7 +1874,7 @@ export default function MaterialRequestDetailScreen() {
         formattedStock = stockEntries
           .filter((entry) => {
             const hasLocation =
-              entry && (entry.location_id || entry.bin_location);
+              entry && normalizeLocationId(entry) !== "Unknown";
             if (!hasLocation) {
               console.warn(`⚠️ Entry missing location:`, entry);
             }
@@ -1698,15 +1882,7 @@ export default function MaterialRequestDetailScreen() {
           })
           .map((entry) => {
             // Try multiple field names for location
-            const locationId =
-              entry.location_id ||
-              entry.bin_location ||
-              entry.bin ||
-              entry.location ||
-              (entry.zone && entry.aisle && entry.rack && entry.level && entry.bin
-                ? `${entry.zone}-${entry.aisle}-${entry.rack}-${entry.level}-${entry.bin}`
-                : null) ||
-              "Unknown";
+            const locationId = normalizeLocationId(entry);
 
             const qty = getQty(entry);
 
@@ -1942,27 +2118,6 @@ export default function MaterialRequestDetailScreen() {
         <Text style={styles.title}>{materialRequest.title}</Text>
         <View style={styles.statusContainer}>
           <StatusBadge status={materialRequest.status || "Unknown"} />
-          {/* Dispatch Button - Show when status is "Picked" and TC is sealed */}
-          {materialRequest.status?.toLowerCase() === "picked" &&
-            hasSealedTC &&
-            !hasDispatchedTC && (
-              <TouchableOpacity
-                style={[
-                  styles.dispatchButtonUnderStatus,
-                  isDispatching && styles.buttonDisabled,
-                ]}
-                onPress={dispatchTransferCarton}
-                disabled={isDispatching || hasDispatchedTC}
-              >
-                {isDispatching ? (
-                  <ActivityIndicator size="small" color="#FFF" />
-                ) : (
-                  <Text style={styles.dispatchButtonUnderStatusText}>
-                    🚚 Dispatch
-                  </Text>
-                )}
-              </TouchableOpacity>
-            )}
         </View>
       </View>
 
@@ -1984,61 +2139,17 @@ export default function MaterialRequestDetailScreen() {
             buttonAction = handleCompletePicking;
             isLoading = isCompletingPicking;
           } else {
-            // ✅ Show "Resume Picking" button (enabled) - ALWAYS start from Bin scanning
-            // ❌ DO NOT use cached bin_location or carton_id - always require fresh scan
             buttonText = "Resume Picking";
-            buttonAction = async () => {
-              // Clear session's bin_location and carton_id to force fresh scanning
-              const session = await pickingSessionService.loadSession(materialRequest.title);
-              if (session) {
-                // Clear bin_location and carton_id from session to force fresh scans
-                const clearedSession: PickingSession = {
-                  ...session,
-                  bin_location: null,
-                  carton_id: null,
-                  status: "In Progress",
-                  updated_at: new Date().toISOString(),
-                };
-                await pickingSessionService.saveSession(clearedSession);
-              }
-              
-              // Always start from Bin scanning screen - require fresh Location ID scan
-              (navigation as any).navigate("PickingScanBin", {
-                materialRequestTitle: materialRequest.title,
-              });
-            };
+            buttonAction = resumePickingSession;
             // Button is enabled - user can click to resume picking
           }
         } else if (status === "Picked") {
-          // When status is "Picked", check if Transfer Carton exists
-          // If no TC exists, show "Create Transfer Carton" button
-          console.log(`🔍 Button Logic - Status: ${status}, hasTransferCarton: ${hasTransferCarton}, transferCarton: ${transferCarton}, tcStatus: ${tcStatus}`);
-          
-          if (!hasTransferCarton && !transferCarton) {
-            console.log(`✅ Showing "Create Transfer Carton" button`);
-            buttonText = "Create Transfer Carton";
-            buttonAction = handleCreateTransferCarton;
-            isLoading = isCreatingTC;
-          } else if (tcStatus === "Created" || tcStatus === "Open") {
-            console.log(`✅ Showing "Seal Transfer Carton" button`);
-            buttonText = "Seal Transfer Carton";
-            buttonAction = handleSealTransferCarton;
-            isLoading = isSealingTC;
-          } else if (tcStatus === "Sealed" || tcStatus === "SEALED") {
-            // Show Dispatch button when TC is sealed
-            console.log(`✅ Showing "Dispatch" button`);
-            buttonText = "🚚 Dispatch";
-            buttonAction = dispatchTransferCarton;
-            isLoading = isDispatching;
-            isDisabled = hasDispatchedTC;
-          } else {
-            // Fallback: if status is "Picked" but TC state is unclear, still show "Create Transfer Carton"
-            // This ensures the button always shows when status is "Picked"
-            console.log(`⚠️ Status is "Picked" but TC state unclear (hasTransferCarton: ${hasTransferCarton}, transferCarton: ${transferCarton}, tcStatus: ${tcStatus}) - showing "Create Transfer Carton" as fallback`);
-            buttonText = "Create Transfer Carton";
-            buttonAction = handleCreateTransferCarton;
-            isLoading = isCreatingTC;
-          }
+          buttonText = materialRequest.stock_entry_no
+            ? "Transfer Material Request"
+            : "Waiting for Stock Entry";
+          buttonAction = dispatchMaterialRequest;
+          isLoading = isDispatching;
+          isDisabled = !materialRequest.stock_entry_no;
         } else {
           // If status is not recognized, log it
           console.log(`⚠️ Unknown status: ${status}`);
@@ -2067,14 +2178,14 @@ export default function MaterialRequestDetailScreen() {
                 <Text style={styles.submitButtonText}>{buttonText}</Text>
               )}
           </TouchableOpacity>
-            {hasTransferCarton && transferCarton && (
-              <Text style={styles.submitButtonSubtext}>
-                Transfer Carton: {transferCarton}
-              </Text>
-            )}
             {status === "In Progress" && pickingStatus && (
               <Text style={styles.submitButtonSubtext}>
                 Progress: {pickingStatus.fully_picked_items} of {pickingStatus.total_items} items fully picked
+              </Text>
+            )}
+            {status === "Picked" && !materialRequest.stock_entry_no && (
+              <Text style={styles.submitButtonSubtext}>
+                ERP Stock Entry Number is required before transfer.
               </Text>
             )}
           </View>
@@ -2094,16 +2205,14 @@ export default function MaterialRequestDetailScreen() {
         <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Request Date:</Text>
           <Text style={styles.infoValue}>
-            {materialRequest.request_date
-              ? new Date(materialRequest.request_date).toLocaleDateString()
-              : "N/A"}
+            {formatDateOnly(materialRequest.request_date)}
           </Text>
         </View>
         {materialRequest.required_date && (
           <View style={styles.infoRow}>
             <Text style={styles.infoLabel}>Required Date:</Text>
             <Text style={styles.infoValue}>
-              {new Date(materialRequest.required_date).toLocaleDateString()}
+              {formatDateOnly(materialRequest.required_date)}
             </Text>
           </View>
         )}
@@ -2113,6 +2222,16 @@ export default function MaterialRequestDetailScreen() {
             {materialRequest.requested_by || "N/A"}
           </Text>
         </View>
+        {(materialRequest.status === "Picked" ||
+          materialRequest.status === "Transferred" ||
+          materialRequest.stock_entry_no) && (
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Stock Entry (ERP):</Text>
+            <Text style={styles.infoValue}>
+              {materialRequest.stock_entry_no || "Not available yet"}
+            </Text>
+          </View>
+        )}
       </View>
 
       <View style={styles.section}>

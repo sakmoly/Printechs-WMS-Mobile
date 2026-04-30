@@ -215,6 +215,24 @@ function normalizeAsnPutawayCompleteRequestBody(
   });
 }
 
+function normalizeSourceType(value: unknown): string {
+  return String(value || "")
+    .trim()
+    .replace(/[\s_-]+/g, "")
+    .toUpperCase();
+}
+
+function hasSourceType(value: unknown): boolean {
+  return normalizeSourceType(value).length > 0;
+}
+
+function isSourceType(value: unknown, expected: "ASN" | "TransferIn"): boolean {
+  const normalized = normalizeSourceType(value);
+  return expected === "ASN"
+    ? normalized === "ASN"
+    : normalized === "TRANSFERIN";
+}
+
 export default function PutAwayScreen() {
   console.log("🔄 PutAwayScreen: Component rendered");
   const navigation = useNavigation();
@@ -415,6 +433,7 @@ export default function PutAwayScreen() {
       // Backend creates putaway tasks when boxes are closed (ASN) or Transfer In items are received
       const backendPutawayTasks: TransferCarton[] = [];
       const backendTaskIds = new Set<string>(); // Track IDs for quick lookup
+      const transferInPutawayRefs = new Set<string>(); // Prevent duplicate boxes from appearing under ASN.
       const normalizeId = (id: string | null | undefined): string => {
         if (!id) return "";
         return String(id).trim().toUpperCase();
@@ -501,10 +520,12 @@ export default function PutAwayScreen() {
                     }
                     
                     // ASN tasks have asn_no or advance_shipping_notice (not transfer_in)
-                    const hasASN = (t.asn_no || t.advance_shipping_notice) && !t.transfer_in;
+                    const taskRef = t.asn_no || t.advance_shipping_notice;
+                    const hasASN = taskRef && !t.transfer_in;
                     // Or explicitly marked as ASN source type
-                    const isASNSource = t.source_type === "ASN";
-                    return hasASN || isASNSource;
+                    const isASNSource = isSourceType(t.source_type, "ASN");
+                    const isTransferInSource = isSourceType(t.source_type, "TransferIn");
+                    return !isTransferInSource && (hasASN || isASNSource);
                   });
                   
                   // Update response to filtered list
@@ -564,7 +585,10 @@ export default function PutAwayScreen() {
                         
                         // ✅ Include Open status for ASN putaway tasks (same as Transfer In)
                         const isDraftOpenOrInProgress = taskStatus === "DRAFT" || taskStatus === "OPEN" || taskStatus === "IN PROGRESS" || taskStatus === "INPROGRESS";
-                        const hasASN = (t.asn_no || t.advance_shipping_notice) && !t.transfer_in;
+                        const taskRef = t.asn_no || t.advance_shipping_notice;
+                        const hasASN = taskRef && !t.transfer_in;
+                        const isTransferInSource = isSourceType(t.source_type, "TransferIn");
+                        if (isTransferInSource) return false;
                         
                         if (activeASN && hasASN) {
                           const taskASN = t.asn_no || t.advance_shipping_notice;
@@ -603,14 +627,53 @@ export default function PutAwayScreen() {
             } else if (putawayTasksResponse?.tasks && Array.isArray(putawayTasksResponse.tasks)) {
               tasksList = putawayTasksResponse.tasks;
             }
+
+            // A backend data issue can create two open rows for the same box:
+            // one ASN row and one TransferIn row. In that conflict, keep the box
+            // only under Transfer In because source_type=TransferIn is explicit.
+            try {
+              const transferInTasksResponse = await apiService.getPutawayTasks({
+                status: "Draft,Open,In Progress",
+                source_type: "TransferIn",
+              });
+              let transferInTasksList: any[] = [];
+              if (Array.isArray(transferInTasksResponse)) {
+                transferInTasksList = transferInTasksResponse;
+              } else if (transferInTasksResponse?.data && Array.isArray(transferInTasksResponse.data)) {
+                transferInTasksList = transferInTasksResponse.data;
+              } else if (transferInTasksResponse?.tasks && Array.isArray(transferInTasksResponse.tasks)) {
+                transferInTasksList = transferInTasksResponse.tasks;
+              }
+              for (const transferInTask of transferInTasksList) {
+                if (!isSourceType(transferInTask.source_type, "TransferIn")) continue;
+                if (isTerminalPutawayTaskStatus(transferInTask.status)) continue;
+                collectPutawayTaskBoxRefs(transferInTask, normalizeId, transferInPutawayRefs);
+              }
+              if (transferInPutawayRefs.size > 0) {
+                console.warn(`ℹ️ PutAwayScreen: Found ${transferInPutawayRefs.size} Transfer In box ref(s) to suppress from ASN tab`);
+              }
+            } catch (transferInConflictError: any) {
+              console.warn(`⚠️ PutAwayScreen: Unable to check Transfer In duplicate refs for ASN tab:`, transferInConflictError.message);
+            }
             
             // ✅ Process ASN tasks (Transfer In tasks are processed separately)
             // ✅ Process ASN tasks only (Transfer In tasks are processed separately)
             // Convert backend putaway tasks to TransferCarton format
             for (const task of tasksList) {
               // ✅ Filter to only process ASN tasks
-              const hasASN = (task.asn_no || task.advance_shipping_notice) && !task.transfer_in;
-              const isASNSource = task.source_type === "ASN";
+              const taskRef = task.asn_no || task.advance_shipping_notice;
+              const hasASN = taskRef && !task.transfer_in;
+              const isASNSource = isSourceType(task.source_type, "ASN");
+              const isTransferInSource = isSourceType(task.source_type, "TransferIn");
+              if (isTransferInSource) {
+                continue;
+              }
+              const taskRefs = new Set<string>();
+              collectPutawayTaskBoxRefs(task, normalizeId, taskRefs);
+              if ([...taskRefs].some((ref) => transferInPutawayRefs.has(ref))) {
+                console.warn(`⚠️ PutAwayScreen: Skipped ASN task ${task.putaway_task || task.title || task.task_id} because same box has Transfer In putaway task`);
+                continue;
+              }
               if (!hasASN && !isASNSource) {
                 // This is not an ASN task, skip it (will be processed in Transfer In loop)
                 continue;
@@ -746,6 +809,7 @@ export default function PutAwayScreen() {
                   if (taskStatus === "COMPLETED" || taskStatus === "CLOSED") return false;
                   if (taskStatus !== "DRAFT" && taskStatus !== "OPEN" && taskStatus !== "IN PROGRESS" && taskStatus !== "INPROGRESS") return false;
                   
+                  if (isSourceType(t.source_type, "TransferIn")) return false;
                   const taskASN = (t.asn_no || t.advance_shipping_notice || "").toUpperCase().trim();
                   const normalizedTaskASN = taskASN.replace(/[^A-Z0-9]/g, "");
                   const normalizedActiveASN = activeASNUpper.replace(/[^A-Z0-9]/g, "");
@@ -1608,14 +1672,17 @@ export default function PutAwayScreen() {
                     
                     // ✅ Transfer In tasks: Check source_type first (most reliable)
                     // If source_type is "TransferIn", it's a Transfer In task
-                    const isTransferInSource = t.source_type === "TransferIn";
+                    const isTransferInSource = isSourceType(t.source_type, "TransferIn");
                     if (isTransferInSource) {
                       return true;
+                    }
+                    if (hasSourceType(t.source_type)) {
+                      return false;
                     }
                     
                     // ✅ Fallback: Transfer In tasks have transfer_in field
                     // Note: Some backends may set both asn_no and transfer_in, so check source_type first
-                    const hasTransferIn = t.transfer_in && (t.source_type === "TransferIn" || (!t.asn_no && !t.advance_shipping_notice));
+                    const hasTransferIn = t.transfer_in && !t.asn_no && !t.advance_shipping_notice;
                     return hasTransferIn;
                   });
                   
@@ -1665,9 +1732,11 @@ export default function PutAwayScreen() {
                         
                         // ✅ Include Open status for Transfer In putaway tasks
                         const isDraftOpenOrInProgress = taskStatus === "DRAFT" || taskStatus === "OPEN" || taskStatus === "IN PROGRESS" || taskStatus === "INPROGRESS";
+                        const isTransferInSource = isSourceType(t.source_type, "TransferIn");
+                        if (isTransferInSource) return isDraftOpenOrInProgress;
+                        if (hasSourceType(t.source_type)) return false;
                         const hasTransferIn = t.transfer_in && !t.asn_no && !t.advance_shipping_notice;
-                        const isTransferInSource = t.source_type === "TransferIn";
-                        return isDraftOpenOrInProgress && (hasTransferIn || isTransferInSource);
+                        return isDraftOpenOrInProgress && hasTransferIn;
                       });
                       
                       transferInTasksResponse = filteredTasks;
@@ -1745,12 +1814,15 @@ export default function PutAwayScreen() {
               }
               
               // Check if it's a Transfer In task
-              const isTransferInSource = t.source_type === "TransferIn";
+              const isTransferInSource = isSourceType(t.source_type, "TransferIn");
+              const isASNSource = isSourceType(t.source_type, "ASN");
               const hasTransferIn = !!t.transfer_in;
               const hasNoAsn = !t.asn_no && !t.advance_shipping_notice;
               
               // ✅ IMPORTANT: Include tasks with transfer_in OR source_type TransferIn
-              return isTransferInSource || hasTransferIn || (hasTransferIn && hasNoAsn);
+              if (isTransferInSource) return true;
+              if (isASNSource) return false;
+              return hasTransferIn && hasNoAsn;
             });
             
             console.warn(`📦 PutAwayScreen: Filtered ${tiTasksList.length} Transfer In tasks from ${allFetchedTasks.length} total`);
@@ -2023,7 +2095,7 @@ export default function PutAwayScreen() {
               console.warn(`⚠️ PutAwayScreen: No Transfer In tasks to process (tiTasksList is empty)`);
             }
             
-            console.warn(`✅ PutAwayScreen: Found ${tiTasksList.length} Transfer In putaway task(s) from backend, added ${backendPutawayTasks.filter(t => (t as any).source_type === "TransferIn").length} to backendPutawayTasks`);
+            console.warn(`✅ PutAwayScreen: Found ${tiTasksList.length} Transfer In putaway task(s) from backend, added ${backendPutawayTasks.filter(t => isSourceType((t as any).source_type, "TransferIn")).length} to backendPutawayTasks`);
           }
           
           console.warn(`✅ PutAwayScreen: Total ${backendPutawayTasks.length} putaway task(s) from backend (ASN + Transfer In)`);
@@ -2116,6 +2188,10 @@ export default function PutAwayScreen() {
         const normalizedId = normalizeId(id);
         
         if (!normalizedId) continue;
+        if (putawaySourceType === "ASN" && transferInPutawayRefs.has(normalizedId)) {
+          console.warn(`⚠️ PutAwayScreen: Skipped local ASN item ${id} because same box has Transfer In putaway task`);
+          continue;
+        }
         
         // Check if this ID is already in the list (from backend tasks)
         // Also check if it matches any backend task's box_id or tc_id
@@ -2456,8 +2532,10 @@ export default function PutAwayScreen() {
         if (status === "COMPLETED" || status === "CLOSED") {
           return false;
         }
-        // Include if source_type is TransferIn OR has transfer_in field
-        return t.source_type === "TransferIn" || !!t.transfer_in;
+        // source_type is authoritative; transfer_in is only a fallback for older responses.
+        if (isSourceType(t.source_type, "TransferIn")) return true;
+        if (hasSourceType(t.source_type)) return false;
+        return !!t.transfer_in;
       });
       
       console.warn(`📦 [SIMPLE] Filtered ${transferInTasks.length} Transfer In tasks`);
@@ -3305,7 +3383,7 @@ export default function PutAwayScreen() {
         // ✅ CRITICAL: For ASN putaway, if validatedData.box_id is PUT-* format, we need to get carton_id from task lines
         let cartonIdForRequest: string | undefined = undefined;
         const sourceType = (selectedTCObj as any).source_type || "ASN";
-        const isTransferIn = sourceType === "TransferIn";
+        const isTransferIn = isSourceType(sourceType, "TransferIn");
         
         // ✅ FIX: For ASN tasks, if box_id is PUT-* format (task ID), get carton_id from task lines
         if (!isTransferIn && validatedData.box_id && validatedData.box_id.startsWith("PUT-")) {
@@ -4257,9 +4335,9 @@ export default function PutAwayScreen() {
         
         // ✅ Get box_id/carton_id based on source type
         if (isTransferIn) {
-          // ✅ Transfer In Putaway: box_id can be CTN-TI-* (new carton) or CTN-* (existing box e.g. CTN-A1-...)
-          // Do NOT use TI-PUT-* / PUT-* (task ID) - backend expects carton/box ID
-          // Priority: carton_id from selectedTCObj > box_id from selectedTCObj > selectedTC (if valid CTN-* / BOX-* / PAW-*)
+          // ✅ Transfer In Putaway: box_id can be any custom carton/box value scanned during receiving.
+          // Do NOT use TI-PUT-* / PUT-* (task ID) - backend expects the actual carton/box ID.
+          // Priority: carton_id from selectedTCObj > box_id from selectedTCObj > selectedTC.
           boxIdToSend = (selectedTCObj as any).carton_id || (selectedTCObj as any).box_id;
           
           // ✅ DEBUG: Log what we found
@@ -4273,7 +4351,7 @@ export default function PutAwayScreen() {
             boxIdToSend_before_check: boxIdToSend,
           });
           
-          // ✅ If carton_id not in selectedTCObj, try to get it from selectedTC (validate format)
+          // ✅ If carton_id not in selectedTCObj, try to get it from selectedTC.
           if (!boxIdToSend && selectedTC) {
             if (selectedTC.startsWith("CTN-")) {
               // ✅ Any CTN-* is valid: CTN-TI-* (Transfer In carton) or CTN-A1-* / CTN-* (existing store/ASN carton linked to Transfer In)
@@ -4296,7 +4374,7 @@ export default function PutAwayScreen() {
           
           if (!boxIdToSend || boxIdToSend.trim() === '') {
             console.error(`❌ CRITICAL: No box_id found for Transfer In putaway`);
-            throw new Error("Box ID (carton_id) is required for Transfer In putaway. Please ensure the putaway task has a valid carton_id (CTN-* or box format).");
+            throw new Error("Box ID (carton_id) is required for Transfer In putaway. Please ensure the putaway task has a valid carton_id or custom box ID.");
           }
           
           // ✅ Reject task IDs only (TI-PUT-*, PUT-*). Allow any CTN-* (CTN-TI-*, CTN-A1-*, etc.) and other box formats.
@@ -4304,18 +4382,6 @@ export default function PutAwayScreen() {
             console.error(`❌ CRITICAL: boxIdToSend is task ID format: ${boxIdToSend}`);
             throw new Error(
               "box_id cannot be a task ID (TI-PUT-* / PUT-*). Use the carton/box ID (e.g. CTN-TI-* or CTN-A1-...) instead."
-            );
-          }
-          
-          // ✅ Accept any CTN-* (Transfer In carton or existing warehouse/store carton) and BOX-*/PAW-*
-          const isValidBoxFormat =
-            boxIdToSend.startsWith("CTN-") ||
-            boxIdToSend.startsWith("BOX-") ||
-            boxIdToSend.startsWith("PAW-");
-          if (!isValidBoxFormat) {
-            console.error(`❌ CRITICAL: boxIdToSend is not a valid carton/box format: ${boxIdToSend}`);
-            throw new Error(
-              `Invalid box_id format: "${boxIdToSend}". Use a carton ID (CTN-*) or box ID (BOX-*, PAW-*).`
             );
           }
           
@@ -4468,12 +4534,13 @@ export default function PutAwayScreen() {
           requestBody.box_id = boxIdToSend;
           console.warn(`📤 Including box_id: ${boxIdToSend}`);
         }
-        if (cartonIdToSend && isTransferIn) {
+        if (cartonIdToSend && isTransferIn && String(cartonIdToSend).trim().toUpperCase().startsWith("CTN-")) {
           requestBody.carton_id = cartonIdToSend;
           console.warn(`📤 Including carton_id: ${cartonIdToSend}`);
         }
         if (isTransferIn) {
           requestBody.tc_id = null;
+          requestBody.source_type = "TransferIn";
         }
 
         // ✅ ASN: send a minimal JSON body so nothing is mistaken for carton_id (INVALID_CARTON_FORMAT).
@@ -4534,7 +4601,7 @@ export default function PutAwayScreen() {
           // ✅ Validation successful - store validated data
           const validated = response.validated;
           const sourceType = (selectedTCObj as any).source_type || "ASN";
-          const isTransferIn = sourceType === "TransferIn";
+          const isTransferIn = isSourceType(sourceType, "TransferIn");
           
           setValidatedData({
             // ✅ NEW: For Transfer In, store box_id (not carton_id)
@@ -5311,7 +5378,9 @@ export default function PutAwayScreen() {
       // For Transfer In putaway, box ID format is TI-* or TI-PUT-* (from Box Management)
       // For ASN putaway, box ID format is PAW-* (from sorting)
       const isPutawayBox = selectedTC?.startsWith("PAW-") || selectedTC?.startsWith("TI-") || selectedTC?.startsWith("TI-PUT-");
-      const isTransferInPutaway = (selectedTCObj as any)?.source_type === "TransferIn" || selectedTC?.startsWith("TI-") || selectedTC?.startsWith("TI-PUT-");
+      const isTransferInPutaway =
+        isSourceType((selectedTCObj as any)?.source_type, "TransferIn") ||
+        putawaySourceType === "TransferIn";
       
       // ✅ FIX: First, check if task lines/items are already stored in selectedTCObj
       // This avoids needing to fetch from backend if we already have them
@@ -6504,10 +6573,10 @@ export default function PutAwayScreen() {
             {selectedTC && (
               <View style={styles.selectedCard}>
                 <Text style={styles.selectedLabel}>
-                  {(selectedTCObj as any)?.source_type === "TransferIn" ? "Putaway Task:" : "Selected TC:"}
+                  {isSourceType((selectedTCObj as any)?.source_type, "TransferIn") ? "Putaway Task:" : "Selected TC:"}
                 </Text>
                 <Text style={styles.selectedValue}>{selectedTC}</Text>
-                {(selectedTCObj as any)?.source_type === "TransferIn" && putawayTask && (
+                {isSourceType((selectedTCObj as any)?.source_type, "TransferIn") && putawayTask && (
                   <>
                     <Text style={styles.selectedLabel}>Transfer In:</Text>
                     <Text style={styles.selectedValue}>{(selectedTCObj as any)?.transfer_in || (selectedTCObj as any)?.asn_no || "N/A"}</Text>
@@ -6517,7 +6586,7 @@ export default function PutAwayScreen() {
                   </>
                 )}
                 {/* Show carton/item only if they were scanned (legacy workflow) */}
-                {(selectedTCObj as any)?.source_type === "TransferIn" && !putawayTask && (
+                {isSourceType((selectedTCObj as any)?.source_type, "TransferIn") && !putawayTask && (
                   <>
                     {selectedCartonOrItem && (
                       <>

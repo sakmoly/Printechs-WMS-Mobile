@@ -18,7 +18,6 @@ import { getSettings } from "../services/settings.service";
 import { transferInReceivingSessionService, TransferInReceivingSession } from "../services/transfer-in-receiving-session.service";
 import { isDeviceOnline } from "../utils/network-check";
 import { addEvent, syncEvents } from "../services/event-queue.service";
-import { useScanGuard } from "../utils/useScanGuard";
 import { dataService } from "../services/data.service";
 import { getDatabase } from "../database/database";
 import { resolveItemFromBarcode } from "../services/item-master.service";
@@ -54,7 +53,6 @@ export default function TransferInReceivingScanItemsScreen() {
   const [expectedItems, setExpectedItems] = useState<ExpectedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
-  const [barcodeDraft, setBarcodeDraft] = useState("");
   const [cartonId, setCartonId] = useState<string | null>(initialCartonId || null);
   const [boxId, setBoxId] = useState<string | null>(initialBoxId || null); // Box ID created when carton was generated
   const [editModal, setEditModal] = useState<{
@@ -88,8 +86,8 @@ export default function TransferInReceivingScanItemsScreen() {
 
   const barcodeInputRef = useRef<BarcodeInputHandle>(null);
   const lastScanTimeRef = useRef<number>(0);
+  const closeBoxErrorRef = useRef<string | null>(null);
   const SCAN_DEBOUNCE_MS = 700;
-  const scanGuard = useScanGuard(350); // ✅ Prevent duplicate scan triggers
 
   // ✅ Restore carton ID from session when screen opens or route params change
   useFocusEffect(
@@ -294,21 +292,31 @@ export default function TransferInReceivingScanItemsScreen() {
           console.warn(`   Backend status: ${ti.status}, completed_at: ${ti.completed_at}, is_completed: ${ti.is_completed}, session status: ${session?.status}`);
         }
 
-        // Convert items to ExpectedItem format
-        const items: ExpectedItem[] = (ti.items || ti.lines || []).map((item: any) => ({
-          line_id: item.line_id || item.item_code,
-          item_code: item.item_code,
-          item_name: item.item_name,
-          barcode: item.barcode,
-          barcodes: item.barcodes || (item.barcode ? [item.barcode] : []),
-          expected_qty: item.qty || item.expected_qty || item.requested_qty || 0,
-          received_qty: item.received_qty || 0,
-          remaining_qty: (item.qty || item.expected_qty || item.requested_qty || 0) - (item.received_qty || 0),
-          has_scanned: (item.received_qty || 0) > 0,
-          editable: true, // ✅ Always enabled - user can edit even if backend shows "Received"
-          uom: item.uom || "pcs",
-          status: item.status, // Include status from backend (Pending, Picking, Received)
-        }));
+        const localScannedQty = await loadLocalScannedQuantities();
+
+        // Convert items to ExpectedItem format. Local scanned qty is merged in so returning
+        // to this screen still shows scans that are queued or not reflected by API yet.
+        const items: ExpectedItem[] = (ti.items || ti.lines || []).map((item: any) => {
+          const expectedQty = item.qty || item.expected_qty || item.requested_qty || 0;
+          const backendReceivedQty = Number(item.received_qty || 0);
+          const itemCode = String(item.item_code || "");
+          const localReceivedQty = localScannedQty[itemCode] || 0;
+          const receivedQty = Math.max(backendReceivedQty, localReceivedQty);
+          return {
+            line_id: item.line_id || item.item_code,
+            item_code: item.item_code,
+            item_name: item.item_name,
+            barcode: item.barcode,
+            barcodes: item.barcodes || (item.barcode ? [item.barcode] : []),
+            expected_qty: expectedQty,
+            received_qty: receivedQty,
+            remaining_qty: expectedQty - receivedQty,
+            has_scanned: receivedQty > 0,
+            editable: true, // ✅ Always enabled - user can edit even if backend shows "Received"
+            uom: item.uom || "pcs",
+            status: item.status, // Include status from backend (Pending, Picking, Received)
+          };
+        });
 
         setExpectedItems(items);
         updateTotalScanned(items);
@@ -343,6 +351,40 @@ export default function TransferInReceivingScanItemsScreen() {
     const session = await transferInReceivingSessionService.loadSession(transferInNo);
     if (session?.is_dirty) {
       setIsDirty(true);
+    }
+  };
+
+  const loadLocalScannedQuantities = async (): Promise<Record<string, number>> => {
+    if (!transferInNo) return {};
+    try {
+      const db = await getDatabase();
+      if (!db) return {};
+
+      const refs = [cartonId, boxId].filter(Boolean) as string[];
+      const rows = refs.length > 0
+        ? await db.getAllAsync<{ item_code: string; scanned_qty: number }>(
+            `SELECT item_code, SUM(scanned_qty) as scanned_qty
+             FROM scanned_items
+             WHERE asn_no = ?
+               AND (carton_id IN (${refs.map(() => "?").join(",")}) OR box_id IN (${refs.map(() => "?").join(",")}))
+             GROUP BY item_code`,
+            [transferInNo, ...refs, ...refs]
+          )
+        : await db.getAllAsync<{ item_code: string; scanned_qty: number }>(
+            `SELECT item_code, SUM(scanned_qty) as scanned_qty
+             FROM scanned_items
+             WHERE asn_no = ?
+             GROUP BY item_code`,
+            [transferInNo]
+          );
+
+      return rows.reduce<Record<string, number>>((acc, row) => {
+        acc[String(row.item_code)] = Number(row.scanned_qty || 0);
+        return acc;
+      }, {});
+    } catch (error: any) {
+      console.warn("⚠️ Unable to load local Transfer In scanned quantities:", error?.message || error);
+      return {};
     }
   };
 
@@ -391,12 +433,17 @@ export default function TransferInReceivingScanItemsScreen() {
   };
 
   const findMatchingItem = (barcode: string): ExpectedItem | null => {
+    const normalized = barcode.trim().toUpperCase();
     return (
       expectedItems.find(
-        (item) =>
-          item.barcode === barcode ||
-          item.barcodes?.includes(barcode) ||
-          item.item_code === barcode
+        (item) => {
+          const itemCode = String(item.item_code || "").trim().toUpperCase();
+          const itemBarcode = String(item.barcode || "").trim().toUpperCase();
+          const itemBarcodes = (item.barcodes || []).map((b) => String(b).trim().toUpperCase());
+          return itemBarcode === normalized ||
+            itemBarcodes.includes(normalized) ||
+            itemCode === normalized;
+        }
       ) || null
     );
   };
@@ -523,16 +570,292 @@ export default function TransferInReceivingScanItemsScreen() {
   };
 
   // ✅ NEW: Close BOX for Transfer In (similar to ASN box closing)
+  const ensureBoxSortEventsSynced = async (boxId: string): Promise<boolean> => {
+    const db = await getDatabase();
+    if (!db) return false;
+
+    await db.runAsync(
+      `UPDATE event_queue
+       SET asn_no = COALESCE(asn_no, ?),
+           inbound_session = COALESCE(inbound_session, ?),
+           transfer_in = COALESCE(transfer_in, ?)
+       WHERE event_type = 'SORT_TO_BOX'
+         AND box_id = ?`,
+      [transferInNo, sessionId || `TI-REC-${Date.now()}`, transferInNo, boxId]
+    );
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const pending = await db.getFirstAsync<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM event_queue
+         WHERE event_type = 'SORT_TO_BOX'
+           AND box_id = ?
+           AND synced = 0`,
+        [boxId]
+      );
+
+      if (!pending || Number(pending.count || 0) === 0) {
+        return true;
+      }
+
+      const syncResult = await syncEvents();
+      if (syncResult.failed > 0) {
+        console.warn(`⚠️ Failed to sync ${syncResult.failed} event(s) before closing box ${boxId}`);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+
+    const stillPending = await db.getFirstAsync<{ count: number }>(
+      `SELECT COUNT(*) as count
+       FROM event_queue
+       WHERE event_type = 'SORT_TO_BOX'
+         AND box_id = ?
+         AND synced = 0`,
+      [boxId]
+    );
+
+    return Number(stillPending?.count || 0) === 0;
+  };
+
+  const rebuildAndSyncBoxSortEvents = async (boxId: string): Promise<boolean> => {
+    const db = await getDatabase();
+    if (!db || !transferInNo || !cartonId) return false;
+
+    const rows = await db.getAllAsync<{ item_code: string; scanned_qty: number; store?: string }>(
+      `SELECT item_code, SUM(scanned_qty) as scanned_qty, MAX(store) as store
+       FROM scanned_items
+       WHERE asn_no = ?
+         AND carton_id = ?
+         AND box_id = ?
+       GROUP BY item_code
+       HAVING scanned_qty > 0`,
+      [transferInNo, cartonId, boxId]
+    );
+
+    if (rows.length === 0) {
+      console.warn(`⚠️ No local scanned_items found to rebuild SORT_TO_BOX for box ${boxId}`);
+      return false;
+    }
+
+    const settings = await getSettings();
+    const recoveryStartedAt = new Date().toISOString();
+    for (const row of rows) {
+      await addEvent({
+        event_type: "SORT_TO_BOX",
+        asn_no: transferInNo,
+        inbound_session: sessionId || `TI-REC-${Date.now()}`,
+        transfer_in: transferInNo,
+        carton_id: cartonId,
+        item_code: row.item_code,
+        box_id: boxId,
+        store: row.store || transferIn?.to_warehouse || transferIn?.warehouse || "WH-MAIN",
+        qty: Number(row.scanned_qty || 0),
+        device_id: settings.device_id ?? undefined,
+        user_id: settings.user_id || settings.user_code || "USER",
+      });
+    }
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const syncResult = await syncEvents();
+      if (syncResult.failed > 0) {
+        console.warn(`⚠️ Recovery sync failed for ${syncResult.failed} event(s) on box ${boxId}`);
+      }
+
+      const pending = await db.getFirstAsync<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM event_queue
+         WHERE event_type = 'SORT_TO_BOX'
+           AND box_id = ?
+           AND event_time >= ?
+           AND synced = 0`,
+        [boxId, recoveryStartedAt]
+      );
+
+      if (Number(pending?.count || 0) === 0) {
+        return true;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    return false;
+  };
+
+  const getPendingTransferInReceiveSyncIssue = async (): Promise<string | null> => {
+    const db = await getDatabase();
+    if (!db || !transferInNo) return "Local database is not available.";
+
+    const pending = await db.getFirstAsync<{
+      count: number;
+      last_error?: string | null;
+    }>(
+      `SELECT COUNT(*) as count,
+              MAX(error_msg) as last_error
+       FROM event_queue
+       WHERE event_type = 'TRANSFER_IN_RECEIVE'
+         AND transfer_in = ?
+         AND synced = 0`,
+      [transferInNo]
+    );
+
+    const pendingCount = Number(pending?.count || 0);
+    if (pendingCount === 0) return null;
+
+    const lastError = String(pending?.last_error || "").trim();
+    return lastError
+      ? `${pendingCount} receive event(s) are still pending.\n\nLast sync error: ${lastError}`
+      : `${pendingCount} receive event(s) are still pending. Tap Sync and try again.`;
+  };
+
+  const ensureTransferInReceiveEventsSynced = async (): Promise<boolean> => {
+    const db = await getDatabase();
+    if (!db || !transferInNo) return false;
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const pending = await db.getFirstAsync<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM event_queue
+         WHERE event_type = 'TRANSFER_IN_RECEIVE'
+           AND transfer_in = ?
+           AND synced = 0`,
+        [transferInNo]
+      );
+
+      if (Number(pending?.count || 0) === 0) {
+        return true;
+      }
+
+      const syncResult = await syncEvents();
+      if (syncResult.failed > 0) {
+        console.warn(
+          `⚠️ ${syncResult.failed} event(s) failed while syncing Transfer In receive events before completion`
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    const stillPending = await db.getFirstAsync<{ count: number }>(
+      `SELECT COUNT(*) as count
+       FROM event_queue
+       WHERE event_type = 'TRANSFER_IN_RECEIVE'
+         AND transfer_in = ?
+         AND synced = 0`,
+      [transferInNo]
+    );
+
+    return Number(stillPending?.count || 0) === 0;
+  };
+
+  const rebuildAndSyncTransferInReceiveEvents = async (): Promise<boolean> => {
+    const db = await getDatabase();
+    if (!db || !transferInNo) return false;
+
+    const rows = await db.getAllAsync<{
+      item_code: string;
+      carton_id?: string;
+      box_id?: string;
+      scanned_qty: number;
+      store?: string;
+    }>(
+      `SELECT item_code,
+              MAX(carton_id) as carton_id,
+              MAX(box_id) as box_id,
+              SUM(scanned_qty) as scanned_qty,
+              MAX(store) as store
+       FROM scanned_items
+       WHERE asn_no = ?
+       GROUP BY item_code
+       HAVING scanned_qty > 0`,
+      [transferInNo]
+    );
+
+    if (rows.length === 0) {
+      console.warn(`⚠️ No local scanned_items found to rebuild TRANSFER_IN_RECEIVE for ${transferInNo}`);
+      return false;
+    }
+
+    const settings = await getSettings();
+    const recoveryStartedAt = new Date().toISOString();
+    for (const row of rows) {
+      await addEvent({
+        event_type: "TRANSFER_IN_RECEIVE",
+        transfer_in: transferInNo,
+        carton_id: row.carton_id || cartonId,
+        box_id: row.box_id || row.carton_id || boxId || cartonId,
+        item_code: row.item_code,
+        qty: Number(row.scanned_qty || 0),
+        store: row.store || transferIn?.to_warehouse || transferIn?.warehouse || "WH-MAIN",
+        device_id: settings.device_id ?? undefined,
+        user_id: settings.user_id || settings.user_code || "USER",
+      });
+    }
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const syncResult = await syncEvents();
+      if (syncResult.failed > 0) {
+        console.warn(`⚠️ Recovery sync failed for ${syncResult.failed} Transfer In receive event(s)`);
+      }
+
+      const pending = await db.getFirstAsync<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM event_queue
+         WHERE event_type = 'TRANSFER_IN_RECEIVE'
+           AND transfer_in = ?
+           AND event_time >= ?
+           AND synced = 0`,
+        [transferInNo, recoveryStartedAt]
+      );
+
+      if (Number(pending?.count || 0) === 0) {
+        return true;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    return false;
+  };
+
   const closeTransferInBox = async (boxId: string): Promise<boolean> => {
     setLoading(true);
     try {
+      closeBoxErrorRef.current = null;
       const settings = await getSettings();
       const closedBy = settings.user_id || undefined;
 
-      const response = await apiService.closeBox({
-        box_id: boxId,
-        closed_by: closedBy,
-      });
+      const sortEventsSynced = await ensureBoxSortEventsSynced(boxId);
+      if (!sortEventsSynced) {
+        Alert.alert(
+          "Sync Required",
+          `Items in box ${boxId} are not fully synced yet. Please tap Sync and try Complete again.`
+        );
+        return false;
+      }
+
+      let response: any;
+      try {
+        response = await apiService.closeBox({
+          box_id: boxId,
+          closed_by: closedBy,
+        });
+      } catch (closeError: any) {
+        const closeMessage = closeError?.message || "";
+        if (closeMessage.includes("NO_ITEMS_FOUND") || closeMessage.includes("No items found")) {
+          const rebuilt = await rebuildAndSyncBoxSortEvents(boxId);
+          if (rebuilt) {
+            response = await apiService.closeBox({
+              box_id: boxId,
+              closed_by: closedBy,
+            });
+          } else {
+            throw closeError;
+          }
+        } else {
+          throw closeError;
+        }
+      }
 
       if (response?.ok === true || response?.success === true) {
         console.log(`✅ Transfer In Box ${boxId} closed successfully`);
@@ -555,7 +878,7 @@ export default function TransferInReceivingScanItemsScreen() {
       }
     } catch (error: any) {
       console.error("❌ Error closing Transfer In box:", error);
-      Alert.alert("Error", error.message || "Failed to close BOX");
+      closeBoxErrorRef.current = error.message || `Failed to close BOX ${boxId}`;
       return false;
     } finally {
       setLoading(false);
@@ -647,33 +970,54 @@ export default function TransferInReceivingScanItemsScreen() {
           
           console.log(`✅ Auto-created BOX "${createdBoxId}" for Transfer In ${transferInNo}`);
         } catch (createError: any) {
-          console.error(`❌ Failed to auto-create BOX:`, createError);
-          
-          // If backend creation fails, create locally only (for offline mode)
-          const localBox = {
-            box_id: finalBoxId,
-            asn_no: transferInNo,
-            store: "WH-MAIN",
-            status: "Open",
-            purpose: "PUTAWAY",
-            updated_on: new Date().toISOString(),
-          };
-          
-          try {
-            await dataService.saveBox(localBox);
-            box = localBox;
+          const createMessage = String(createError?.message || "");
+          const isDuplicateBox =
+            createMessage.includes("DUPLICATE_ENTRY") ||
+            createMessage.toLowerCase().includes("box already exists");
+
+          if (isDuplicateBox) {
+            const existingBox = {
+              box_id: finalBoxId,
+              asn_no: transferInNo,
+              store: "WH-MAIN",
+              status: "Open",
+              purpose: "PUTAWAY",
+              updated_on: new Date().toISOString(),
+            };
+
+            await dataService.saveBox(existingBox);
+            box = existingBox;
             setBoxId(finalBoxId);
-            console.log(`✅ Created local BOX "${finalBoxId}" (backend creation failed, will sync later)`);
-          } catch (localError: any) {
-            console.error(`❌ Failed to create local BOX:`, localError);
-            Alert.alert(
-              "BOX Not Found",
-              `BOX "${finalBoxId}" not found and could not be created.\n\n` +
-              `Error: ${createError.message || localError.message}\n\n` +
-              `Please go back and generate a carton ID first, or contact support.`
-            );
-            setLoading(false);
-            return;
+            console.log(`✅ BOX "${finalBoxId}" already exists in backend; saved locally and continuing`);
+          } else {
+            console.error(`❌ Failed to auto-create BOX:`, createError);
+          
+            // If backend creation fails, create locally only (for offline mode)
+            const localBox = {
+              box_id: finalBoxId,
+              asn_no: transferInNo,
+              store: "WH-MAIN",
+              status: "Open",
+              purpose: "PUTAWAY",
+              updated_on: new Date().toISOString(),
+            };
+          
+            try {
+              await dataService.saveBox(localBox);
+              box = localBox;
+              setBoxId(finalBoxId);
+              console.log(`✅ Created local BOX "${finalBoxId}" (backend creation failed, will sync later)`);
+            } catch (localError: any) {
+              console.error(`❌ Failed to create local BOX:`, localError);
+              Alert.alert(
+                "BOX Not Found",
+                `BOX "${finalBoxId}" not found and could not be created.\n\n` +
+                `Error: ${createError.message || localError.message}\n\n` +
+                `Please go back and generate a carton ID first, or contact support.`
+              );
+              setLoading(false);
+              return;
+            }
           }
         }
       }
@@ -689,14 +1033,16 @@ export default function TransferInReceivingScanItemsScreen() {
         return;
       }
 
-      // Resolve item from barcode (in case barcode was scanned instead of item_code)
-      const resolvedItem = await resolveItemFromBarcode(itemCode);
-      const finalItemCode = resolvedItem?.item_code || itemCode;
-
-      // Find matching item in Transfer In
-      const matchingItem = expectedItems.find(
-        (item) => item.item_code === finalItemCode
-      );
+      // Match the Transfer In expected list first. Only fallback to item master if
+      // direct matching fails; item master supports partial matches and can map
+      // 269151 to 2691, which is wrong for this workflow.
+      let matchingItem = findMatchingItem(itemCode);
+      let finalItemCode = matchingItem?.item_code || itemCode;
+      if (!matchingItem) {
+        const resolvedItem = await resolveItemFromBarcode(itemCode);
+        finalItemCode = resolvedItem?.item_code || itemCode;
+        matchingItem = findMatchingItem(finalItemCode);
+      }
 
       if (!matchingItem) {
         Alert.alert("Item Not Found", `Item "${finalItemCode}" is not in this Transfer In.`);
@@ -716,6 +1062,8 @@ export default function TransferInReceivingScanItemsScreen() {
       // Create SORT_TO_BOX event (similar to ASN)
       await addEvent({
         event_type: "SORT_TO_BOX",
+        asn_no: transferInNo,
+        inbound_session: sessionId || `TI-REC-${Date.now()}`,
         transfer_in: transferInNo,
         carton_id: cartonId,
         item_code: finalItemCode,
@@ -811,36 +1159,15 @@ export default function TransferInReceivingScanItemsScreen() {
       setExpectedItems(updatedItems);
       updateTotalScanned(updatedItems);
 
-      // Sync events
-      try {
-        await syncEvents();
-      } catch (syncError: any) {
+      void syncEvents().catch((syncError: any) => {
         console.warn(`⚠️ Event sync failed (will retry later):`, syncError.message);
-      }
+      });
 
       // ✅ PERMANENT FIX: Always refocus input after successful scan
       setTimeout(() => {
         barcodeInputRef.current?.focus();
       }, 100);
 
-      // Reload Transfer In after delay
-      setTimeout(async () => {
-        try {
-          await loadTransferIn();
-          // ✅ PERMANENT FIX: Refocus input after reload completes
-          setTimeout(() => {
-            barcodeInputRef.current?.focus();
-          }, 300);
-        } catch (reloadError: any) {
-          console.warn(`⚠️ Failed to reload Transfer In:`, reloadError.message);
-          // ✅ PERMANENT FIX: Refocus input even if reload fails
-          setTimeout(() => {
-            barcodeInputRef.current?.focus();
-          }, 300);
-        }
-      }, 2000);
-
-      Alert.alert("Success", `Item ${finalItemCode} sorted to BOX ${boxId}`);
       setCurrentItem(null);
       setBoxSelectionModal({ visible: false, itemCode: "" });
     } catch (error: any) {
@@ -859,13 +1186,6 @@ export default function TransferInReceivingScanItemsScreen() {
     if (isCompleted) {
       Alert.alert("Already Completed", "This Transfer In has already been completed. Scanning is disabled.");
       return false;
-    }
-
-    // ✅ FIX: Use scan guard to prevent duplicate triggers
-    const guard = scanGuard(barcode);
-    if (!guard.allow) {
-      console.log("⏭️ Scan guard blocked duplicate scan");
-      return true;
     }
 
     // ✅ CRITICAL: Validate cartonId FIRST
@@ -902,12 +1222,16 @@ export default function TransferInReceivingScanItemsScreen() {
     setScanning(true);
 
     try {
-      // Resolve item from barcode
-      const resolvedItem = await resolveItemFromBarcode(normalizedBarcode);
-      const itemCode = resolvedItem?.item_code || normalizedBarcode;
-
-      // Find matching item in Transfer In
-      const matchingItem = findMatchingItem(itemCode);
+      // Match the Transfer In expected list first. Material Request uses this
+      // direct path, and it prevents barcode-master partial matches like
+      // 269151 -> 2691 from rejecting a valid item.
+      let matchingItem = findMatchingItem(normalizedBarcode);
+      let itemCode = matchingItem?.item_code || normalizedBarcode;
+      if (!matchingItem) {
+        const resolvedItem = await resolveItemFromBarcode(normalizedBarcode);
+        itemCode = resolvedItem?.item_code || normalizedBarcode;
+        matchingItem = findMatchingItem(itemCode);
+      }
       
       if (!matchingItem) {
         Alert.alert("Item Not Found", `Item "${itemCode}" is not in this Transfer In.`, [
@@ -959,7 +1283,7 @@ export default function TransferInReceivingScanItemsScreen() {
         // ✅ PERMANENT FIX: Refocus input after scan completes
         setTimeout(() => {
           barcodeInputRef.current?.focus();
-        }, 150);
+        }, 50);
       } else {
         // No box_id available - show BOX selection modal (user can select existing or create new)
         setCurrentItem(matchingItem.item_code);
@@ -1277,9 +1601,9 @@ export default function TransferInReceivingScanItemsScreen() {
       "Complete Receiving",
       "Are you sure you want to complete receiving?\n\n" +
       "This will:\n" +
-      "1. Close all open boxes for this carton\n" +
+      "1. Sync the Transfer In receiving scans\n" +
       "2. Finalize the Transfer In and mark it as Received\n" +
-      "3. Make boxes available for Putaway",
+      "3. Make the Transfer In box available for Putaway",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -1288,31 +1612,43 @@ export default function TransferInReceivingScanItemsScreen() {
             try {
               setLoading(true);
               
-              // ✅ STEP 1: Sync pending events first
+              // ✅ STEP 1: Sync Transfer In receive events first.
+              // Backend create-putaway-task reads received_qty, which is written
+              // only after TRANSFER_IN_RECEIVE events are processed.
               try {
-                const syncResult = await syncEvents();
-                console.log(`✅ Synced ${syncResult.synced} event(s) before completing`);
-                if (syncResult.failed > 0) {
-                  console.warn(`⚠️ ${syncResult.failed} event(s) failed to sync - continuing with completion`);
+                const receiveEventsSynced = await ensureTransferInReceiveEventsSynced();
+                if (!receiveEventsSynced) {
+                  console.warn(
+                    `⚠️ Transfer In receive events still pending for ${transferInNo}. Trying local scanned_items recovery before blocking completion...`
+                  );
+                  const rebuilt = await rebuildAndSyncTransferInReceiveEvents();
+                  const recovered = rebuilt && (await ensureTransferInReceiveEventsSynced());
+                  if (!recovered) {
+                    const syncIssue = await getPendingTransferInReceiveSyncIssue();
+                    Alert.alert(
+                      "Sync Required",
+                      syncIssue ||
+                        "Transfer In received quantities are not fully synced yet. Please check connection, tap Sync, and try Complete Receiving again."
+                    );
+                    setLoading(false);
+                    return;
+                  }
                 }
+                console.log(`✅ Transfer In receive events synced before completing ${transferInNo}`);
               } catch (syncError: any) {
                 console.warn(`⚠️ Event sync failed before completion:`, syncError.message);
-                // Continue - events will sync later
-              }
-              
-              // ✅ NEW STEP 2: Close all open boxes for this carton (similar to ASN)
-              const boxesClosed = await closeAllBoxesForCarton();
-              if (!boxesClosed) {
                 Alert.alert(
-                  "Warning",
-                  "Some boxes could not be closed. Please check and close them manually before completing.",
-                  [{ text: "OK" }]
+                  "Sync Failed",
+                  `Could not sync Transfer In received quantities before completion.\n\nError: ${syncError.message}`
                 );
                 setLoading(false);
                 return;
               }
-              
-              // ✅ STEP 3: Call backend complete endpoint
+
+              // Transfer In putaway does not require ASN-style box closing.
+              // The backend should create/maintain putaway from the Transfer In receiving data.
+
+              // ✅ STEP 2: Call backend complete endpoint
               let completed = false;
               try {
                 if (apiService.completeTransferInReceiving) {
@@ -1350,8 +1686,89 @@ export default function TransferInReceivingScanItemsScreen() {
                 setIsCompleted(true);
                 console.log(`✅ Transfer In ${transferInNo} marked as completed - UI status will show "Received"`);
               }
+
+              // ✅ STEP 3: Ensure Transfer In putaway task exists
+              // Transfer In putaway is driven by tabPutawayTask.source_type = "TransferIn",
+              // not by ASN-style box closing.
+              let createdPutawayTask: string | null = null;
+              try {
+                const putawayResponse = await apiService.createPutawayTaskForTransferIn(transferInNo);
+                createdPutawayTask =
+                  putawayResponse?.putaway_task ||
+                  putawayResponse?.data?.putaway_task ||
+                  putawayResponse?.task ||
+                  putawayResponse?.data?.task ||
+                  null;
+
+                if (!createdPutawayTask) {
+                  throw new Error(
+                    `Backend did not return putaway_task for ${transferInNo}. Response: ${JSON.stringify(putawayResponse).slice(0, 300)}`
+                  );
+                }
+
+                console.log(
+                  `✅ Ensured Transfer In putaway task ${createdPutawayTask} exists for ${transferInNo}:`,
+                  putawayResponse
+                );
+              } catch (putawayError: any) {
+                const putawayMessage = String(putawayError?.message || "");
+                try {
+                  if (putawayMessage.includes("NO_RECEIVED_QTY")) {
+                    console.warn(
+                      `⚠️ Backend has no received_qty for ${transferInNo}. Rebuilding TRANSFER_IN_RECEIVE events from local scanned_items...`
+                    );
+                    const rebuilt = await rebuildAndSyncTransferInReceiveEvents();
+                    if (!rebuilt) {
+                      throw putawayError;
+                    }
+
+                    const retryResponse = await apiService.createPutawayTaskForTransferIn(transferInNo);
+                    createdPutawayTask =
+                      retryResponse?.putaway_task ||
+                      retryResponse?.data?.putaway_task ||
+                      retryResponse?.task ||
+                      retryResponse?.data?.task ||
+                      null;
+
+                    if (createdPutawayTask) {
+                      console.log(
+                        `✅ Created Transfer In putaway task ${createdPutawayTask} after receive-event recovery:`,
+                        retryResponse
+                      );
+                    } else {
+                      throw new Error(
+                        `Backend still did not return putaway_task for ${transferInNo}. Response: ${JSON.stringify(retryResponse).slice(0, 300)}`
+                      );
+                    }
+                  } else {
+                    throw putawayError;
+                  }
+                } catch (finalPutawayError: any) {
+                  console.warn(
+                    `⚠️ Transfer In ${transferInNo} completed, but putaway task creation failed:`,
+                    finalPutawayError?.message || finalPutawayError
+                  );
+                  Alert.alert(
+                    "Putaway Task Not Created",
+                    `Receiving was completed, but the Transfer In putaway task could not be created.\n\n` +
+                      `Error: ${finalPutawayError?.message || "Unknown error"}\n\n` +
+                      `Please check backend/session and retry creating putaway task for ${transferInNo}.`
+                  );
+                  setLoading(false);
+                  return;
+                }
+              }
+
+              if (!createdPutawayTask) {
+                Alert.alert(
+                  "Putaway Task Not Created",
+                  `Receiving was completed, but no putaway task was returned for ${transferInNo}.`
+                );
+                setLoading(false);
+                return;
+              }
               
-              // ✅ STEP 5: Update session
+              // ✅ STEP 4: Update session
               const session = await transferInReceivingSessionService.loadSession(transferInNo);
               if (session) {
                 await transferInReceivingSessionService.saveSession({
@@ -1363,14 +1780,14 @@ export default function TransferInReceivingScanItemsScreen() {
                 console.log(`✅ Marked receiving session as completed: ${session.session_id}`);
               }
 
-              // ✅ STEP 6: Reload data
+              // ✅ STEP 5: Reload data
               await loadTransferIn();
               await loadAvailableBoxes();
 
               Alert.alert(
                 "Success",
                 "Receiving completed successfully!\n\n" +
-                "All boxes have been closed and are now available for Putaway.",
+                `The Transfer In is now available for Putaway.\n\nPutaway Task: ${createdPutawayTask}`,
                 [
                   {
                     text: "Go to Putaway",
@@ -1408,8 +1825,6 @@ export default function TransferInReceivingScanItemsScreen() {
         {
           text: "Change",
           onPress: () => {
-            // Clear current item scan input
-            setBarcodeDraft("");
             // Navigate back to carton scan
             (navigation as any).navigate("TransferInReceivingScanCarton", {
               transferInNo,
@@ -1510,6 +1925,11 @@ export default function TransferInReceivingScanItemsScreen() {
   const allItemsReceived = expectedItems.every(
     (item) => item.received_qty >= item.expected_qty
   );
+  const totalTransferredQty = expectedItems.reduce(
+    (sum, item) => sum + (Number(item.expected_qty) || 0),
+    0
+  );
+  const totalRemainingQty = Math.max(totalTransferredQty - totalScanned, 0);
 
   if (loading && !transferIn) {
     return (
@@ -1543,14 +1963,59 @@ export default function TransferInReceivingScanItemsScreen() {
               <Text style={styles.taskText}>Txn: {transactionNo}</Text>
             </View>
           )}
-          <TouchableOpacity 
-            style={styles.cartonBadge}
-            onPress={handleChangeCarton}
+          <View style={styles.cartonActionRow}>
+            <TouchableOpacity 
+              style={styles.cartonBadge}
+              onPress={handleChangeCarton}
+            >
+              <Text style={styles.cartonText}>Carton: {cartonId || "N/A"}</Text>
+              <Text style={styles.changeTextSmall}>Tap to change</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.completeButtonSmall,
+                !allItemsReceived && styles.completeButtonSmallDisabled,
+              ]}
+              onPress={handleCompleteReceiving}
+              disabled={!allItemsReceived || loading || isCompleted}
+            >
+              <Text style={styles.completeButtonSmallText}>Complete</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        <View style={styles.qtySummaryRow}>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Transferred</Text>
+            <Text style={styles.qtySummaryValue}>{totalTransferredQty}</Text>
+          </View>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Scanned</Text>
+            <Text style={styles.qtySummaryValue}>{totalScanned}</Text>
+          </View>
+          <View style={styles.qtySummaryCard}>
+            <Text style={styles.qtySummaryLabel}>Remaining</Text>
+            <Text
+              style={[
+                styles.qtySummaryValue,
+                totalRemainingQty === 0 && styles.qtySummaryDone,
+              ]}
+            >
+              {totalRemainingQty}
+            </Text>
+          </View>
+        </View>
+        {(allItemsReceived && !isCompleted) && (
+        <View style={styles.headerActionsRow}>
+          <TouchableOpacity
+            style={styles.completeButtonPrimary}
+            onPress={handleCompleteReceiving}
+            disabled={loading}
           >
-            <Text style={styles.cartonText}>Carton: {cartonId || "N/A"}</Text>
-            <Text style={styles.changeTextSmall}>Tap to change</Text>
+            <Text style={styles.completeButtonPrimaryText}>Complete Receiving</Text>
           </TouchableOpacity>
         </View>
+        )}
+        {(isDirty && (!allItemsReceived || isCompleted)) && (
         <View style={styles.headerActionsRow}>
           {isDirty && (
             <TouchableOpacity 
@@ -1583,17 +2048,8 @@ export default function TransferInReceivingScanItemsScreen() {
               <Text style={styles.syncButtonText}>🔄 Sync</Text>
             </TouchableOpacity>
           )}
-          <TouchableOpacity
-            style={[
-              styles.completeButtonSmall,
-              !allItemsReceived && styles.completeButtonSmallDisabled,
-            ]}
-            onPress={handleCompleteReceiving}
-            disabled={!allItemsReceived || loading || isCompleted}
-          >
-            <Text style={styles.completeButtonSmallText}>Complete</Text>
-          </TouchableOpacity>
         </View>
+        )}
       </View>
 
       {/* Scan Item Card - Fixed at Top */}
@@ -1616,7 +2072,6 @@ export default function TransferInReceivingScanItemsScreen() {
                 ? "⚠️ Carton ID required - Tap Carton above to scan"
                 : "Scan or enter barcode"
             }
-            onChangeText={setBarcodeDraft}
             onBarcodeScanned={async (raw) => {
               const cleaned = raw.trim();
               if (!cleaned) return false;
@@ -1645,28 +2100,21 @@ export default function TransferInReceivingScanItemsScreen() {
               }
               return handleItemScan(cleaned);
             }}
-            containerStyle={{ flex: 1 }}
+            containerStyle={styles.scanInputStack}
             inputStyle={[
               styles.scanInput,
               (!cartonId || cartonId.trim() === "") &&
                 styles.scanInputDisabled,
             ]}
+            actionsContainerStyle={styles.scanInputActions}
+            submitButtonStyle={styles.scanSubmitButton}
+            submitTextStyle={styles.scanSubmitButtonText}
+            showSoftInputOnFocus={false}
+            showKeyboardButton
+            keyboardButtonStyle={styles.scanKeyboardButton}
+            keyboardButtonTextStyle={styles.scanKeyboardButtonText}
+            keyboardButtonLabel="Keyboard"
           />
-          <TouchableOpacity
-            style={styles.submitButton}
-            onPress={() => {
-              const b =
-                barcodeDraft.trim() ||
-                barcodeInputRef.current?.getLastText?.()?.trim() ||
-                "";
-              if (b) void handleItemScan(b);
-            }}
-            disabled={
-              scanning || !cartonId || isCompleted || !barcodeDraft.trim()
-            }
-          >
-            <Text style={styles.submitButtonText}>Submit</Text>
-          </TouchableOpacity>
         </View>
         {scanning && (
           <ActivityIndicator
@@ -1923,6 +2371,42 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: PickingTheme.colors.textWhite,
   },
+  cartonActionRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: PickingTheme.spacing.sm,
+  },
+  qtySummaryRow: {
+    flexDirection: "row",
+    gap: PickingTheme.spacing.sm,
+    marginTop: PickingTheme.spacing.sm,
+  },
+  qtySummaryCard: {
+    flex: 1,
+    backgroundColor: "rgba(255,255,255,0.16)",
+    borderRadius: PickingTheme.borderRadius.small,
+    paddingHorizontal: PickingTheme.spacing.sm,
+    paddingVertical: 6,
+    alignItems: "center",
+  },
+  qtySummaryLabel: {
+    ...PickingTheme.typography.caption,
+    fontSize: 9,
+    color: PickingTheme.colors.textWhite,
+    opacity: 0.78,
+    marginBottom: 2,
+  },
+  qtySummaryValue: {
+    fontSize: 18,
+    lineHeight: 22,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "800",
+  },
+  qtySummaryDone: {
+    color: "#8EF0A0",
+  },
   changeTextSmall: {
     ...PickingTheme.typography.caption,
     fontSize: 8,
@@ -1954,6 +2438,20 @@ const styles = StyleSheet.create({
     color: PickingTheme.colors.textWhite,
     fontWeight: "600",
   },
+  completeButtonPrimary: {
+    flex: 1,
+    backgroundColor: PickingTheme.colors.statusDone,
+    borderRadius: PickingTheme.borderRadius.small,
+    paddingHorizontal: PickingTheme.spacing.md,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  completeButtonPrimaryText: {
+    ...PickingTheme.typography.caption,
+    fontSize: 12,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "800",
+  },
   completeButtonSmall: {
     backgroundColor: PickingTheme.colors.statusDone,
     borderRadius: PickingTheme.borderRadius.small,
@@ -1972,8 +2470,9 @@ const styles = StyleSheet.create({
   },
   scanCard: {
     backgroundColor: PickingTheme.colors.buttonBlue,
-    padding: PickingTheme.spacing.md,
-    paddingVertical: PickingTheme.spacing.sm + 4,
+    paddingHorizontal: PickingTheme.spacing.md,
+    paddingTop: PickingTheme.spacing.sm,
+    paddingBottom: PickingTheme.spacing.lg,
     borderRadius: 0,
     borderBottomWidth: 2,
     borderBottomColor: "rgba(255,255,255,0.2)",
@@ -1993,15 +2492,28 @@ const styles = StyleSheet.create({
     marginBottom: PickingTheme.spacing.sm,
   },
   scanInputRow: {
-    flexDirection: "row",
+    alignSelf: "stretch",
+  },
+  scanInputStack: {
+    alignSelf: "stretch",
+    flexDirection: "column",
+    alignItems: "stretch",
     gap: PickingTheme.spacing.sm,
   },
   scanInput: {
-    flex: 1,
+    alignSelf: "stretch",
     backgroundColor: PickingTheme.colors.backgroundWhite,
     borderRadius: PickingTheme.borderRadius.small,
     padding: PickingTheme.spacing.md,
+    minHeight: 56,
     ...PickingTheme.typography.body,
+  },
+  scanInputActions: {
+    alignSelf: "stretch",
+    flexDirection: "row",
+    gap: PickingTheme.spacing.sm,
+    marginTop: 2,
+    marginBottom: 0,
   },
   scanInputDisabled: {
     backgroundColor: PickingTheme.colors.backgroundLight,
@@ -2009,17 +2521,29 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     opacity: 0.6,
   },
-  submitButton: {
+  scanSubmitButton: {
+    flex: 1,
     backgroundColor: PickingTheme.colors.statusDone,
-    paddingHorizontal: PickingTheme.spacing.lg,
-    paddingVertical: PickingTheme.spacing.md,
+    borderColor: PickingTheme.colors.statusDone,
     borderRadius: PickingTheme.borderRadius.small,
-    justifyContent: "center",
+    minHeight: 52,
   },
-  submitButtonText: {
+  scanSubmitButtonText: {
     ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
-    fontWeight: "600",
+    fontWeight: "700",
+  },
+  scanKeyboardButton: {
+    flex: 1,
+    backgroundColor: "#F59E0B",
+    borderColor: "#F59E0B",
+    borderRadius: PickingTheme.borderRadius.small,
+    minHeight: 52,
+  },
+  scanKeyboardButtonText: {
+    ...PickingTheme.typography.body,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "700",
   },
   scanningIndicator: {
     marginTop: PickingTheme.spacing.sm,

@@ -2,6 +2,8 @@ node_modules/
 .expo/
 .expo-shared/
 dist/
+build/
+coverage/
 npm-debug.*
 *.jks
 *.p8
@@ -50,9 +52,17 @@ ios/.xcode.env.local
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+eslint-compact.txt
+tsc-errors*.txt
+tsc-out.txt
 
 # Temporary files
 *.tmp
 *.temp
 .cache/
+
+# Local backups / generated diagnostics
+backups/
+src/backup_*/
+*.backup*
 

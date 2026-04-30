@@ -25,12 +25,13 @@ export default function TransferInReceivingScanCartonScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const routeParams = (route.params as any) || {};
-  const { transferInNo, sessionId, transactionNo } = routeParams;
+  const { transferInNo, sessionId, transactionNo, activeCartonId } = routeParams;
   
   console.log(`📦 TransferInReceivingScanCartonScreen opened: transferInNo=${transferInNo}, sessionId=${sessionId}`);
 
   const [cartonId, setCartonId] = useState("");
   const [boxId, setBoxId] = useState<string | null>(null); // Store box_id created when generating carton
+  const [cartonReady, setCartonReady] = useState(false);
   const [useExistingBox, setUseExistingBox] = useState(false); // When ON, send create_carton_if_missing: true
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -38,17 +39,26 @@ export default function TransferInReceivingScanCartonScreen() {
   const lastScanTimeRef = useRef<number>(0);
   const SCAN_DEBOUNCE_MS = 700;
 
+  const normalizeCustomCartonId = (value: string): string =>
+    value.trim().toUpperCase().replace(/\s+/g, "-");
+
   useEffect(() => {
     // ✅ Restore carton ID from session if exists (but allow user to change it)
     const restoreCartonId = async () => {
       if (!transferInNo) return;
       
       const session = await transferInReceivingSessionService.loadSession(transferInNo);
-      if (session && session.active_carton_id && session.status !== "Completed") {
+      if (session && session.active_carton_id) {
         console.log(`✅ Restored carton ID from session: ${session.active_carton_id}`);
         setCartonId(session.active_carton_id);
+        setCartonReady(false);
         // Note: box_id is not stored in session, it's passed via route params
         // If user navigates back, they'll need to generate carton again to create a new box
+      } else if (activeCartonId) {
+        const restoredCartonId = normalizeCustomCartonId(String(activeCartonId));
+        console.log(`✅ Restored carton ID from route: ${restoredCartonId}`);
+        setCartonId(restoredCartonId);
+        setCartonReady(false);
       } else {
         console.log(`ℹ️ No carton ID in session - user can generate or scan new carton`);
       }
@@ -60,7 +70,7 @@ export default function TransferInReceivingScanCartonScreen() {
     setTimeout(() => {
       cartonInputRef.current?.focus();
     }, 300);
-  }, [transferInNo]);
+  }, [transferInNo, activeCartonId]);
 
   // Generate carton ID and create BOX automatically
   const handleGenerateCartonId = async () => {
@@ -75,6 +85,10 @@ export default function TransferInReceivingScanCartonScreen() {
       
       const settings = await getSettings();
       
+      const customCartonId = normalizeCustomCartonId(
+        cartonInputRef.current?.getLastText() || cartonId
+      );
+
       // ✅ STEP 1: Generate carton ID first (needed for BOX creation)
       const date = new Date();
       const dateStr = date.toISOString().split('T')[0].replace(/-/g, ''); // YYYYMMDD
@@ -84,7 +98,7 @@ export default function TransferInReceivingScanCartonScreen() {
       // Generate format: CTN-TI-{TRANSFER_IN_NO}-{DATE}-{TIME}-{RANDOM}
       // Example: CTN-TI-INSLIP-123456-20250125-143022-123
       const transferInShort = transferInNo.replace(/^INSLIP-/, ''); // Remove INSLIP- prefix if present
-      const generatedCartonId = `CTN-TI-${transferInShort}-${dateStr}-${timeStr}-${randomSuffix}`;
+      const generatedCartonId = customCartonId || `CTN-TI-${transferInShort}-${dateStr}-${timeStr}-${randomSuffix}`;
       
       // ✅ STEP 2: Create BOX using /api/boxes/create endpoint
       // Note: For Transfer In, send box_id = Carton ID (CTN-TI-...) as per user requirement
@@ -127,6 +141,7 @@ export default function TransferInReceivingScanCartonScreen() {
         
         if (finalBoxId) {
           setBoxId(finalBoxId); // Store for later use (this will be the Carton ID for putaway)
+          setCartonReady(true);
           console.log(`✅ Box ID stored: ${finalBoxId}`);
         } else {
           console.error(`❌ Failed to get box_id from response`);
@@ -221,7 +236,8 @@ export default function TransferInReceivingScanCartonScreen() {
   // ✅ NEW: Navigate to next screen after carton is scanned
   // Validate carton from tabsortbox backend (similar to ASN validating from asn_carton_map)
   const handleContinue = async (
-    overrideCartonId?: string
+    overrideCartonId?: string,
+    navigateAfterValidation = true
   ): Promise<boolean> => {
     const source = overrideCartonId !== undefined ? overrideCartonId : cartonId;
     console.log(`➡️ Continue button pressed with carton ID: "${source}"`);
@@ -262,6 +278,17 @@ export default function TransferInReceivingScanCartonScreen() {
     const normalizedCarton = trimmedCartonId.toUpperCase();
     setCartonId(normalizedCarton);
 
+    if (cartonReady) {
+      (navigation as any).navigate("TransferInReceivingScanItems", {
+        transferInNo,
+        sessionId: sessionId || `TI-REC-${Date.now()}`,
+        transactionNo,
+        cartonId: normalizedCarton,
+        boxId,
+      });
+      return true;
+    }
+
     setLoading(true);
     try {
       const settings = await getSettings();
@@ -273,9 +300,17 @@ export default function TransferInReceivingScanCartonScreen() {
         // Use boxId from state (created during generation) or pass carton ID if boxId not available
         // Backend expects BOX ID in carton_id field when validating
         const boxIdToValidate = boxId || normalizedCarton; // Fallback to carton ID if boxId not available
-        const validationResponse = await apiService.validateTransferInCarton(transferInNo, boxIdToValidate, {
-          create_carton_if_missing: useExistingBox || undefined,
+        const shouldLinkExistingBox =
+          useExistingBox || !boxIdToValidate.toUpperCase().startsWith("CTN-");
+        let validationResponse = await apiService.validateTransferInCarton(transferInNo, boxIdToValidate, {
+          create_carton_if_missing: shouldLinkExistingBox || undefined,
         });
+        const firstErrorCode = validationResponse?.error?.code;
+        if (firstErrorCode === "BOX_NOT_FOUND" && !shouldLinkExistingBox) {
+          validationResponse = await apiService.validateTransferInCarton(transferInNo, boxIdToValidate, {
+            create_carton_if_missing: true,
+          });
+        }
         
         if (validationResponse?.ok === false || validationResponse?.validated === false) {
           const errorCode = validationResponse?.error?.code;
@@ -363,6 +398,11 @@ export default function TransferInReceivingScanCartonScreen() {
       // ✅ Pass box_id from validation response (or from carton generation if validation didn't return it)
       // Priority: validatedBoxId (from validate-carton) > boxId (from state, created during generation)
       const finalBoxId = validatedBoxId || boxId || null;
+      setCartonReady(true);
+      if (!navigateAfterValidation) {
+        Alert.alert("Validated", "Carton/box is validated. You can now continue to item scanning.");
+        return true;
+      }
       (navigation as any).navigate("TransferInReceivingScanItems", {
         transferInNo,
         sessionId: sessionId || `TI-REC-${Date.now()}`,
@@ -389,11 +429,6 @@ export default function TransferInReceivingScanCartonScreen() {
 
   return (
     <View style={styles.container}>
-      <View style={styles.headerSection}>
-        <Text style={styles.headerTitle}>Transfer In Receiving</Text>
-        <Text style={styles.headerSubtitle}>Scan Carton ID</Text>
-      </View>
-
       <View style={styles.infoSection}>
         <Text style={styles.transferInText}>Transfer In: {transferInNo || "N/A"}</Text>
         {transactionNo && (
@@ -421,13 +456,31 @@ export default function TransferInReceivingScanCartonScreen() {
         <View style={styles.cartonInputRow}>
           <BarcodeInput
             ref={cartonInputRef}
+            value={cartonId}
             autoFocus
-            placeholder="Scan or enter carton ID"
-            onBarcodeScanned={async (raw) =>
-              handleContinue(raw.trim().toUpperCase())
-            }
-            containerStyle={{ flex: 1 }}
+            placeholder="Scan custom barcode or carton ID"
+            onChangeText={(text) => {
+              setCartonId(text);
+              setCartonReady(false);
+              setBoxId(null);
+            }}
+            onBarcodeScanned={(raw) => {
+              const scannedCarton = normalizeCustomCartonId(raw);
+              setCartonId(scannedCarton);
+              setCartonReady(false);
+              setBoxId(null);
+              return false;
+            }}
+            containerStyle={styles.cartonInputStack}
             inputStyle={styles.cartonInput}
+            actionsContainerStyle={styles.cartonInputActions}
+            submitButtonStyle={styles.cartonSubmitButton}
+            submitTextStyle={styles.cartonSubmitButtonText}
+            showSoftInputOnFocus={false}
+            showKeyboardButton
+            keyboardButtonStyle={styles.keyboardButton}
+            keyboardButtonTextStyle={styles.keyboardButtonText}
+            keyboardButtonLabel="Keyboard"
           />
         </View>
 
@@ -477,13 +530,25 @@ export default function TransferInReceivingScanCartonScreen() {
           </View>
         )}
         
-        {cartonId.trim() && !loading && (
+        {cartonId.trim() && !loading && !cartonReady && (
+          <TouchableOpacity
+            style={styles.validateButton}
+            onPress={() => {
+              void handleContinue(undefined, false);
+            }}
+            disabled={loading || generating}
+          >
+            <Text style={styles.validateButtonText}>Validate Carton / Box</Text>
+          </TouchableOpacity>
+        )}
+
+        {cartonId.trim() && !loading && cartonReady && (
           <TouchableOpacity
             style={styles.continueButton}
             onPress={() => {
               void handleContinue();
             }}
-            disabled={loading}
+            disabled={loading || generating}
           >
             <Text style={styles.continueButtonText}>Continue to Item Scanning</Text>
           </TouchableOpacity>
@@ -515,7 +580,7 @@ const styles = StyleSheet.create({
   headerSection: {
     backgroundColor: PickingTheme.colors.headerPurple,
     padding: PickingTheme.spacing.lg,
-    paddingTop: 40,
+    paddingTop: PickingTheme.spacing.sm,
   },
   headerTitle: {
     ...PickingTheme.typography.h1,
@@ -529,6 +594,7 @@ const styles = StyleSheet.create({
   infoSection: {
     backgroundColor: PickingTheme.colors.headerPurple,
     paddingHorizontal: PickingTheme.spacing.lg,
+    paddingTop: PickingTheme.spacing.md,
     paddingBottom: PickingTheme.spacing.md,
   },
   transferInText: {
@@ -589,19 +655,50 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   cartonInputRow: {
-    flexDirection: "row",
-    gap: PickingTheme.spacing.md,
     marginTop: PickingTheme.spacing.sm,
   },
+  cartonInputStack: {
+    alignSelf: "stretch",
+    flexDirection: "column",
+    alignItems: "stretch",
+    gap: PickingTheme.spacing.sm,
+  },
   cartonInput: {
-    flex: 1,
-    backgroundColor: PickingTheme.colors.backgroundLight,
-    borderRadius: PickingTheme.borderRadius.medium,
+    alignSelf: "stretch",
+    backgroundColor: PickingTheme.colors.backgroundWhite,
+    borderRadius: PickingTheme.borderRadius.small,
     padding: PickingTheme.spacing.md,
+    minHeight: 60,
     ...PickingTheme.typography.body,
     fontSize: 16,
     borderWidth: 2,
     borderColor: PickingTheme.colors.borderLight,
+  },
+  cartonInputActions: {
+    alignSelf: "stretch",
+    flexDirection: "row",
+    gap: PickingTheme.spacing.sm,
+  },
+  cartonSubmitButton: {
+    flex: 1,
+    backgroundColor: PickingTheme.colors.headerPurple,
+    borderRadius: PickingTheme.borderRadius.small,
+    paddingHorizontal: PickingTheme.spacing.md,
+  },
+  cartonSubmitButtonText: {
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "700",
+  },
+  keyboardButton: {
+    flex: 1,
+    backgroundColor: "rgba(255,255,255,0.92)",
+    borderColor: "rgba(255,255,255,0.75)",
+    borderRadius: PickingTheme.borderRadius.small,
+    paddingHorizontal: PickingTheme.spacing.md,
+  },
+  keyboardButtonText: {
+    color: PickingTheme.colors.headerPurple,
+    fontWeight: "700",
   },
   loadingContainer: {
     alignItems: "center",
@@ -629,6 +726,23 @@ const styles = StyleSheet.create({
     color: PickingTheme.colors.headerOrange,
     fontWeight: "600",
   },
+  validateButton: {
+    backgroundColor: PickingTheme.colors.buttonBlue || "#2196F3",
+    borderRadius: PickingTheme.borderRadius.medium,
+    padding: PickingTheme.spacing.md,
+    marginTop: PickingTheme.spacing.lg,
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  validateButtonText: {
+    ...PickingTheme.typography.h2,
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "700",
+  },
   actionButtonsRow: {
     flexDirection: "row",
     gap: PickingTheme.spacing.sm,
@@ -650,7 +764,8 @@ const styles = StyleSheet.create({
     ...PickingTheme.typography.body,
     color: PickingTheme.colors.textWhite,
     fontWeight: "600",
-    fontSize: 14,
+    fontSize: 12,
+    textAlign: "center",
   },
   printButton: {
     flex: 1,

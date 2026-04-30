@@ -192,7 +192,7 @@ export interface MaterialRequest {
   to_showroom: string;
   request_date: string;
   required_date?: string;
-  status: "Draft" | "Submitted" | "In Progress" | "Picked" | "Dispatched" | "Completed" | "Cancelled";
+  status: "Draft" | "Submitted" | "In Progress" | "Picked" | "Dispatched" | "Transferred" | "Completed" | "Cancelled";
   items: {
     item_code: string;
     requested_qty: number;
@@ -203,6 +203,7 @@ export interface MaterialRequest {
     description?: string;
   }[];
   requested_by: string;
+  stock_entry_no?: string | null;
   total_requested_qty?: number;
   total_picked_qty?: number;
   created_on?: string;

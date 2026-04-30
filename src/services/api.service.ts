@@ -572,6 +572,26 @@ const makeRequest = async (
         return makeRequest(endpoint, method, body, false);
       }
 
+      if (response.status === 403 && retryAuth) {
+        const errorText = await response.clone().text().catch(() => "");
+        let errorCode = "";
+        try {
+          const parsed = JSON.parse(errorText);
+          errorCode = parsed?.code || parsed?.error?.code || "";
+        } catch {
+          errorCode = "";
+        }
+
+        if (errorCode === "SESSION_REVOKED") {
+          console.warn("🔄 Session revoked - clearing local token and retrying authentication once...");
+          await saveSettings({
+            auth_token: undefined,
+            auth_token_expires: undefined,
+          });
+          return makeRequest(endpoint, method, body, false);
+        }
+      }
+
       // Try to get error message from response body
       let errorMessage = response.statusText || `HTTP ${response.status}`;
       let errorJson: any = null;
@@ -2984,13 +3004,21 @@ export const apiService = {
     options?: { create_carton_if_missing?: boolean }
   ) => {
     try {
+      const normalizedBoxId = String(boxId || "").trim().toUpperCase();
+      const isGeneratedCartonId = normalizedBoxId.startsWith("CTN-");
       const body: { box_id: string; carton_id?: string; create_carton_if_missing?: boolean } = {
         box_id: boxId,
-        carton_id: boxId, // Backend may expect either; send both for compatibility
       };
+      if (isGeneratedCartonId) {
+        body.carton_id = boxId; // Backend may expect carton_id only for generated CTN-* cartons.
+      }
       if (options?.create_carton_if_missing === true) {
         body.create_carton_if_missing = true;
       }
+      console.warn(
+        `📤 validateTransferInCarton body:`,
+        JSON.stringify(body, null, 2)
+      );
       return await makeRequest(`/api/transfer-in/${transferInNo}/validate-carton`, "POST", body);
     } catch (error: any) {
       // ✅ Check if this is a database schema error (source_type column missing)
@@ -3610,44 +3638,101 @@ export const apiService = {
   // Uses: GET /api/stock/item/:item_code/warehouse/:warehouse
   // Alternative: GET /api/stock-ledger/:item_code/:warehouse
   getItemLocations: async (warehouseId: string, itemCode: string) => {
+    const extractLocations = (response: any): any[] => {
+      if (Array.isArray(response)) return response;
+      if (!response || typeof response !== "object") return [];
+
+      const data = response.data;
+      const candidates = [
+        response.data,
+        response.locations,
+        response.stock,
+        response.stock_ledger,
+        response.ledger,
+        response.rows,
+        response.items,
+        response.entries,
+        data?.locations,
+        data?.stock,
+        data?.stock_ledger,
+        data?.ledger,
+        data?.rows,
+        data?.items,
+        data?.entries,
+      ];
+      const found = candidates.find((candidate) => Array.isArray(candidate));
+      if (Array.isArray(found)) return found;
+
+      if (
+        response.location_id ||
+        response["Location ID"] ||
+        response.bin_location ||
+        response.bin_code ||
+        response.carton_id ||
+        response["Carton ID"]
+      ) {
+        return [response];
+      }
+      if (
+        data &&
+        typeof data === "object" &&
+        (data.location_id ||
+          data["Location ID"] ||
+          data.bin_location ||
+          data.bin_code ||
+          data.carton_id ||
+          data["Carton ID"])
+      ) {
+        return [data];
+      }
+
+      return [];
+    };
+
     try {
-      // Try primary endpoint first
-      let response;
-      try {
-        response = await makeRequest(
-          `/api/stock/item/${encodeURIComponent(itemCode)}/warehouse/${encodeURIComponent(warehouseId)}`,
-          "GET"
-        );
-      } catch (error: any) {
-        // If primary endpoint fails, try alternative
-        if (error?.status === 404 || error?.message?.includes("404")) {
-          console.log("ℹ️ Primary stock endpoint not found, trying alternative...");
-          response = await makeRequest(
-            `/api/stock-ledger/${encodeURIComponent(itemCode)}/${encodeURIComponent(warehouseId)}`,
-            "GET"
+      const encodedItem = encodeURIComponent(itemCode);
+      const encodedWarehouse = encodeURIComponent(warehouseId || "");
+      const endpoints = [
+        warehouseId
+          ? `/api/stock/item/${encodedItem}/warehouse/${encodedWarehouse}`
+          : null,
+        warehouseId
+          ? `/api/stock-ledger/${encodedItem}/${encodedWarehouse}`
+          : null,
+        warehouseId
+          ? `/api/stock-ledger?item_code=${encodedItem}&warehouse=${encodedWarehouse}`
+          : null,
+        `/api/stock-ledger?item_code=${encodedItem}`,
+      ].filter(Boolean) as string[];
+
+      for (const endpoint of endpoints) {
+        try {
+          const response = await makeRequest(endpoint, "GET");
+          const locations = extractLocations(response);
+          if (locations.length > 0) {
+            console.log(
+              `📦 getItemLocations: ${endpoint} returned ${locations.length} row(s)`
+            );
+            return locations;
+          }
+          console.log(`ℹ️ getItemLocations: ${endpoint} returned no rows`);
+        } catch (error: any) {
+          if (
+            error?.status === 404 ||
+            error?.is404 ||
+            error?.message?.includes("404") ||
+            error?.message?.includes("not found")
+          ) {
+            console.log(`ℹ️ getItemLocations endpoint not available: ${endpoint}`);
+            continue;
+          }
+          console.warn(
+            `⚠️ getItemLocations endpoint failed (${endpoint}):`,
+            error?.message || error
           );
-        } else {
-          throw error;
         }
       }
-      
-      // Response should be an array of locations
-      if (Array.isArray(response)) {
-        return response;
-      }
-      
-      // If response is wrapped, try to extract array
-      if (response?.data && Array.isArray(response.data)) {
-        return response.data;
-      }
-      
-      // If response is an object with locations array
-      if (response?.locations && Array.isArray(response.locations)) {
-        return response.locations;
-      }
-      
-      // Return empty array if response format is unexpected
-      console.warn("⚠️ Unexpected response format for item locations:", response);
+
       return [];
     } catch (error: any) {
       // If endpoint doesn't exist, return empty array
@@ -3916,10 +4001,11 @@ export const apiService = {
     if (filters?.bin_location) params.append("bin_location", filters.bin_location);
     const queryString = params.toString();
     
-    // If backend requires bin_location, we need to handle it differently
-    // For now, only add it if provided (optional)
+    // /api/stock/ledger is the strict bin-location endpoint. General item/warehouse
+    // lookups must use /api/stock-ledger to avoid backend 400s for missing bin_location.
+    const basePath = filters?.bin_location ? "/api/stock/ledger" : "/api/stock-ledger";
     return makeRequest(
-      `/api/stock/ledger${queryString ? `?${queryString}` : ""}`,
+      `${basePath}${queryString ? `?${queryString}` : ""}`,
       "GET"
     );
   },
@@ -3965,8 +4051,14 @@ export const apiService = {
     item_code: string,
     warehouse: string
   ) => {
+    if (!item_code?.trim()) {
+      throw new Error("item_code is required");
+    }
+    if (!warehouse?.trim()) {
+      throw new Error("warehouse is required");
+    }
     return makeRequest(
-      `/api/stock/item/${item_code}/warehouse/${warehouse}`,
+      `/api/stock/item/${encodeURIComponent(item_code.trim())}/warehouse/${encodeURIComponent(warehouse.trim())}`,
       "GET"
     );
   },
