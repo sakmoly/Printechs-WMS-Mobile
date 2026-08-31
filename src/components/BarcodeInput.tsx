@@ -53,19 +53,32 @@ export type BarcodeInputProps = {
   showSoftInputOnFocus?: boolean;
   /** Optional manual keyboard button for scanner-first flows. */
   showKeyboardButton?: boolean;
+  /** When true, keyboard button toggles show/hide instead of show-only. */
+  keyboardToggle?: boolean;
+  /** Show clear (✕) button to empty the field without submitting. */
+  showClearButton?: boolean;
+  clearButtonStyle?: object;
+  clearButtonTextStyle?: object;
   keyboardButtonStyle?: object;
   keyboardButtonTextStyle?: object;
   keyboardButtonLabel?: string;
   /** Label for the manual submit control (default "Submit"). */
   submitLabel?: string;
+  /** Place action buttons above the input instead of beside it. */
+  actionsPosition?: "inline" | "top";
+  /** Equal-width compact action buttons (for top toolbar). */
+  compactActions?: boolean;
 };
 
 export type BarcodeInputHandle = {
   focus: () => void;
   blur: () => void;
   clear: () => void;
-  /** Last raw value from `onChangeText` (for optional manual Submit next to the field). */
-  getLastText: () => string;
+  enableKeyboard: () => void;
+  hideKeyboard: () => void;
+  toggleKeyboard: () => void;
+  /** Whether soft keyboard is currently enabled/requested. */
+  isKeyboardVisible: () => boolean;
 };
 
 /** Idle time after last character before auto-submit (no Enter from scanner). */
@@ -107,10 +120,16 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       submitTextStyle,
       showSoftInputOnFocus = true,
       showKeyboardButton = false,
+      keyboardToggle = false,
+      showClearButton = false,
+      clearButtonStyle,
+      clearButtonTextStyle,
       keyboardButtonStyle,
       keyboardButtonTextStyle,
       keyboardButtonLabel = "Keyboard",
       submitLabel = "Submit",
+      actionsPosition = "inline",
+      compactActions = false,
     },
     ref
   ) {
@@ -121,6 +140,7 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
     const [softKeyboardEnabled, setSoftKeyboardEnabled] = useState(
       showSoftInputOnFocus
     );
+    const [keyboardVisible, setKeyboardVisible] = useState(showSoftInputOnFocus);
     const isControlled = controlledValue !== undefined;
     const text = isControlled ? controlledValue : internalText;
 
@@ -161,13 +181,6 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
         inputRef.current?.setNativeProps?.({ text: "" });
       });
     }, [setText]);
-
-    useImperativeHandle(ref, () => ({
-      focus: () => inputRef.current?.focus(),
-      blur: () => inputRef.current?.blur(),
-      clear: () => flushInputClear(),
-      getLastText: () => latestTextRef.current,
-    }));
 
     const processBarcode = useCallback(
       async (raw: string) => {
@@ -237,10 +250,12 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
     useEffect(() => {
       if (showSoftInputOnFocus) {
         setSoftKeyboardEnabled(true);
+        setKeyboardVisible(true);
         return;
       }
 
       setSoftKeyboardEnabled(false);
+      setKeyboardVisible(false);
     }, [showSoftInputOnFocus]);
 
     const handleChangeText = useCallback(
@@ -282,10 +297,15 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
           (cleaned) => {
             void processBarcode(cleaned);
           },
-          { delayMs: debounceMs, autoIdleSubmit: true }
+          {
+            delayMs: debounceMs,
+            // Manual keyboard: only submit via Enter / Submit button (not idle debounce).
+            autoIdleSubmit:
+              !showSoftInputOnFocus && !manualKeyboardRequestRef.current,
+          }
         );
       },
-      [debounceMs, minBarcodeLength, processBarcode, setText, flushInputClear]
+      [debounceMs, minBarcodeLength, processBarcode, setText, flushInputClear, showSoftInputOnFocus]
     );
 
     useLayoutEffect(() => {
@@ -330,91 +350,183 @@ export const BarcodeInput = forwardRef<BarcodeInputHandle, BarcodeInputProps>(
       void processBarcode(latestTextRef.current);
     }, [disabled, processBarcode]);
 
-    const handleEnableKeyboard = useCallback(() => {
+    const hideKeyboard = useCallback(() => {
+      manualKeyboardRequestRef.current = false;
+      setSoftKeyboardEnabled(false);
+      setKeyboardVisible(false);
+      inputRef.current?.blur();
+    }, []);
+
+    const enableManualKeyboard = useCallback(() => {
       if (disabled) return;
       manualKeyboardRequestRef.current = true;
       setSoftKeyboardEnabled(true);
-      inputRef.current?.blur();
-      requestAnimationFrame(() => inputRef.current?.focus());
+      setKeyboardVisible(true);
+      inputRef.current?.setNativeProps?.({ showSoftInputOnFocus: true });
     }, [disabled]);
+
+    const handleEnableKeyboard = useCallback(() => {
+      if (disabled) return;
+      enableManualKeyboard();
+      inputRef.current?.blur();
+      setTimeout(() => inputRef.current?.focus(), 50);
+      setTimeout(() => inputRef.current?.focus(), 150);
+    }, [disabled, enableManualKeyboard]);
+
+    const handleKeyboardToggle = useCallback(() => {
+      if (disabled) return;
+      if (keyboardToggle && keyboardVisible) {
+        hideKeyboard();
+        return;
+      }
+      handleEnableKeyboard();
+    }, [disabled, keyboardToggle, keyboardVisible, hideKeyboard, handleEnableKeyboard]);
+
+    useImperativeHandle(ref, () => ({
+      focus: () => inputRef.current?.focus(),
+      blur: () => inputRef.current?.blur(),
+      clear: () => flushInputClear(),
+      enableKeyboard: handleEnableKeyboard,
+      hideKeyboard,
+      toggleKeyboard: handleKeyboardToggle,
+      isKeyboardVisible: () => keyboardVisible,
+      getLastText: () => latestTextRef.current,
+    }));
 
     const handleInputFocus = useCallback(() => {
       if (showSoftInputOnFocus || manualKeyboardRequestRef.current) return;
+      if (showKeyboardButton) {
+        enableManualKeyboard();
+        return;
+      }
       setSoftKeyboardEnabled(false);
-    }, [showSoftInputOnFocus]);
+    }, [showSoftInputOnFocus, showKeyboardButton, enableManualKeyboard]);
 
     const handleInputPressIn = useCallback(() => {
       if (showSoftInputOnFocus || manualKeyboardRequestRef.current) return;
+      if (showKeyboardButton) {
+        enableManualKeyboard();
+        return;
+      }
       setSoftKeyboardEnabled(false);
-    }, [showSoftInputOnFocus]);
+    }, [showSoftInputOnFocus, showKeyboardButton, enableManualKeyboard]);
 
     const handleInputBlur = useCallback(() => {
-      manualKeyboardRequestRef.current = false;
+      if (manualKeyboardRequestRef.current) {
+        return;
+      }
       if (!showSoftInputOnFocus) {
         setSoftKeyboardEnabled(false);
+        setKeyboardVisible(false);
       }
     }, [showSoftInputOnFocus]);
+
+    const keyboardButtonLabelResolved =
+      keyboardToggle && keyboardVisible ? "Hide" : keyboardButtonLabel;
+
+    const compactBtnStyle = compactActions ? styles.compactActionBtn : null;
+
+    const actionButtons = (
+      <>
+        {showClearButton ? (
+          <TouchableOpacity
+            style={[styles.iconBtn, styles.clearBtn, clearButtonStyle, compactBtnStyle]}
+            onPress={() => flushInputClear()}
+            accessibilityLabel="Clear barcode field"
+            disabled={disabled || !text}
+          >
+            <Text style={[styles.clearBtnText, clearButtonTextStyle]}>✕</Text>
+          </TouchableOpacity>
+        ) : null}
+
+        {showKeyboardButton ? (
+          <TouchableOpacity
+            style={[styles.iconBtn, styles.keyboardBtn, keyboardButtonStyle, compactBtnStyle]}
+            onPress={keyboardToggle ? handleKeyboardToggle : handleEnableKeyboard}
+            accessibilityLabel={
+              keyboardToggle && keyboardVisible
+                ? "Hide keyboard"
+                : "Show keyboard"
+            }
+            disabled={disabled}
+          >
+            <Text style={[styles.keyboardBtnText, keyboardButtonTextStyle]}>
+              {keyboardButtonLabelResolved}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+
+        <TouchableOpacity
+          style={[styles.iconBtn, styles.submitBtn, submitButtonStyle, compactBtnStyle]}
+          onPress={handleManualSubmit}
+          accessibilityLabel="Submit barcode"
+          disabled={disabled}
+        >
+          <Text style={[styles.submitBtnText, submitTextStyle]}>
+            {submitLabel}
+          </Text>
+        </TouchableOpacity>
+      </>
+    );
 
     useEffect(() => {
       return () => clearScannerTimer(timerRefMutable);
     }, []);
 
+    const inputField = (
+      <TextInput
+        key={inputInstanceKey}
+        ref={inputRef}
+        style={[
+          styles.input,
+          actionsPosition === "top" && styles.inputFullWidth,
+          inputStyle,
+        ]}
+        value={text}
+        onChangeText={handleChangeText}
+        placeholder={placeholder}
+        placeholderTextColor="#999"
+        editable={!disabled}
+        autoFocus={autoFocus}
+        autoCapitalize="none"
+        autoCorrect={false}
+        blurOnSubmit={false}
+        returnKeyType="done"
+        showSoftInputOnFocus={softKeyboardEnabled}
+        keyboardType="default"
+        onFocus={handleInputFocus}
+        onPressIn={handleInputPressIn}
+        onBlur={handleInputBlur}
+        onSubmitEditing={onSubmitEditing}
+        onKeyPress={onKeyPress}
+        {...(Platform.OS === "ios" ||
+        (Platform.OS === "android" && Number(Platform.Version) >= 21)
+          ? ({ submitBehavior: "submit" } as object)
+          : {})}
+      />
+    );
+
+    if (actionsPosition === "top") {
+      return (
+        <View style={[styles.column, containerStyle]}>
+          <View
+            style={[
+              styles.actionsTop,
+              compactActions && styles.actionsTopCompact,
+              actionsContainerStyle,
+            ]}
+          >
+            {actionButtons}
+          </View>
+          {inputField}
+        </View>
+      );
+    }
+
     return (
       <View style={[styles.row, containerStyle]}>
-        <TextInput
-          key={inputInstanceKey}
-          ref={inputRef}
-          style={[styles.input, inputStyle]}
-          value={text}
-          onChangeText={handleChangeText}
-          placeholder={placeholder}
-          placeholderTextColor="#999"
-          editable={!disabled}
-          autoFocus={autoFocus}
-          autoCapitalize="none"
-          autoCorrect={false}
-          blurOnSubmit={false}
-          returnKeyType="done"
-          showSoftInputOnFocus={softKeyboardEnabled}
-          keyboardType="default"
-          onFocus={handleInputFocus}
-          onPressIn={handleInputPressIn}
-          onBlur={handleInputBlur}
-          onSubmitEditing={onSubmitEditing}
-          onKeyPress={onKeyPress}
-          {...(Platform.OS === "ios" ||
-          (Platform.OS === "android" && Number(Platform.Version) >= 21)
-            ? // Keeps single-line submit without inserting newline on some OEM keyboards
-              ({ submitBehavior: "submit" } as object)
-            : {})}
-        />
-
-        <View style={[styles.actions, actionsContainerStyle]}>
-          {showKeyboardButton ? (
-            <TouchableOpacity
-              style={[styles.iconBtn, styles.keyboardBtn, keyboardButtonStyle]}
-              onPress={handleEnableKeyboard}
-              accessibilityLabel="Enable manual keyboard"
-              disabled={disabled}
-            >
-              <Text style={[styles.keyboardBtnText, keyboardButtonTextStyle]}>
-                {keyboardButtonLabel}
-              </Text>
-            </TouchableOpacity>
-          ) : null}
-
-          {/* Manual submit if wedge idle-debounce did not fire or Enter was not sent */}
-          <TouchableOpacity
-            style={[styles.iconBtn, styles.submitBtn, submitButtonStyle]}
-            onPress={handleManualSubmit}
-            accessibilityLabel="Submit barcode"
-            disabled={disabled}
-          >
-            <Text style={[styles.submitBtnText, submitTextStyle]}>
-              {submitLabel}
-            </Text>
-          </TouchableOpacity>
-        </View>
+        {inputField}
+        <View style={[styles.actions, actionsContainerStyle]}>{actionButtons}</View>
       </View>
     );
   }
@@ -425,6 +537,30 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+  },
+  column: {
+    flexDirection: "column",
+    alignSelf: "stretch",
+    width: "100%",
+  },
+  actionsTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 6,
+    marginBottom: 8,
+    alignSelf: "stretch",
+  },
+  actionsTopCompact: {
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  compactActionBtn: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 38,
+    maxHeight: 38,
+    paddingHorizontal: 4,
   },
   actions: {
     flexDirection: "row",
@@ -443,6 +579,11 @@ const styles = StyleSheet.create({
     color: "#333",
     backgroundColor: "#fff",
     minHeight: 60,
+  },
+  inputFullWidth: {
+    flex: 0,
+    width: "100%",
+    alignSelf: "stretch",
   },
   iconBtn: {
     borderRadius: 10,
@@ -474,5 +615,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: "#1976D2",
+  },
+  clearBtn: {
+    minWidth: 52,
+    paddingHorizontal: 8,
+    flexShrink: 0,
+    backgroundColor: "#FFEBEE",
+    borderColor: "#FFCDD2",
+  },
+  clearBtnText: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#C62828",
+    lineHeight: 20,
   },
 });

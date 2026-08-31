@@ -18,6 +18,7 @@ interface DraftSession {
   session_id: string;
   bin_code: string;
   count_type: string;
+  count_mode?: string | null;
   started_at: string;
   status: string;
   is_blind_count: number;
@@ -41,6 +42,7 @@ export default function CycleCountDraftsScreen() {
           session_id, 
           bin_code, 
           count_type, 
+          count_mode,
           started_at, 
           status, 
           is_blind_count,
@@ -92,6 +94,8 @@ export default function CycleCountDraftsScreen() {
       // Navigate to counting screen with session data
       (navigation as any).navigate("CycleCountBinCounting", {
         sessionId: session.session_id,
+        countType: session.count_type || "Directed",
+        countMode: session.count_mode || "Reconciliation",
         binCode: session.bin_code,
         binInfo: binInfo || { bin_code: session.bin_code },
         isBlindCount: session.is_blind_count === 1,

@@ -13,6 +13,7 @@ import {
   Platform,
   Vibration,
   Modal,
+  Keyboard,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
@@ -25,13 +26,32 @@ import { apiService } from "../services/api.service";
 import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { generateUUID } from "../utils/uuid";
-import { syncCycleCountSession } from "../services/cycle-count-sync.service";
 import { isDeviceOnline } from "../utils/network-check";
-import { resolveItemFromBarcode } from "../services/item-master.service";
+import {
+  resolveItemFromBarcode,
+  resolveItemFromOnlineScan,
+} from "../services/item-master.service";
 import {
   BarcodeInput,
   type BarcodeInputHandle,
 } from "../components/BarcodeInput";
+import {
+  getExpectedQtyForCarton,
+  listLocalStockForCarton,
+  applyCycleCountStockSync,
+} from "../services/stock-ledger-local.service";
+import {
+  countModeToApiValue,
+  getCycleCountWarehouseContext,
+  getCycleCountPushIdentity,
+  isAdhocAddMode,
+  unwrapFrappeMessage,
+  type CycleCountMode,
+} from "../services/cycle-count-erp.service";
+import {
+  startCycleCountSession,
+  validateCycleCountBin,
+} from "../services/cycle-count-session-start.service";
 
 interface CountLine {
   line_id: string;
@@ -50,17 +70,64 @@ interface CountLine {
   updated_at?: string; // Timestamp when line was last updated
 }
 
+function normalizeCartonId(value: string): string {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "-");
+}
+
+/** Carton labels (NEWCTN, WHMAIN001) vs numeric item barcodes (108226). */
+function looksLikeCartonId(value: string): boolean {
+  const v = normalizeCartonId(value);
+  if (!v || v.length < 2) return false;
+  if (/^\d+$/.test(v)) return false;
+  if (/^(CTN|NEW|CARTON|WHMAIN|BOX)/.test(v)) return true;
+  return /[A-Z]/.test(v) && /^[A-Z0-9-]+$/.test(v);
+}
+
+type SetupScanMethod = "local" | "blind" | "online";
+
+function deriveSetupScanMethod(
+  blind: boolean,
+  online: boolean
+): SetupScanMethod | null {
+  if (blind) return "blind";
+  if (online) return "online";
+  return null;
+}
+
 export default function CycleCountBinCountingScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const routeParams = (route.params as any) || {};
   const {
     sessionId,
+    countType: routeCountType,
     binCode,
     binInfo,
     isBlindCount,
+    scanOnline: initialScanOnline = false,
+    openingStock = false,
     cartonId: initialCartonId,
+    countMode: routeCountMode = "Reconciliation",
+    skipCartonRestore: skipCartonRestoreParam = false,
+    forceNewSession: forceNewSessionParam = false,
   } = routeParams;
+  const [sessionCountType, setSessionCountType] = useState<string>(
+    routeCountType || ""
+  );
+  const [countMode, setCountMode] = useState<CycleCountMode>(
+    (routeCountMode as CycleCountMode) || "Reconciliation"
+  );
+  const [erpBatch, setErpBatch] = useState<string | null>(null);
+  const [erpLockedCartonId, setErpLockedCartonId] = useState<string | null>(
+    null
+  );
+  const [syncingStock, setSyncingStock] = useState(false);
+  const shouldLoadExpectedItems =
+    String(sessionCountType || routeCountType || "")
+      .toLowerCase() === "directed" && !Boolean(openingStock);
 
   // ✅ DEBUG: Log route params to verify carton ID is passed
   useEffect(() => {
@@ -69,6 +136,9 @@ export default function CycleCountBinCountingScreen() {
       binCode,
       cartonId: initialCartonId,
       isBlindCount,
+      scanOnline: initialScanOnline,
+      openingStock,
+      shouldLoadExpectedItems,
       allParams: routeParams,
     });
   }, [route.params]);
@@ -80,10 +150,40 @@ export default function CycleCountBinCountingScreen() {
   const [editingLineId, setEditingLineId] = useState<string | null>(null);
   const [editQty, setEditQty] = useState("");
   const [taskTitle, setTaskTitle] = useState<string | null>(null);
+  const [scanOnlineEnabled, setScanOnlineEnabled] = useState(Boolean(initialScanOnline));
   const [cartonId, setCartonId] = useState<string | null>(null); // ✅ NEW: Carton ID will be scanned in this screen
   const [cartonIdInput, setCartonIdInput] = useState(""); // ✅ NEW: Input field for carton ID
   const cartonIdInputRef = useRef<BarcodeInputHandle>(null); // ✅ NEW: Ref for carton ID input
-  const skipCartonRestoreRef = useRef<boolean>(false); // ✅ NEW: Flag to skip carton ID restoration when user explicitly clears it
+  const binSetupInputRef = useRef<BarcodeInputHandle>(null);
+  const skipCartonRestoreRef = useRef<boolean>(Boolean(skipCartonRestoreParam));
+  const [binSetupLoading, setBinSetupLoading] = useState(false);
+  const [setupScanMethod, setSetupScanMethod] = useState<SetupScanMethod | null>(
+    () => deriveSetupScanMethod(Boolean(isBlindCount), Boolean(initialScanOnline))
+  );
+  const setupBlindCount = setupScanMethod === "blind";
+  const setupScanOnline = setupScanMethod === "online";
+  const binScanReady = setupScanMethod !== null;
+  const needsBinSetup = !binCode?.trim();
+
+  useEffect(() => {
+    if (!needsBinSetup || !setupScanMethod) return;
+    const timer = setTimeout(() => binSetupInputRef.current?.focus(), 150);
+    return () => clearTimeout(timer);
+  }, [needsBinSetup, setupScanMethod]);
+
+  useEffect(() => {
+    if (skipCartonRestoreParam) {
+      skipCartonRestoreRef.current = true;
+      setCartonId(null);
+      setErpLockedCartonId(null);
+    }
+  }, [skipCartonRestoreParam]);
+
+  useEffect(() => {
+    if (routeParams?.scanOnline !== undefined) {
+      setScanOnlineEnabled(Boolean(routeParams.scanOnline));
+    }
+  }, [route.params]);
 
   // ✅ IMPORTANT: Update cartonId when route params change (e.g., when screen is focused)
   useEffect(() => {
@@ -119,10 +219,19 @@ export default function CycleCountBinCountingScreen() {
   }, [cartonId, sessionId]);
 
   const barcodeInputRef = useRef<BarcodeInputHandle | null>(null);
+  const listRef = useRef<FlatList<CountLine> | null>(null);
+  const editingLineIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    editingLineIdRef.current = editingLineId;
+  }, [editingLineId]);
 
   const focusActiveBarcodeInput = useCallback(
     (delayMs = 0) => {
       const focus = () => {
+        if (editingLineIdRef.current) {
+          return;
+        }
         if (!cartonId) {
           cartonIdInputRef.current?.focus();
         } else {
@@ -138,6 +247,17 @@ export default function CycleCountBinCountingScreen() {
     [cartonId]
   );
 
+  const isCartonLocked = Boolean(erpLockedCartonId);
+
+  const alertCartonChangeBlocked = () => {
+    Alert.alert(
+      "Carton Locked",
+      `This count was already pushed to ERP for carton ${erpLockedCartonId}. ` +
+        "You cannot switch cartons on this task. Add more items to the same carton and push again, " +
+        "or start a new count session for a different carton."
+    );
+  };
+
   useFocusEffect(
     useCallback(() => {
       console.log(
@@ -148,27 +268,52 @@ export default function CycleCountBinCountingScreen() {
 
       // ✅ FIX: Async function inside callback (useFocusEffect doesn't support async callbacks)
       const loadData = async () => {
-        // ✅ FIX: Restore cartonId from database if not set in route params
-        // This ensures cartonId is restored when returning to the screen after saving draft
-        // BUT skip restoration if user explicitly cleared it (clicked "Change Carton")
+        // After ERP push, always restore the locked carton (cannot be cleared)
         let restoredCartonId = cartonId;
-        if (!cartonId && sessionId && !skipCartonRestoreRef.current) {
+        if (sessionId && !skipCartonRestoreRef.current) {
           try {
             const db = await getDatabase();
-            const mostRecentLine = await db.getFirstAsync<{
-              carton_id: string | null;
+            const sessionLock = await db.getFirstAsync<{
+              erp_locked_carton_id: string | null;
+              erp_batch: string | null;
             }>(
-              "SELECT carton_id FROM cycle_count_lines WHERE session_id = ? AND carton_id IS NOT NULL AND carton_id != '' ORDER BY updated_at DESC LIMIT 1",
+              "SELECT erp_locked_carton_id, erp_batch FROM cycle_count_sessions WHERE session_id = ?",
               [sessionId]
             );
-            if (mostRecentLine?.carton_id) {
-              console.log(
-                `📦 Restored cartonId from database: ${mostRecentLine.carton_id}`
+            let lockedCarton = sessionLock?.erp_locked_carton_id?.trim() || null;
+            if (!lockedCarton && sessionLock?.erp_batch) {
+              const pushedLine = await db.getFirstAsync<{ carton_id: string | null }>(
+                "SELECT carton_id FROM cycle_count_lines WHERE session_id = ? AND carton_id IS NOT NULL AND carton_id != '' ORDER BY updated_at DESC LIMIT 1",
+                [sessionId]
               );
-              restoredCartonId = mostRecentLine.carton_id;
-              setCartonId(mostRecentLine.carton_id);
-              // Wait a bit for state to update
+              lockedCarton = pushedLine?.carton_id?.trim() || null;
+              if (lockedCarton) {
+                await db.runAsync(
+                  "UPDATE cycle_count_sessions SET erp_locked_carton_id = ? WHERE session_id = ?",
+                  [lockedCarton, sessionId]
+                );
+              }
+            }
+            if (lockedCarton) {
+              setErpLockedCartonId(lockedCarton);
+              restoredCartonId = lockedCarton;
+              setCartonId(lockedCarton);
               await new Promise((resolve) => setTimeout(resolve, 100));
+            } else if (!cartonId) {
+              const mostRecentLine = await db.getFirstAsync<{
+                carton_id: string | null;
+              }>(
+                "SELECT carton_id FROM cycle_count_lines WHERE session_id = ? AND carton_id IS NOT NULL AND carton_id != '' ORDER BY updated_at DESC LIMIT 1",
+                [sessionId]
+              );
+              if (mostRecentLine?.carton_id) {
+                console.log(
+                  `📦 Restored cartonId from database: ${mostRecentLine.carton_id}`
+                );
+                restoredCartonId = mostRecentLine.carton_id;
+                setCartonId(mostRecentLine.carton_id);
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
             }
           } catch (error: any) {
             console.warn(
@@ -177,11 +322,8 @@ export default function CycleCountBinCountingScreen() {
             );
           }
         } else if (skipCartonRestoreRef.current) {
-          console.log(
-            `📦 Skipping carton ID restoration - user explicitly cleared it`
-          );
-          // Reset the flag after skipping restoration
-          skipCartonRestoreRef.current = false;
+          console.log(`📦 Fresh count — waiting for carton scan (skip restore)`);
+          restoredCartonId = null;
         }
 
         // ✅ NEW: Load taskTitle (server_session_id) from session FIRST
@@ -192,10 +334,30 @@ export default function CycleCountBinCountingScreen() {
             const db = await getDatabase();
             const session = await db.getFirstAsync<{
               server_session_id: string | null;
+              count_type: string | null;
+              count_mode: string | null;
+              erp_batch: string | null;
+              erp_locked_carton_id: string | null;
             }>(
-              "SELECT server_session_id FROM cycle_count_sessions WHERE session_id = ?",
+              "SELECT server_session_id, count_type, count_mode, erp_batch, erp_locked_carton_id FROM cycle_count_sessions WHERE session_id = ?",
               [sessionId]
             );
+            if (session?.count_type) {
+              setSessionCountType(session.count_type);
+            } else if (routeCountType) {
+              setSessionCountType(routeCountType);
+            }
+            if (session?.count_mode) {
+              setCountMode(session.count_mode as CycleCountMode);
+            } else if (routeCountMode) {
+              setCountMode(routeCountMode as CycleCountMode);
+            }
+            if (session?.erp_batch) {
+              setErpBatch(session.erp_batch);
+            }
+            if (session?.erp_locked_carton_id) {
+              setErpLockedCartonId(session.erp_locked_carton_id);
+            }
             if (session?.server_session_id) {
               console.log(
                 `📋 Loaded taskTitle from session: ${session.server_session_id}`
@@ -222,52 +384,12 @@ export default function CycleCountBinCountingScreen() {
         const cartonIdToUse = cartonId || restoredCartonId;
         await loadSessionWithCartonId(cartonIdToUse);
 
-        // ✅ NEW: Start the task if carton ID is already set (restored from previous session)
-        // This ensures the task is started before scanning items, even if user returns to this screen
-        // Only starts if task is in "Draft" status - if already "In Progress", skips starting
-        if (cartonIdToUse && loadedTaskTitle) {
-          // Use the helper function to ensure task is started (only if in Draft status)
-          await ensureTaskStarted(loadedTaskTitle);
-        }
-
-        // Then load expected items (which will use taskTitle to check backend task lines)
-        // Pass taskTitle directly to loadExpectedItems to ensure it has the value
         await loadExpectedItems(loadedTaskTitle);
       };
 
-      // Call the async function
       loadData();
-      // ✅ NEW: Auto-focus carton ID input if not set, otherwise focus item barcode input
       focusActiveBarcodeInput(100);
-
-      // Sync when screen loses focus (user navigates away)
-      return () => {
-        if (sessionId) {
-          console.log(
-            `🔄 Screen losing focus, syncing session ${sessionId}...`
-          );
-          // Use a timeout to ensure sync happens after navigation starts
-          setTimeout(async () => {
-            try {
-              const success = await syncCycleCountSession(sessionId);
-              if (success) {
-                console.log(
-                  `✅ Successfully synced session ${sessionId} on navigation`
-                );
-              } else {
-                console.warn(`⚠️ Sync returned false for session ${sessionId}`);
-              }
-            } catch (error: any) {
-              console.error(
-                `❌ Failed to sync session ${sessionId} on navigation:`,
-                error
-              );
-              console.error(`❌ Error details:`, error.message, error.stack);
-            }
-          }, 100); // Small delay to ensure navigation doesn't block sync
-        }
-      };
-    }, [sessionId, cartonId, focusActiveBarcodeInput]) // ✅ FIX: Include cartonId in dependencies so it reloads when carton changes
+    }, [sessionId, cartonId, focusActiveBarcodeInput])
   );
 
   // Auto-focus the active field on mount/state changes. When no carton is selected,
@@ -276,136 +398,21 @@ export default function CycleCountBinCountingScreen() {
     const timers = [80, 300, 700].map((delay) =>
       focusActiveBarcodeInput(delay)
     );
-    const focusInterval = !cartonId
-      ? setInterval(() => cartonIdInputRef.current?.focus(), 1500)
-      : undefined;
+    const focusInterval = setInterval(() => {
+      if (!editingLineId) {
+        focusActiveBarcodeInput();
+      }
+    }, 1500);
 
     return () => {
       timers.forEach((timer) => {
         if (timer) clearTimeout(timer);
       });
-      if (focusInterval) clearInterval(focusInterval);
+      clearInterval(focusInterval);
     };
-  }, [cartonId, focusActiveBarcodeInput]);
+  }, [cartonId, editingLineId, focusActiveBarcodeInput]);
 
   // ✅ NEW: Load session with specific cartonId (can be passed as parameter)
-  // ✅ Helper function to start task only if it's in "Draft" status
-  const ensureTaskStarted = async (taskTitleToStart: string) => {
-    if (!taskTitleToStart) {
-      console.log(
-        `ℹ️ No task title provided - task will be started when backend task is created`
-      );
-      return;
-    }
-
-    try {
-      const online = await isDeviceOnline();
-      if (!online) {
-        console.log(
-          `ℹ️ Device is offline - task ${taskTitleToStart} will be started when synced`
-        );
-        return;
-      }
-
-      // ✅ Check task status first before attempting to start
-      try {
-        const taskResponse = await apiService.getCycleCount(taskTitleToStart);
-        const taskStatus =
-          taskResponse?.status ||
-          taskResponse?.data?.status ||
-          taskResponse?.task?.status ||
-          null;
-
-        console.log(
-          `📋 Task ${taskTitleToStart} current status: ${
-            taskStatus || "unknown"
-          }`
-        );
-
-        // ✅ Only start if task is in "Draft" status
-        // If already "In Progress", "Started", "Submitted", etc., skip starting
-        if (
-          taskStatus &&
-          (taskStatus.toLowerCase() === "draft" ||
-            taskStatus.toLowerCase() === "pending")
-        ) {
-          console.log(
-            `📤 Starting cycle count task ${taskTitleToStart} (status: ${taskStatus})...`
-          );
-          const settings = await getSettings();
-          await apiService.startCycleCount(taskTitleToStart, {
-            started_by: settings.user_id || settings.user_code || "USER-AUTO",
-          });
-          console.log(
-            `✅ Successfully started task ${taskTitleToStart} - status changed to Started/In Progress`
-          );
-        } else if (taskStatus) {
-          // Task is already started or in progress - no action needed
-          console.log(
-            `ℹ️ Task ${taskTitleToStart} is already in "${taskStatus}" status - no need to start again`
-          );
-        } else {
-          // Status not found in response - try to start anyway (might be a new task)
-          console.log(
-            `⚠️ Could not determine task status - attempting to start anyway...`
-          );
-          const settings = await getSettings();
-          await apiService.startCycleCount(taskTitleToStart, {
-            started_by: settings.user_id || settings.user_code || "USER-AUTO",
-          });
-          console.log(`✅ Successfully started task ${taskTitleToStart}`);
-        }
-      } catch (getStatusError: any) {
-        // If getCycleCount fails, the task might not exist yet - try to start anyway
-        // This will fail gracefully if task doesn't exist
-        console.warn(
-          `⚠️ Could not check task status: ${getStatusError.message} - attempting to start anyway...`
-        );
-        try {
-          const settings = await getSettings();
-          await apiService.startCycleCount(taskTitleToStart, {
-            started_by: settings.user_id || settings.user_code || "USER-AUTO",
-          });
-          console.log(`✅ Successfully started task ${taskTitleToStart}`);
-        } catch (startError: any) {
-          // Handle "already started" error gracefully
-          const errorMessage =
-            startError.message || startError.toString() || "";
-          if (
-            errorMessage.includes("INVALID_STATUS") ||
-            errorMessage.includes("Cannot start") ||
-            errorMessage.includes("status: In Progress") ||
-            errorMessage.includes("status: Started")
-          ) {
-            console.log(
-              `ℹ️ Task ${taskTitleToStart} is already started/in progress - no action needed`
-            );
-          } else {
-            throw startError; // Re-throw other errors
-          }
-        }
-      }
-    } catch (error: any) {
-      const errorMessage = error.message || error.toString() || "";
-      if (
-        errorMessage.includes("INVALID_STATUS") ||
-        errorMessage.includes("Cannot start") ||
-        errorMessage.includes("status: In Progress") ||
-        errorMessage.includes("status: Started")
-      ) {
-        console.log(
-          `ℹ️ Task ${taskTitleToStart} is already started/in progress - no action needed`
-        );
-      } else {
-        console.warn(
-          `⚠️ Failed to start task ${taskTitleToStart}:`,
-          error.message
-        );
-        console.warn(`⚠️ Task will be started during sync or when submitting`);
-      }
-    }
-  };
-
   const loadSessionWithCartonId = async (cartonIdToFilter?: string | null) => {
     if (!sessionId) {
       console.log("⚠️ loadSessionWithCartonId: sessionId is missing");
@@ -447,10 +454,35 @@ export default function CycleCountBinCountingScreen() {
 
       console.log(`✅ loadSession: Loaded ${lines.length} count lines`);
 
+      const itemCodes = Array.from(
+        new Set(lines.map((line) => line.item_code).filter(Boolean))
+      );
+      const itemNameByCode = new Map<string, string>();
+      if (itemCodes.length > 0) {
+        const placeholders = itemCodes.map(() => "?").join(",");
+        const itemMasters = await db.getAllAsync<{
+          item_code: string;
+          item_name: string | null;
+        }>(
+          `SELECT item_code, item_name FROM item_master WHERE item_code IN (${placeholders})`,
+          itemCodes
+        );
+        itemMasters.forEach((item) => {
+          if (item.item_name) {
+            itemNameByCode.set(item.item_code, item.item_name);
+          }
+        });
+      }
+
+      const linesWithNames = lines.map((line) => ({
+        ...line,
+        item_name: line.item_name || itemNameByCode.get(line.item_code) || undefined,
+      }));
+
       // ✅ FIX: Show ALL items (both scanned and expected) in the UI
       // Expected items with counted_qty = 0 should be displayed with their expected_qty
       // Note: expected_qty is preserved even when carton_id is set (backend stock ledger is bin-level)
-      const allLines = lines
+      const allLines = linesWithNames
         // Sort: Most recently scanned/updated items first (by updated_at DESC)
         .sort((a, b) => {
           // Sort by updated_at descending (most recent first)
@@ -497,546 +529,208 @@ export default function CycleCountBinCountingScreen() {
     await loadSessionWithCartonId();
   };
 
-  const loadExpectedItems = async (taskTitleParam?: string | null) => {
-    // Use provided taskTitle or fall back to state
-    const effectiveTaskTitle =
-      taskTitleParam !== undefined ? taskTitleParam : taskTitle;
-
-    // ✅ NEW: Only load expected items AFTER carton ID is scanned
-    // Items should be filtered by carton_id
+  const loadExpectedItems = async (_taskTitleParam?: string | null) => {
     if (!binCode || isBlindCount || !sessionId || !cartonId) {
-      if (!cartonId) {
-        console.log(
-          `⏭️ loadExpectedItems: Skipping - carton ID not scanned yet. Items will be loaded after carton ID is scanned.`
-        );
-      } else {
-        console.log(
-          `⏭️ loadExpectedItems: Skipping (binCode: ${binCode}, isBlindCount: ${isBlindCount}, sessionId: ${sessionId})`
-        );
-      }
+      return;
+    }
+
+    if (isAdhocAddMode(countMode)) {
+      console.log(
+        `⏭️ loadExpectedItems: Adhoc Add mode — expected qty resolved per scan (new carton → 0)`
+      );
       return;
     }
 
     console.log(
-      `🔄 loadExpectedItems: Loading items for carton ${cartonId} in bin ${binCode}, session ${sessionId}`
+      `🔄 loadExpectedItems: Reconciliation — loading local carton stock for ${cartonId} @ ${binCode}`
     );
     setLoading(true);
     try {
       const db = await getDatabase();
-
-      // CRITICAL: Check database directly, not state (state might be stale)
       const existingLinesInDb = await db.getAllAsync<{
         item_code: string;
         counted_qty: number;
       }>(
-        "SELECT item_code, counted_qty FROM cycle_count_lines WHERE session_id = ?",
-        [sessionId]
+        "SELECT item_code, counted_qty FROM cycle_count_lines WHERE session_id = ? AND carton_id = ?",
+        [sessionId, cartonId]
       );
 
-      console.log(
-        `📋 loadExpectedItems: Found ${existingLinesInDb.length} existing lines in database`
-      );
-      console.log(
-        `📋 loadExpectedItems: Existing lines:`,
-        existingLinesInDb.map((l) => ({
-          item_code: l.item_code,
-          counted_qty: l.counted_qty,
-        }))
-      );
-
-      // If session already has lines (especially with counted_qty > 0), don't load expected items
-      // This prevents overwriting scanned data
-      if (existingLinesInDb.length > 0) {
-        const hasScannedItems = existingLinesInDb.some(
-          (l) => l.counted_qty > 0
-        );
-        if (hasScannedItems) {
-          console.log(
-            `✅ loadExpectedItems: Session has scanned items, skipping expected items load to preserve data`
-          );
-          return;
-        }
+      if (existingLinesInDb.some((l) => l.counted_qty > 0)) {
         console.log(
-          `⚠️ loadExpectedItems: Session has lines but no scanned items, will only add missing expected items`
+          `✅ loadExpectedItems: Session has scanned items — preserving counts`
         );
-      }
-
-      // ✅ NEW: Priority 1: Try to load expected items from backend task lines first
-      // This allows scanning the same bin/carton again and getting expected items from previous task
-      let expectedItems: { item_code: string; qty: number }[] = [];
-      let loadedFromBackend = false;
-
-      // First, try to load from current task title if available
-      if (effectiveTaskTitle) {
-        try {
-          console.log(
-            `🔍 loadExpectedItems: Fetching task lines from backend for task ${effectiveTaskTitle}...`
-          );
-          const taskResponse = await apiService.getCycleCount(
-            effectiveTaskTitle
-          );
-          const taskData = taskResponse?.data || taskResponse;
-          const taskLines = taskData?.lines || taskData?.items || [];
-
-          if (taskLines && taskLines.length > 0) {
-            console.log(
-              `✅ loadExpectedItems: Found ${taskLines.length} task lines from backend task ${effectiveTaskTitle}`
-            );
-            // ✅ NEW: Filter task lines by carton_id to only show items in this carton
-            const cartonFilteredLines = taskLines.filter((line: any) => {
-              const lineCartonId = (line.carton_id || "").trim();
-              const currentCartonId = (cartonId || "").trim();
-              return (
-                !lineCartonId ||
-                lineCartonId === currentCartonId ||
-                lineCartonId === ""
-              );
-            });
-
-            expectedItems = cartonFilteredLines
-              .filter(
-                (line: any) =>
-                  line.item_code &&
-                  (line.expected_qty || line.expected_qty === 0)
-              )
-              .map((line: any) => ({
-                item_code: line.item_code,
-                qty: line.expected_qty || 0,
-              }));
-            loadedFromBackend = true;
-            console.log(
-              `✅ loadExpectedItems: Loaded ${expectedItems.length} expected items from backend task lines (filtered by carton ${cartonId})`
-            );
-          } else {
-            console.log(
-              `ℹ️ loadExpectedItems: Backend task ${effectiveTaskTitle} has no task lines, will try to find other tasks for this bin`
-            );
-          }
-        } catch (backendError: any) {
-          console.warn(
-            `⚠️ loadExpectedItems: Failed to fetch task lines from backend task ${effectiveTaskTitle}:`,
-            backendError.message
-          );
-          console.log(
-            `ℹ️ loadExpectedItems: Will try to find other tasks for this bin`
-          );
-        }
-      } else {
-        console.log(
-          `ℹ️ loadExpectedItems: No taskTitle available, will search for backend tasks for bin ${binCode}`
-        );
-      }
-
-      // ✅ NEW: If current task has no lines, check for other backend tasks for this bin
-      // This allows loading expected items from a previous task for the same bin
-      if (!loadedFromBackend && binCode) {
-        try {
-          const online = await isDeviceOnline();
-          if (online) {
-            console.log(
-              `🔍 loadExpectedItems: Searching for backend tasks for bin ${binCode}...`
-            );
-            const tasksResponse = await apiService.getCycleCounts({
-              status: "Draft,In Progress,Review,Completed,Submitted",
-            });
-            const tasksArray = Array.isArray(tasksResponse)
-              ? tasksResponse
-              : tasksResponse?.data || tasksResponse?.cycle_counts || [];
-
-            // Normalize bin codes for comparison
-            const normalizeBinCode = (
-              code: string | null | undefined
-            ): string => {
-              if (!code) return "";
-              return String(code)
-                .trim()
-                .toUpperCase()
-                .replace(/\s+/g, "")
-                .replace(/--+/g, "-");
-            };
-
-            const binCodeNormalized = normalizeBinCode(binCode);
-
-            // Find tasks for this bin (can be multiple - use the most recent or active one)
-            const matchingTasks = tasksArray.filter((t: any) => {
-              const taskBinCode = normalizeBinCode(
-                t.bin_code || t.bin_location || t.bin_id
-              );
-              return taskBinCode && taskBinCode === binCodeNormalized;
-            });
-
-            if (matchingTasks.length > 0) {
-              // Sort by updated_on or created_on (most recent first)
-              matchingTasks.sort((a: any, b: any) => {
-                const dateA = new Date(
-                  a.updated_on || a.created_on || 0
-                ).getTime();
-                const dateB = new Date(
-                  b.updated_on || b.created_on || 0
-                ).getTime();
-                return dateB - dateA;
-              });
-
-              // Try each task until we find one with task lines
-              for (const task of matchingTasks) {
-                if (!task.title) continue;
-
-                try {
-                  console.log(
-                    `🔍 loadExpectedItems: Fetching task lines from backend task ${task.title} for bin ${binCode}...`
-                  );
-                  const taskResponse = await apiService.getCycleCount(
-                    task.title
-                  );
-                  const taskData = taskResponse?.data || taskResponse;
-                  const taskLines = taskData?.lines || taskData?.items || [];
-
-                  if (taskLines && taskLines.length > 0) {
-                    console.log(
-                      `✅ loadExpectedItems: Found ${taskLines.length} task lines from previous backend task ${task.title}`
-                    );
-                    expectedItems = taskLines
-                      .filter(
-                        (line: any) =>
-                          line.item_code &&
-                          (line.expected_qty || line.expected_qty === 0)
-                      )
-                      .map((line: any) => ({
-                        item_code: line.item_code,
-                        qty: line.expected_qty || 0,
-                      }));
-                    loadedFromBackend = true;
-
-                    // Save this task title to session for future use
-                    await db.runAsync(
-                      "UPDATE cycle_count_sessions SET server_session_id = ?, updated_at = ? WHERE session_id = ?",
-                      [task.title, new Date().toISOString(), sessionId]
-                    );
-                    setTaskTitle(task.title);
-
-                    console.log(
-                      `✅ loadExpectedItems: Loaded ${expectedItems.length} expected items from previous backend task ${task.title}`
-                    );
-                    break; // Found task lines, stop searching
-                  }
-                } catch (taskError: any) {
-                  console.warn(
-                    `⚠️ loadExpectedItems: Failed to fetch task lines from task ${task.title}:`,
-                    taskError.message
-                  );
-                  continue; // Try next task
-                }
-              }
-
-              if (!loadedFromBackend) {
-                console.log(
-                  `ℹ️ loadExpectedItems: Found ${matchingTasks.length} backend task(s) for bin ${binCode} but none have task lines`
-                );
-              }
-            } else {
-              console.log(
-                `ℹ️ loadExpectedItems: No backend tasks found for bin ${binCode}`
-              );
-            }
-          } else {
-            console.log(
-              `ℹ️ loadExpectedItems: Device is offline, cannot search backend tasks`
-            );
-          }
-        } catch (searchError: any) {
-          console.warn(
-            `⚠️ loadExpectedItems: Failed to search backend tasks for bin ${binCode}:`,
-            searchError.message
-          );
-        }
-      }
-
-      // ✅ Priority 2: Fetch from backend stock ledger API
-      // Note: Skip stock ledger for carton-level counting because:
-      // - Stock ledger is bin-level (tracks items already in the bin)
-      // - New cartons don't have items in stock ledger yet
-      // - Showing bin-level expected items for a new carton is misleading
-      // Only load stock ledger for bin-level counting (no carton_id)
-      if (!loadedFromBackend || expectedItems.length === 0) {
-        if (cartonId) {
-          // Carton-level counting: Skip stock ledger (new carton doesn't have items in stock ledger yet)
-          console.log(
-            `⏭️ loadExpectedItems: Skipping stock ledger for carton ${cartonId} - new cartons don't have items in stock ledger yet`
-          );
-          console.log(
-            `ℹ️ loadExpectedItems: For new cartons, expected items will only come from already scanned items in this session`
-          );
-        } else {
-          // Bin-level counting: Load stock ledger (bin already has items)
-          try {
-            const online = await isDeviceOnline();
-            if (online) {
-              console.log(
-                `📦 loadExpectedItems: Fetching bin-level items from backend stock ledger for bin ${binCode}...`
-              );
-
-              try {
-                // Query bin-level items (backend stock ledger is bin-level)
-                const stockResponse = await apiService.getStockLedgerByLocation(
-                  {
-                    bin_location: binCode,
-                  }
-                );
-
-                const stockItems =
-                  stockResponse?.data ||
-                  stockResponse?.items ||
-                  stockResponse ||
-                  [];
-                console.log(
-                  `📦 loadExpectedItems: Backend Stock Ledger API Response:`,
-                  {
-                    responseType: Array.isArray(stockItems)
-                      ? "array"
-                      : typeof stockItems,
-                    isArray: Array.isArray(stockItems),
-                    itemCount: Array.isArray(stockItems)
-                      ? stockItems.length
-                      : 0,
-                    rawResponse: JSON.stringify(stockResponse).substring(
-                      0,
-                      500
-                    ), // First 500 chars for debugging
-                    firstItem:
-                      Array.isArray(stockItems) && stockItems.length > 0
-                        ? stockItems[0]
-                        : null,
-                  }
-                );
-
-                if (
-                  stockItems &&
-                  Array.isArray(stockItems) &&
-                  stockItems.length > 0
-                ) {
-                  console.log(
-                    `✅ loadExpectedItems: Found ${stockItems.length} items from backend stock ledger for bin ${binCode}`
-                  );
-                  expectedItems = stockItems.map((item: any) => ({
-                    item_code: item.item_code,
-                    qty: item.qty || item.expected_qty || 0,
-                  }));
-                  loadedFromBackend = true;
-                  console.log(
-                    `✅ loadExpectedItems: Processed ${expectedItems.length} expected items:`,
-                    expectedItems.map((i) => `${i.item_code}: ${i.qty}`)
-                  );
-                } else {
-                  console.warn(
-                    `⚠️ loadExpectedItems: Backend returned empty array or invalid format`
-                  );
-                  console.warn(
-                    `⚠️ loadExpectedItems: Raw response:`,
-                    JSON.stringify(stockResponse)
-                  );
-                }
-              } catch (stockError: any) {
-                console.error(
-                  `❌ loadExpectedItems: Failed to fetch from backend stock ledger:`,
-                  stockError.message
-                );
-                console.error(
-                  `❌ loadExpectedItems: Error details:`,
-                  stockError
-                );
-              }
-            } else {
-              console.log(
-                `ℹ️ loadExpectedItems: Device is offline, cannot fetch from backend stock ledger`
-              );
-            }
-          } catch (stockError: any) {
-            console.error(
-              `❌ loadExpectedItems: Error fetching from backend stock ledger:`,
-              stockError.message
-            );
-            console.error(`❌ loadExpectedItems: Error details:`, stockError);
-          }
-        }
-      }
-
-      // ✅ Priority 3: Fallback to stock ledger cache if backend API fails (bin-level only, no carton_id support)
-      // Note: stock_ledger_cache doesn't have carton_id column, so we can only use it for bin-level items
-      // For carton-level counting, we must use backend API which supports carton_id filtering
-      if (!loadedFromBackend || expectedItems.length === 0) {
-        if (cartonId) {
-          // Carton-level counting: stock_ledger_cache doesn't support carton_id, so skip it
-          console.log(
-            `⏭️ loadExpectedItems: Skipping stock_ledger_cache - carton-level counting requires backend API (carton_id: ${cartonId})`
-          );
-          console.log(
-            `ℹ️ loadExpectedItems: For carton-level items, backend stock ledger API must be available with carton_id filter`
-          );
-        } else {
-          // Bin-level counting: use stock_ledger_cache
-          console.log(
-            `📦 loadExpectedItems: Loading expected items from stock ledger cache for bin ${binCode}...`
-          );
-          const stockLedgerItems = await db.getAllAsync<{
-            item_code: string;
-            qty: number;
-          }>(
-            "SELECT item_code, qty FROM stock_ledger_cache WHERE bin_location = ?",
-            [binCode]
-          );
-
-          if (stockLedgerItems && stockLedgerItems.length > 0) {
-            expectedItems = stockLedgerItems.map((item) => ({
-              item_code: item.item_code,
-              qty: item.qty,
-            }));
-            console.log(
-              `✅ loadExpectedItems: Found ${expectedItems.length} expected items in stock ledger cache for bin ${binCode}`
-            );
-          } else {
-            console.warn(
-              `⚠️ loadExpectedItems: No expected items found in stock ledger cache for bin ${binCode}.`
-            );
-          }
-        }
-      }
-
-      // If no items found from both sources, log warning
-      if (expectedItems.length === 0) {
-        console.warn(
-          `⚠️ loadExpectedItems: No expected items found for bin ${binCode} from backend task or stock ledger cache.`
-        );
-        if (taskTitle) {
-          console.warn(
-            `⚠️ Backend task ${taskTitle} may not have task lines yet. Items will be created as you scan them.`
-          );
-        } else {
-          console.warn(
-            `⚠️ Please sync stock ledger data from backend or ensure backend task has task lines.`
-          );
-        }
         return;
       }
 
-      // Get existing item codes from DATABASE (not state)
+      const warehouseCode = getWarehouseCode();
+      let expectedItems = await listLocalStockForCarton(
+        warehouseCode,
+        binCode,
+        cartonId
+      );
+
+      if (expectedItems.length === 0 && scanOnlineEnabled) {
+        try {
+          const stockResponse = await apiService.getStockLedgerByLocation({
+            bin_location: binCode,
+            warehouse: warehouseCode || undefined,
+            carton_id: cartonId,
+          });
+          const stockItems =
+            stockResponse?.data || stockResponse?.items || stockResponse || [];
+          const stockArray = Array.isArray(stockItems) ? stockItems : [stockItems];
+          expectedItems = stockArray
+            .filter((entry: any) => {
+              const entryCarton = String(
+                entry?.carton_id || entry?.carton || ""
+              ).trim();
+              return entryCarton === String(cartonId).trim();
+            })
+            .map((entry: any) => ({
+              item_code: String(entry.item_code || "").trim(),
+              qty: Number(
+                entry.qty ?? entry.actual_qty ?? entry.current_qty ?? 0
+              ),
+            }))
+            .filter((item) => item.item_code);
+        } catch (error: any) {
+          console.warn(
+            `⚠️ loadExpectedItems: online carton stock lookup failed:`,
+            error.message
+          );
+        }
+      }
+
+      if (expectedItems.length === 0) {
+        console.log(
+          `ℹ️ loadExpectedItems: No local stock rows for carton ${cartonId}`
+        );
+        return;
+      }
+
       const existingItemCodes = new Set(
         existingLinesInDb.map((l) => l.item_code)
       );
-      console.log(
-        `📋 loadExpectedItems: Existing item codes:`,
-        Array.from(existingItemCodes)
-      );
+      const now = new Date().toISOString();
 
-      // Only create lines for items that don't exist in the database
-      const newLines: CountLine[] = expectedItems
-        .filter((item) => {
-          const exists = existingItemCodes.has(item.item_code);
-          if (exists) {
-            console.log(
-              `⏭️ loadExpectedItems: Skipping ${item.item_code} - already exists in database`
-            );
-          }
-          return !exists;
-        })
-        .map((item) => ({
-          line_id: generateUUID(),
-          item_code: item.item_code,
-          barcode: "",
-          carton_id: cartonId || null, // ✅ NEW: Include carton_id when loading expected items
-          uom: "EA",
-          expected_qty: item.qty,
-          counted_qty: 0,
-          variance_qty: null,
-          is_unexpected_item: false,
-        }));
-
-      console.log(
-        `➕ loadExpectedItems: Will add ${newLines.length} new expected items`
-      );
-
-      if (newLines.length > 0) {
-        // Save new lines to database
-        for (const line of newLines) {
-          console.log(
-            `💾 loadExpectedItems: Inserting line for ${line.item_code}, expected: ${line.expected_qty}`
-          );
-          await db.runAsync(
-            `INSERT INTO cycle_count_lines (
-              line_id, session_id, item_code, barcode, carton_id, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              line.line_id,
-              sessionId,
-              line.item_code,
-              line.barcode,
-              line.carton_id || null, // ✅ NEW: Include carton_id (can be null for bin-level mode)
-              line.uom,
-              line.expected_qty,
-              line.counted_qty,
-              line.is_unexpected_item ? 1 : 0,
-              new Date().toISOString(),
-              new Date().toISOString(),
-            ]
-          );
-        }
-        console.log(
-          `✅ loadExpectedItems: Added ${newLines.length} expected items, reloading session`
+      for (const item of expectedItems) {
+        if (existingItemCodes.has(item.item_code)) continue;
+        await db.runAsync(
+          `INSERT INTO cycle_count_lines (
+            line_id, session_id, item_code, barcode, carton_id, uom, expected_qty, counted_qty, is_unexpected_item, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            generateUUID(),
+            sessionId,
+            item.item_code,
+            "",
+            cartonId,
+            "EA",
+            item.qty,
+            0,
+            0,
+            now,
+            now,
+          ]
         );
-        await loadSession();
-      } else {
-        console.log(`✅ loadExpectedItems: No new items to add`);
       }
+
+      await loadSession();
     } catch (error: any) {
-      console.error(
-        "❌ loadExpectedItems: Error loading expected items:",
-        error
-      );
+      console.error("❌ loadExpectedItems:", error);
     } finally {
       setLoading(false);
     }
   };
 
-  // ✅ NEW: Handle carton ID scan/input
+  // ✅ NEW: Handle carton ID scan/input — any ID is allowed (WMS new carton, ERP may not know it yet)
   const handleCartonIdScan = async (
     scannedCartonId: string
   ): Promise<boolean> => {
-    const trimmedCartonId = scannedCartonId.trim().toUpperCase();
+    const trimmedCartonId = normalizeCartonId(scannedCartonId);
     if (!trimmedCartonId) {
       return false;
     }
-    console.log(`📦 Carton ID scanned: ${trimmedCartonId}`);
+    if (
+      erpLockedCartonId &&
+      normalizeCartonId(erpLockedCartonId) !== trimmedCartonId
+    ) {
+      alertCartonChangeBlocked();
+      return false;
+    }
+    console.log(`📦 Carton ID scanned/created: ${trimmedCartonId}`);
+    skipCartonRestoreRef.current = false;
     setCartonId(trimmedCartonId);
     setCartonIdInput("");
 
-    // ✅ NEW: Start the task immediately after carton ID validation (before scanning items)
-    // This ensures the task status is "Started/In Progress" before any items are counted
-    // Only starts if task is in "Draft" status - if already "In Progress", skips starting
-    if (taskTitle) {
-      await ensureTaskStarted(taskTitle);
-    } else {
+    if (sessionId && binCode && !isBlindCount) {
+      await loadSessionWithCartonId(trimmedCartonId);
+      await loadExpectedItems(taskTitle);
+    } else if (sessionId) {
+      await loadSessionWithCartonId(trimmedCartonId);
+    }
+
+    const warehouseCode = getWarehouseCode();
+    const existingStock = await listLocalStockForCarton(
+      warehouseCode,
+      binCode,
+      trimmedCartonId
+    );
+    if (existingStock.length === 0) {
       console.log(
-        `ℹ️ No task title found - task will be started when backend task is created`
+        `ℹ️ New WMS carton ${trimmedCartonId} — no local stock rows (expected qty 0 per item)`
       );
     }
 
-    // ✅ NEW: Load expected items for this carton after carton ID is set
-    if (sessionId && binCode && !isBlindCount) {
-      console.log(`🔄 Loading expected items for carton ${trimmedCartonId}...`);
-      // Load session first to get items for this carton
-      await loadSessionWithCartonId(trimmedCartonId);
-      // Then load expected items from backend/stock ledger
-      await loadExpectedItems(taskTitle);
-    }
-
-    // Focus item barcode input after carton ID is set
     setTimeout(() => {
       barcodeInputRef.current?.focus();
     }, 100);
     return true;
   };
 
+  const promptUseAsCartonId = (value: string) => {
+    const normalized = normalizeCartonId(value);
+    if (
+      erpLockedCartonId &&
+      normalizeCartonId(erpLockedCartonId) !== normalized
+    ) {
+      alertCartonChangeBlocked();
+      return;
+    }
+    Alert.alert(
+      "Use as Carton ID?",
+      `"${normalized}" is not an item barcode.\n\nUse it as a carton ID for this bin? New or WMS-only cartons start with expected qty 0 per item until stock is synced.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Use as Carton",
+          onPress: () => {
+            void handleCartonIdScan(normalized);
+          },
+        },
+      ]
+    );
+  };
+
+  const handleCreateNewCarton = () => {
+    if (isCartonLocked) {
+      alertCartonChangeBlocked();
+      return;
+    }
+    skipCartonRestoreRef.current = true;
+    setCartonId(null);
+    setCartonIdInput("");
+    setTimeout(() => {
+      cartonIdInputRef.current?.focus();
+    }, 150);
+  };
+
   const handleChangeCartonId = () => {
-    // ✅ Clear the current carton ID to show the carton ID input card
+    if (isCartonLocked) {
+      alertCartonChangeBlocked();
+      return;
+    }
+    // Clear the current carton ID to show the carton ID input card
     // This allows the user to type, scan, or generate a new carton ID
     // Set flag to prevent useFocusEffect from restoring carton ID from database
     skipCartonRestoreRef.current = true;
@@ -1047,6 +741,11 @@ export default function CycleCountBinCountingScreen() {
     setTimeout(() => {
       cartonIdInputRef.current?.focus();
     }, 200);
+  };
+
+  const handleScanModeChange = (online: boolean) => {
+    if (scanOnlineEnabled === online) return;
+    setScanOnlineEnabled(online);
   };
 
   // ✅ NEW: Generate carton ID locally
@@ -1110,18 +809,36 @@ export default function CycleCountBinCountingScreen() {
 
     setShowScanner(false);
 
+    const scannedBarcode = barcode.trim();
+    if (!scannedBarcode) {
+      return false;
+    }
+
+    if (looksLikeCartonId(scannedBarcode)) {
+      promptUseAsCartonId(scannedBarcode);
+      return false;
+    }
+
     try {
       const db = await getDatabase();
 
-      // ✅ Priority 1: Search local database first (item_master, item_barcode_map)
-      // ✅ Priority 2: If not found locally, search from backend API
-      console.log(`🔍 Searching for item: barcode="${barcode}"`);
-      const item = await resolveItemFromBarcode(barcode);
+      console.log(
+        `🔍 Searching for item: barcode="${scannedBarcode}", scanOnline=${scanOnlineEnabled ? "true" : "false"}`
+      );
+      const item = scanOnlineEnabled
+        ? await resolveItemFromOnlineScan(scannedBarcode)
+        : await resolveItemFromBarcode(scannedBarcode);
 
       if (!item) {
+        if (looksLikeCartonId(scannedBarcode)) {
+          promptUseAsCartonId(scannedBarcode);
+          return false;
+        }
         Alert.alert(
           "Item Not Found",
-          `Barcode "${barcode}" not found in system`
+          scanOnlineEnabled
+            ? `Barcode "${scannedBarcode}" was not returned by backend online lookup.\n\nIf this is a new carton ID, tap Change Carton and enter it there — or scan a valid item barcode.`
+            : `Barcode "${scannedBarcode}" not found in system`
         );
         // Refocus input even on error
         setTimeout(() => {
@@ -1138,7 +855,7 @@ export default function CycleCountBinCountingScreen() {
         barcode_type: string;
       }>(
         "SELECT item_code, uom, pack_size, barcode_type FROM item_barcode_map WHERE barcode = ? OR item_code = ?",
-        [barcode, item.item_code]
+        [scannedBarcode, item.item_code]
       );
 
       // Use barcode_map data if available (has pack_size and UOM), otherwise use defaults
@@ -1152,7 +869,7 @@ export default function CycleCountBinCountingScreen() {
           await db.runAsync(
             "INSERT OR REPLACE INTO item_barcode_map (barcode, item_code, uom, pack_size, barcode_type, updated_on) VALUES (?, ?, ?, ?, ?, ?)",
             [
-              barcode,
+              scannedBarcode,
               itemCode,
               uom,
               increment,
@@ -1161,7 +878,7 @@ export default function CycleCountBinCountingScreen() {
             ]
           );
           console.log(
-            `💾 Created barcode map entry: barcode="${barcode}", item_code="${itemCode}"`
+            `💾 Created barcode map entry: barcode="${scannedBarcode}", item_code="${itemCode}"`
           );
         } catch (cacheError: any) {
           console.warn(
@@ -1172,9 +889,9 @@ export default function CycleCountBinCountingScreen() {
       }
 
       console.log(
-        `✅ Item resolved: item_code="${itemCode}", barcode="${barcode}", uom="${uom}", increment=${increment}`
+        `✅ Item resolved: item_code="${itemCode}", barcode="${scannedBarcode}", uom="${uom}", increment=${increment}`
       );
-      await addOrIncrementItem(itemCode, barcode, uom, increment);
+      await addOrIncrementItem(itemCode, scannedBarcode, uom, increment);
 
       // Vibrate on success
       Vibration.vibrate(50);
@@ -1182,7 +899,15 @@ export default function CycleCountBinCountingScreen() {
       return true;
     } catch (error: any) {
       console.error("Error processing scan:", error);
-      Alert.alert("Error", `Failed to process scan: ${error.message}`);
+      const message = error.message || "Failed to process scan";
+      if (looksLikeCartonId(scannedBarcode)) {
+        promptUseAsCartonId(scannedBarcode);
+        return false;
+      }
+      Alert.alert(
+        scanOnlineEnabled ? "Online Lookup Failed" : "Error",
+        message
+      );
       Vibration.vibrate([100, 50, 100]); // Error pattern
 
       // Refocus even on error
@@ -1244,6 +969,13 @@ export default function CycleCountBinCountingScreen() {
       if (existingLine) {
         // Increment existing line (carton_id already matches due to query filter)
         const newQty = existingLine.counted_qty + increment;
+        const expectedQty =
+          existingLine.expected_qty !== null &&
+          existingLine.expected_qty !== undefined
+            ? existingLine.expected_qty
+            : isBlindCount
+            ? null
+            : await getExpectedQty(itemCode);
         console.log(
           `📝 Updating existing line ${existingLine.line_id}: ${
             existingLine.counted_qty
@@ -1254,11 +986,11 @@ export default function CycleCountBinCountingScreen() {
 
         // Update existing line quantity and ensure carton_id is set (in case it was null before)
         const updateQuery = cartonId
-          ? "UPDATE cycle_count_lines SET counted_qty = ?, carton_id = ?, updated_at = ? WHERE line_id = ?"
-          : "UPDATE cycle_count_lines SET counted_qty = ?, updated_at = ? WHERE line_id = ?";
+          ? "UPDATE cycle_count_lines SET counted_qty = ?, expected_qty = COALESCE(expected_qty, ?), carton_id = ?, updated_at = ? WHERE line_id = ?"
+          : "UPDATE cycle_count_lines SET counted_qty = ?, expected_qty = COALESCE(expected_qty, ?), updated_at = ? WHERE line_id = ?";
         const updateParams = cartonId
-          ? [newQty, cartonId, now, existingLine.line_id]
-          : [newQty, now, existingLine.line_id];
+          ? [newQty, expectedQty, cartonId, now, existingLine.line_id]
+          : [newQty, expectedQty, now, existingLine.line_id];
 
         const result = await db.runAsync(updateQuery, updateParams);
         console.log(
@@ -1310,45 +1042,8 @@ export default function CycleCountBinCountingScreen() {
       // Reload session to refresh UI
       await loadSession();
       console.log(`✅ Item saved successfully: ${itemCode}`);
-
-      // Real-time sync: If device is online, sync only the current item immediately (non-blocking)
-      isDeviceOnline()
-        .then(async (online) => {
-          if (online) {
-            console.log(
-              `🔄 Device is online - syncing item ${itemCode} for session ${sessionId} immediately...`
-            );
-            try {
-              const syncSuccess = await syncCycleCountSession(
-                sessionId,
-                itemCode
-              );
-              if (syncSuccess) {
-                console.log(
-                  `✅ Real-time sync successful for item ${itemCode} in session ${sessionId}`
-                );
-              } else {
-                console.warn(
-                  `⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`
-                );
-              }
-            } catch (syncError: any) {
-              console.warn(
-                `⚠️ Real-time sync failed for item ${itemCode}:`,
-                syncError.message
-              );
-              // Don't show error to user - sync will retry later
-            }
-          } else {
-            console.log(
-              `ℹ️ Device is offline - item ${itemCode} will sync when online`
-            );
-          }
-        })
-        .catch((error) => {
-          console.warn(`⚠️ Error checking network status:`, error);
-          // Continue without sync - will retry later
-        });
+      focusActiveBarcodeInput(100);
+      focusActiveBarcodeInput(400);
     } catch (error: any) {
       console.error("❌ Error in addOrIncrementItem:", error);
       console.error("❌ Error stack:", error.stack);
@@ -1360,88 +1055,69 @@ export default function CycleCountBinCountingScreen() {
     }
   };
 
+  const getWarehouseCode = () =>
+    String(binInfo?.warehouse_id || binInfo?.warehouse || "").trim();
+
   const getExpectedQty = async (itemCode: string): Promise<number | null> => {
-    // ✅ FIX: Show expected qty even when carton_id is set
-    // Backend stock ledger is bin-level, so expected_qty applies regardless of carton_id
-    // carton_id is only for tracking which carton was counted, not for filtering expected quantities
+    if (isBlindCount) return null;
+    if (!binCode) return 0;
 
-    try {
-      const db = await getDatabase();
-
-      // Priority 1: Check if we already have expected_qty in cycle_count_lines for this item
-      if (sessionId) {
-        const existingLine = await db.getFirstAsync<{
-          expected_qty: number | null;
-        }>(
-          "SELECT expected_qty FROM cycle_count_lines WHERE session_id = ? AND item_code = ? LIMIT 1",
-          [sessionId, itemCode]
-        );
-
-        if (
-          existingLine &&
-          existingLine.expected_qty !== null &&
-          existingLine.expected_qty !== undefined
-        ) {
-          console.log(
-            `✅ getExpectedQty: Found expected_qty from cycle_count_lines for ${itemCode}: ${existingLine.expected_qty}`
-          );
-          return existingLine.expected_qty;
-        }
-      }
-
-      // Priority 2: Fallback to stock_ledger_cache
-      let stock = await db.getFirstAsync<{ qty: number }>(
-        "SELECT qty FROM stock_ledger_cache WHERE item_code = ? AND bin_location = ?",
-        [itemCode, binCode]
-      );
-
-      // If not found, use mock data
-      if (!stock) {
-        const mockStockData: Record<string, Record<string, number>> = {
-          "BIN-A1-01": {
-            "SKU-HAT-301-BLU-OS": 25,
-            "SKU-HAT-301-GRN-OS": 30,
-            "SKU-HAT-301-RED-OS": 20,
-          },
-          "BIN-A1-02": {
-            "SKU-JACKET-201-BLK-L": 15,
-            "SKU-JACKET-201-BLK-M": 18,
-            "SKU-JACKET-201-BLK-XL": 12,
-          },
-          "BIN-B2-01": {
-            "SKU-JEANS-001-BLK-32": 40,
-          },
-        };
-
-        const binStock = mockStockData[binCode.toUpperCase()];
-        if (binStock && binStock[itemCode]) {
-          stock = { qty: binStock[itemCode] };
-          // Save to cache
-          await db.runAsync(
-            `INSERT OR REPLACE INTO stock_ledger_cache (
-              item_code, warehouse, bin_location, qty, reserved_qty, updated_on
-            ) VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-              itemCode,
-              "WH-MAIN",
-              binCode,
-              stock.qty,
-              0,
-              new Date().toISOString(),
-            ]
-          );
-        }
-      }
-
-      return stock?.qty || null;
-    } catch {
-      return null;
-    }
+    const qty = await getExpectedQtyForCarton(
+      {
+        warehouse: getWarehouseCode(),
+        item_code: itemCode,
+        bin_location: binCode,
+        carton_id: cartonId,
+      },
+      { fetchOnline: scanOnlineEnabled }
+    );
+    return qty;
   };
 
   const handleEditQty = (lineId: string, currentQty: number) => {
+    barcodeInputRef.current?.blur();
+    cartonIdInputRef.current?.blur();
+    Keyboard.dismiss();
     setEditingLineId(lineId);
     setEditQty(currentQty.toString());
+    setTimeout(() => {
+      listRef.current?.scrollToEnd({ animated: true });
+    }, 150);
+  };
+
+  const handleClearLineQty = (lineId: string, itemCode: string, currentQty: number) => {
+    if (currentQty <= 0) return;
+    Alert.alert(
+      "Clear Count",
+      `Reset counted qty for ${itemCode} to 0?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Clear",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              const db = await getDatabase();
+              const now = new Date().toISOString();
+              await db.runAsync(
+                "UPDATE cycle_count_lines SET counted_qty = 0, updated_at = ? WHERE line_id = ?",
+                [now, lineId]
+              );
+              await db.runAsync(
+                "UPDATE cycle_count_sessions SET status = 'Draft', updated_at = ? WHERE session_id = ?",
+                [now, sessionId]
+              );
+              setEditingLineId(null);
+              setEditQty("");
+              await loadSession();
+              focusActiveBarcodeInput(100);
+            } catch (error: any) {
+              Alert.alert("Error", error.message || "Could not clear count");
+            }
+          },
+        },
+      ]
+    );
   };
 
   const handleSaveQty = async (lineId: string) => {
@@ -1484,45 +1160,8 @@ export default function CycleCountBinCountingScreen() {
       setEditingLineId(null);
       setEditQty("");
       await loadSession();
-
-      // Real-time sync: If device is online, sync only the edited item immediately (non-blocking)
-      isDeviceOnline()
-        .then(async (online) => {
-          if (online) {
-            console.log(
-              `🔄 Device is online - syncing item ${itemCode} for session ${sessionId} after quantity edit...`
-            );
-            try {
-              const syncSuccess = await syncCycleCountSession(
-                sessionId,
-                itemCode
-              );
-              if (syncSuccess) {
-                console.log(
-                  `✅ Real-time sync successful for item ${itemCode} in session ${sessionId} after edit`
-                );
-              } else {
-                console.warn(
-                  `⚠️ Real-time sync returned false for item ${itemCode} (will retry later)`
-                );
-              }
-            } catch (syncError: any) {
-              console.warn(
-                `⚠️ Real-time sync failed for item ${itemCode}:`,
-                syncError.message
-              );
-              // Don't show error to user - sync will retry later
-            }
-          } else {
-            console.log(
-              `ℹ️ Device is offline - item ${itemCode} will sync when online`
-            );
-          }
-        })
-        .catch((error) => {
-          console.warn(`⚠️ Error checking network status:`, error);
-          // Continue without sync - will retry later
-        });
+      focusActiveBarcodeInput(100);
+      focusActiveBarcodeInput(400);
     } catch (error: any) {
       Alert.alert("Error", `Failed to update quantity: ${error.message}`);
     }
@@ -1608,161 +1247,117 @@ export default function CycleCountBinCountingScreen() {
     }
   };
 
-  const handleSubmitBinCount = async () => {
-    // For now, submit directly without review screen
-    // TODO: Navigate to Review screen when implemented
+  const handlePushToErp = async () => {
+    if (!cartonId) {
+      Alert.alert("Carton Required", "Scan a carton ID before pushing to ERP.");
+      return;
+    }
+
+    const linesToPush = countLines.filter((l) => Number(l.counted_qty || 0) > 0);
+    if (linesToPush.length === 0) {
+      Alert.alert("No Counts", "Scan at least one item with a counted quantity.");
+      return;
+    }
+
+    const pushMessage = erpLockedCartonId
+      ? `Update ERP with ${linesToPush.length} line(s) for carton ${cartonId}?`
+      : `Send ${linesToPush.length} line(s) to ERP for carton ${cartonId} (${countModeToApiValue(countMode)})?\n\nAfter the first push, this carton will be locked for this task.`;
+
     Alert.alert(
-      "Submit Bin Count",
-      "This will submit the bin count. Continue?",
+      "Push to ERP",
+      pushMessage,
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: "Submit",
+          text: "Push",
           onPress: async () => {
             setSaving(true);
             try {
+              const online = await isDeviceOnline();
+              if (!online) {
+                Alert.alert("Offline", "Connect to the network to push counts to ERP.");
+                return;
+              }
+
+              const wh = await getCycleCountWarehouseContext(getWarehouseCode());
+              const postingDate = new Date().toISOString().split("T")[0];
+              const { counted_by: countedBy, device_id: deviceId } =
+                await getCycleCountPushIdentity();
+
               const db = await getDatabase();
+              const persistedLines = await db.getAllAsync<{
+                item_code: string;
+                carton_id: string | null;
+                counted_qty: number;
+              }>(
+                `SELECT item_code, carton_id, counted_qty FROM cycle_count_lines
+                 WHERE session_id = ? AND carton_id = ? AND counted_qty > 0`,
+                [sessionId, cartonId]
+              );
+              const linesForErp =
+                persistedLines.length > 0
+                  ? persistedLines
+                  : linesToPush.map((line) => ({
+                      item_code: line.item_code,
+                      carton_id: cartonId,
+                      counted_qty: Number(line.counted_qty),
+                    }));
 
-              // First, sync all counts to backend
+              const response = await apiService.syncCycleCountTaskCaptureOnly({
+                task: {
+                  external_ref: sessionId,
+                  count_mode: countModeToApiValue(countMode),
+                  company: wh.company,
+                  warehouse: wh.warehouse_name,
+                  warehouse_code: wh.warehouse_code,
+                  bin_location: binCode,
+                  posting_date: postingDate,
+                  status: "Completed",
+                  counted_by: countedBy,
+                  device_id: deviceId,
+                },
+                lines: linesForErp.map((line) => ({
+                  item_code: line.item_code,
+                  bin_location: binCode,
+                  carton_id: cartonId || line.carton_id || "",
+                  counted_qty: Number(line.counted_qty),
+                })),
+              });
+
+              const result = unwrapFrappeMessage(response);
               console.log(
-                `🔄 Syncing counts before submission for session ${sessionId}...`
+                "📥 ERP push audit:",
+                JSON.stringify({
+                  api_version: result?.api_version,
+                  device_id: result?.device_id,
+                  counted_by: result?.counted_by,
+                  audit_debug: result?.audit_debug,
+                })
               );
-              const syncSuccess = await syncCycleCountSession(sessionId);
-              if (!syncSuccess) {
-                console.warn(
-                  `⚠️ Sync returned false, but continuing with submission`
-                );
+              const batch = result?.batch;
+              if (!result?.ok) {
+                throw new Error(result?.message || "ERP push failed");
               }
 
-              // Update local status to Submitted
+              const now = new Date().toISOString();
               await db.runAsync(
-                "UPDATE cycle_count_sessions SET status = 'Submitted', updated_at = ? WHERE session_id = ?",
-                [new Date().toISOString(), sessionId]
+                `UPDATE cycle_count_sessions
+                 SET status = 'Submitted', erp_batch = ?, erp_locked_carton_id = ?, updated_at = ?
+                 WHERE session_id = ?`,
+                [batch || null, cartonId, now, sessionId]
               );
-
-              // ✅ Submit the task to backend (only if taskTitle exists)
-              if (taskTitle) {
-                try {
-                  console.log(
-                    `📤 Submitting cycle count task ${taskTitle} to backend...`
-                  );
-
-                  // ✅ Try to submit the task
-                  try {
-                    await apiService.submitCycleCount(taskTitle);
-                    console.log(
-                      `✅ Successfully submitted task ${taskTitle} to backend`
-                    );
-                  } catch (submitError: any) {
-                    // ✅ Handle case where task is in "Draft" status - need to start it first
-                    const errorMessage =
-                      submitError.message || submitError.toString() || "";
-                    const isInvalidStatus =
-                      errorMessage.includes("INVALID_STATUS") ||
-                      errorMessage.includes("Cannot submit") ||
-                      errorMessage.includes("status: Draft");
-
-                    if (isInvalidStatus) {
-                      console.log(
-                        `ℹ️ Task ${taskTitle} is in Draft status. Starting task first...`
-                      );
-                      try {
-                        // Get settings for started_by
-                        const settings = await getSettings();
-                        // Start the task first
-                        await apiService.startCycleCount(taskTitle, {
-                          started_by:
-                            settings.user_id ||
-                            settings.user_code ||
-                            "USER-AUTO",
-                        });
-                        console.log(
-                          `✅ Successfully started task ${taskTitle}`
-                        );
-
-                        // Wait a moment for backend to process status change
-                        await new Promise((resolve) =>
-                          setTimeout(resolve, 500)
-                        );
-
-                        // Retry submission after starting
-                        console.log(
-                          `📤 Retrying submission of task ${taskTitle}...`
-                        );
-                        await apiService.submitCycleCount(taskTitle);
-                        console.log(
-                          `✅ Successfully submitted task ${taskTitle} to backend (after starting)`
-                        );
-                      } catch (startError: any) {
-                        // If starting fails, log and rethrow
-                        console.error(
-                          `❌ Failed to start task ${taskTitle}:`,
-                          startError.message
-                        );
-                        throw startError; // Re-throw to be caught by outer catch
-                      }
-                    } else {
-                      // Other submission errors - rethrow
-                      throw submitError;
-                    }
-                  }
-
-                  // ✅ Complete the task after submission (automatic)
-                  try {
-                    console.log(
-                      `📤 Completing cycle count task ${taskTitle} via API...`
-                    );
-                    await apiService.completeCycleCount(taskTitle);
-                    console.log(
-                      `✅ Successfully completed task ${taskTitle} via API`
-                    );
-                  } catch (completeError: any) {
-                    // Log error but don't block - task is already submitted
-                    console.warn(
-                      `⚠️ Failed to complete task via API:`,
-                      completeError.message
-                    );
-                    console.warn(
-                      `⚠️ Task is submitted but not completed - may need manual completion in desktop app`
-                    );
-                  }
-                } catch (submitError: any) {
-                  // If submission fails even after starting, log but don't block - counts are already synced
-                  console.error(
-                    `❌ Failed to submit task to backend:`,
-                    submitError.message
-                  );
-                  // Still show success to user since counts are synced
-                  Alert.alert(
-                    "Warning",
-                    `Bin count has been synced, but task submission failed: ${submitError.message}. The task may need to be submitted manually in the desktop app.`
-                  );
-                }
-              } else {
-                console.warn(
-                  `⚠️ No task title found - skipping submit and complete API calls`
-                );
-                console.warn(
-                  `⚠️ Task will be submitted when backend task is found and synced`
-                );
-              }
+              if (batch) setErpBatch(batch);
+              setErpLockedCartonId(cartonId);
 
               Alert.alert(
-                "Success",
-                "Bin count submitted and completed successfully",
-                [
-                  {
-                    text: "OK",
-                    onPress: () => {
-                      // Navigate to Cycle Count Dashboard
-                      (navigation as any).navigate("CycleCountDashboard");
-                    },
-                  },
-                ]
+                "Pushed to ERP",
+                batch
+                  ? `Batch ${batch} created. Ask finance to post in ERP, then tap Sync Stock from Server.`
+                  : "Count pushed to ERP successfully."
               );
             } catch (error: any) {
-              console.error("❌ Error submitting bin count:", error);
-              Alert.alert("Error", `Failed to submit: ${error.message}`);
+              console.error("Push to ERP failed:", error);
+              Alert.alert("Push Failed", error.message || "Could not push to ERP");
             } finally {
               setSaving(false);
             }
@@ -1772,66 +1367,173 @@ export default function CycleCountBinCountingScreen() {
     );
   };
 
-  const getItemName = (itemCode: string): string => {
-    const itemNames: Record<string, string> = {
-      "SKU-HAT-301-BLU-OS": "Hat Blue One Size",
-      "SKU-HAT-301-GRN-OS": "Hat Green One Size",
-      "SKU-HAT-301-RED-OS": "Hat Red One Size",
-      "SKU-JACKET-201-BLK-L": "Jacket Black Large",
-      "SKU-JACKET-201-BLK-M": "Jacket Black Medium",
-      "SKU-JACKET-201-BLK-XL": "Jacket Black XL",
-      "SKU-JEANS-001-BLK-32": "Jeans Black Size 32",
-    };
-    return itemNames[itemCode] || itemCode;
+  const handleSyncStockFromServer = async () => {
+    if (!erpBatch) {
+      Alert.alert(
+        "No Batch",
+        "Push the count to ERP first to receive a batch number."
+      );
+      return;
+    }
+
+    setSyncingStock(true);
+    try {
+      const online = await isDeviceOnline();
+      if (!online) {
+        Alert.alert("Offline", "Connect to the network to sync stock from ERP.");
+        return;
+      }
+
+      const response = await apiService.getCycleCountStockSync(erpBatch);
+      const result = unwrapFrappeMessage(response);
+
+      if (!result?.ok) {
+        Alert.alert("Sync Failed", result?.message || "Could not sync stock");
+        return;
+      }
+
+      if (!result.ready) {
+        Alert.alert(
+          "Not Posted Yet",
+          result.message ||
+            "Batch is not posted on ERP yet. Wait for finance to post, then try again."
+        );
+        return;
+      }
+
+      const { cleared, updated } = await applyCycleCountStockSync(result);
+      if (cartonId && !isBlindCount) {
+        await loadExpectedItems();
+      }
+      await loadSession();
+
+      Alert.alert(
+        "Stock Synced",
+        `Applied ${cleared} cleared carton(s) and ${updated} balance row(s) from batch ${erpBatch}.`
+      );
+    } catch (error: any) {
+      console.error("Stock sync failed:", error);
+      Alert.alert("Sync Failed", error.message || "Could not sync stock");
+    } finally {
+      setSyncingStock(false);
+    }
   };
+
+  /** @deprecated use handlePushToErp */
+  const handleSubmitBinCount = handlePushToErp;
 
   const renderCountLine = ({ item }: { item: CountLine }) => {
     const isEditing = editingLineId === item.line_id;
-    const variance =
-      typeof item.expected_qty === "number"
-        ? item.counted_qty - item.expected_qty
-        : null;
+    const hasExpected =
+      !isBlindCount &&
+      item.expected_qty !== null &&
+      item.expected_qty !== undefined;
+    const expectedQty = hasExpected ? Number(item.expected_qty) : null;
+    const balanceQty =
+      expectedQty !== null ? item.counted_qty - expectedQty : null;
+    const isAdhoc = isAdhocAddMode(countMode);
+    const expectedLabel = isAdhoc ? "Previous (carton)" : "Expected";
+    const balanceLabel =
+      isAdhoc && balanceQty !== null && balanceQty > 0
+        ? "Additional"
+        : "Balance";
+    const balanceColor =
+      balanceQty === null
+        ? "#666"
+        : balanceQty === 0
+        ? "#4CAF50"
+        : balanceQty > 0
+        ? "#FF9800"
+        : "#F44336";
 
     return (
       <View style={styles.countLineCard}>
         <View style={styles.countLineHeader}>
           <View style={styles.countLineLeft}>
             <Text style={styles.itemCode}>{item.item_code}</Text>
-            <Text style={styles.itemName}>{getItemName(item.item_code)}</Text>
+            <Text style={styles.itemName}>{item.item_name || item.item_code}</Text>
             {item.barcode && (
               <Text style={styles.barcodeText}>Barcode: {item.barcode}</Text>
             )}
           </View>
-          {!isBlindCount &&
-            item.expected_qty !== null &&
-            item.expected_qty !== undefined && (
-              <View
-                style={[
-                  styles.expectedBadge,
-                  variance === 0 && styles.expectedBadgeGreen,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.expectedBadgeText,
-                    variance === 0 && styles.expectedBadgeTextGreen,
-                  ]}
-                >
-                  Exp: {item.expected_qty}
-                </Text>
-              </View>
-            )}
         </View>
 
         <View style={styles.countLineBody}>
+          <View style={styles.qtySummaryRow}>
+            <View style={[styles.qtySummaryBox, styles.expectedQtyBox]}>
+              <Text style={styles.qtySummaryLabel}>{expectedLabel}</Text>
+              <Text style={[styles.qtySummaryValue, styles.expectedQtyValue]}>
+                {expectedQty !== null ? expectedQty : "-"}
+              </Text>
+            </View>
+
+            <View style={[styles.qtySummaryBox, styles.countedQtyBox]}>
+              <Text style={styles.qtySummaryLabel}>Counted</Text>
+              {isEditing ? (
+                <Text
+                  style={[
+                    styles.qtySummaryValue,
+                    styles.countedQtyValue,
+                    item.counted_qty === 0 && styles.qtyValueZero,
+                  ]}
+                >
+                  {item.counted_qty}
+                </Text>
+              ) : (
+                <TouchableOpacity
+                  onPress={() => handleEditQty(item.line_id, item.counted_qty)}
+                  accessibilityLabel={`Edit counted quantity for ${item.item_code}`}
+                >
+                  <Text
+                    style={[
+                      styles.qtySummaryValue,
+                      styles.countedQtyValue,
+                      styles.countedQtyEditable,
+                      item.counted_qty === 0 && styles.qtyValueZero,
+                    ]}
+                  >
+                    {item.counted_qty}
+                  </Text>
+                  <Text style={styles.tapToEditHint}>Tap to edit</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <View style={[styles.qtySummaryBox, styles.balanceQtyBox]}>
+              <Text style={styles.qtySummaryLabel}>{balanceLabel}</Text>
+              <Text style={[styles.qtySummaryValue, { color: balanceColor }]}>
+                {balanceQty !== null
+                  ? balanceQty > 0
+                    ? `+${balanceQty}`
+                    : balanceQty
+                  : "-"}
+              </Text>
+            </View>
+          </View>
+
+          {balanceQty !== null && (
+            <Text style={[styles.qtyHintText, { color: balanceColor }]}>
+              {balanceQty === 0
+                ? "Count matched"
+                : balanceQty > 0
+                ? isAdhoc
+                  ? `Additional ${balanceQty}`
+                  : `Over by ${balanceQty}`
+                : `Short by ${Math.abs(balanceQty)}`}
+            </Text>
+          )}
+
           {isEditing ? (
             <View style={styles.editQtyRow}>
               <TextInput
                 style={styles.editQtyInput}
                 value={editQty}
                 onChangeText={setEditQty}
-                keyboardType="numeric"
+                keyboardType="decimal-pad"
+                showSoftInputOnFocus
+                selectTextOnFocus
                 autoFocus
+                placeholder="Enter quantity"
               />
               <TouchableOpacity
                 style={styles.saveQtyButton}
@@ -1850,57 +1552,280 @@ export default function CycleCountBinCountingScreen() {
               </TouchableOpacity>
             </View>
           ) : (
-            <View style={styles.qtyRow}>
-              <View style={styles.qtySection}>
-                <Text style={styles.qtyLabel}>Counted</Text>
+            <>
+              <View style={styles.qtyActionRow}>
+                <View style={styles.qtySection}>
+                  <Text style={styles.qtyLabel}>UOM</Text>
+                  <Text style={styles.uomText}>{item.uom}</Text>
+                </View>
                 <Text
                   style={[
-                    styles.qtyValue,
-                    item.counted_qty === 0 && styles.qtyValueZero,
+                    styles.qtyStatusText,
+                    { color: balanceColor },
                   ]}
                 >
-                  {item.counted_qty}
+                  {expectedQty !== null
+                    ? balanceQty === 0
+                      ? "Complete"
+                      : balanceQty && balanceQty > 0
+                      ? "In Progress"
+                      : "Over Count"
+                    : "Counted"}
                 </Text>
-                <Text style={styles.uomText}>{item.uom}</Text>
+
+                <TouchableOpacity
+                  style={styles.editButton}
+                  onPress={() => handleEditQty(item.line_id, item.counted_qty)}
+                >
+                  <Text style={styles.editButtonText}>Edit</Text>
+                </TouchableOpacity>
+                {item.counted_qty > 0 ? (
+                  <TouchableOpacity
+                    style={styles.clearLineButton}
+                    onPress={() =>
+                      handleClearLineQty(
+                        item.line_id,
+                        item.item_code,
+                        item.counted_qty
+                      )
+                    }
+                  >
+                    <Text style={styles.clearLineButtonText}>Clear</Text>
+                  </TouchableOpacity>
+                ) : null}
               </View>
-
-              {!isBlindCount &&
-                variance !== null &&
-                item.expected_qty !== null &&
-                item.expected_qty !== undefined && (
-                  <View style={styles.varianceSection}>
-                    <Text style={styles.varianceLabel}>Variance</Text>
-                    <Text
-                      style={[
-                        styles.varianceValue,
-                        {
-                          color:
-                            variance === 0
-                              ? "#4CAF50"
-                              : variance > 0
-                              ? "#FF9800"
-                              : "#F44336",
-                        },
-                      ]}
-                    >
-                      {variance > 0 ? "+" : ""}
-                      {variance}
-                    </Text>
-                  </View>
-                )}
-
-              <TouchableOpacity
-                style={styles.editButton}
-                onPress={() => handleEditQty(item.line_id, item.counted_qty)}
-              >
-                <Text style={styles.editButtonText}>Edit</Text>
-              </TouchableOpacity>
-            </View>
+            </>
           )}
         </View>
       </View>
     );
   };
+
+  const scannedItemCount = countLines.filter(
+    (line) => Number(line.counted_qty || 0) > 0
+  ).length;
+  const totalScannedQty = countLines.reduce(
+    (sum, line) => sum + (Number(line.counted_qty) || 0),
+    0
+  );
+
+  const renderListEmpty = () => (
+    <View style={styles.emptyListCompact}>
+      <Text style={styles.emptyListText}>
+        {isBlindCount ? "No items scanned yet." : "No items for this carton."}
+      </Text>
+    </View>
+  );
+
+  const completeBinSetup = async (rawBin: string) => {
+    const scannedBin = rawBin.trim().toUpperCase();
+    if (!scannedBin) return;
+
+    if (!setupScanMethod) {
+      Alert.alert(
+        "Select Scan Method",
+        "Choose Local, Blind Count, or Scan Online before scanning the bin."
+      );
+      return;
+    }
+
+    setBinSetupLoading(true);
+    try {
+      const validatedBin = await validateCycleCountBin(scannedBin, setupScanOnline);
+      if (!validatedBin) return;
+
+      const result = await startCycleCountSession({
+        binInfo: validatedBin,
+        countType: routeCountType || "Directed",
+        countMode,
+        isBlindCount: setupBlindCount,
+        preCreatedSessionId: routeParams.preCreatedSessionId,
+        preCreatedTaskTitle: routeParams.preCreatedTaskTitle,
+        forceNewSession: Boolean(forceNewSessionParam),
+      });
+
+      setScanOnlineEnabled(setupScanOnline);
+      setSessionCountType(routeCountType || "Directed");
+      skipCartonRestoreRef.current = true;
+      setCartonId(null);
+      setErpLockedCartonId(null);
+
+      (navigation as any).replace("CycleCountBinCounting", {
+        sessionId: result.sessionId,
+        binCode: result.binInfo.bin_code,
+        binInfo: result.binInfo,
+        countType: routeCountType || "Directed",
+        countMode,
+        isBlindCount: setupBlindCount,
+        scanOnline: setupScanOnline,
+        openingStock,
+        skipCartonRestore: true,
+      });
+    } catch (error: any) {
+      Alert.alert("Error", error.message || "Failed to start count for this bin");
+    } finally {
+      setBinSetupLoading(false);
+    }
+  };
+
+  if (needsBinSetup) {
+    return (
+      <SafeAreaView style={styles.safeArea} edges={["top"]}>
+        <ScrollView
+          style={styles.binSetupContainer}
+          contentContainerStyle={styles.binSetupScrollContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={styles.binSetupHeader}>
+            <Text style={styles.binSetupTitle}>
+              {routeCountType === "Adhoc" ? "Ad-hoc Count" : "Directed Count"}
+            </Text>
+            <Text style={styles.binSetupSubtitle}>
+              Choose scan method, then scan bin code
+            </Text>
+          </View>
+
+          <View style={styles.binSetupSection}>
+            <Text style={styles.binSetupFieldLabel}>Scan Method</Text>
+            <Text style={styles.binSetupFieldHint}>
+              Required — pick one before scanning the bin
+            </Text>
+            <View style={styles.binSetupScanMethodRow}>
+              <TouchableOpacity
+                style={[
+                  styles.binSetupScanMethodButton,
+                  setupScanMethod === "local" && styles.binSetupModeButtonActive,
+                ]}
+                onPress={() => setSetupScanMethod("local")}
+              >
+                <Text
+                  style={[
+                    styles.binSetupScanMethodText,
+                    setupScanMethod === "local" && styles.binSetupModeTextActive,
+                  ]}
+                >
+                  Local
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.binSetupScanMethodButton,
+                  setupScanMethod === "blind" && styles.binSetupModeButtonActive,
+                ]}
+                onPress={() => setSetupScanMethod("blind")}
+              >
+                <Text
+                  style={[
+                    styles.binSetupScanMethodText,
+                    setupScanMethod === "blind" && styles.binSetupModeTextActive,
+                  ]}
+                >
+                  Blind Count
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.binSetupScanMethodButton,
+                  setupScanMethod === "online" && styles.binSetupModeButtonActive,
+                ]}
+                onPress={() => setSetupScanMethod("online")}
+              >
+                <Text
+                  style={[
+                    styles.binSetupScanMethodText,
+                    setupScanMethod === "online" && styles.binSetupModeTextActive,
+                  ]}
+                >
+                  Scan Online
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <View
+            style={[
+              styles.binSetupCard,
+              !binScanReady && styles.binSetupCardDisabled,
+            ]}
+          >
+            <Text style={styles.binSetupFieldLabel}>Bin Code</Text>
+            {!binScanReady ? (
+              <Text style={styles.binSetupBlockedHint}>
+                Select a scan method above to enable bin scanning
+              </Text>
+            ) : null}
+            <BarcodeInput
+              ref={binSetupInputRef}
+              autoFocus={binScanReady}
+              placeholder={
+                binScanReady
+                  ? "Scan or enter bin code"
+                  : "Select scan method first"
+              }
+              showSoftInputOnFocus={binScanReady}
+              onBarcodeScanned={completeBinSetup}
+              disabled={binSetupLoading || !binScanReady}
+              containerStyle={styles.binSetupInputWrap}
+              inputStyle={[
+                styles.binSetupInput,
+                !binScanReady && styles.binSetupInputDisabled,
+              ]}
+              submitButtonStyle={[
+                styles.binSetupSubmitButton,
+                !binScanReady && styles.binSetupSubmitButtonDisabled,
+              ]}
+              submitTextStyle={styles.binSetupSubmitButtonText}
+              submitLabel="Submit"
+            />
+            {binSetupLoading ? (
+              <View style={styles.binSetupLoading}>
+                <ActivityIndicator size="small" color="#9C27B0" />
+                <Text style={styles.binSetupLoadingText}>Validating bin…</Text>
+              </View>
+            ) : null}
+          </View>
+
+          <View style={styles.binSetupSection}>
+            <Text style={styles.binSetupFieldLabel}>Count Mode</Text>
+            <View style={styles.binSetupModeRow}>
+              <TouchableOpacity
+                style={[
+                  styles.binSetupModeButton,
+                  countMode === "Reconciliation" && styles.binSetupModeButtonActive,
+                ]}
+                onPress={() => setCountMode("Reconciliation")}
+              >
+                <Text
+                  style={[
+                    styles.binSetupModeText,
+                    countMode === "Reconciliation" && styles.binSetupModeTextActive,
+                  ]}
+                >
+                  Reconciliation
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.binSetupModeButton,
+                  countMode === "Adhoc Add" && styles.binSetupModeButtonActive,
+                ]}
+                onPress={() => setCountMode("Adhoc Add")}
+              >
+                <Text
+                  style={[
+                    styles.binSetupModeText,
+                    countMode === "Adhoc Add" && styles.binSetupModeTextActive,
+                  ]}
+                >
+                  Adhoc Add
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea} edges={["top"]}>
@@ -1909,175 +1834,266 @@ export default function CycleCountBinCountingScreen() {
         behavior={Platform.OS === "ios" ? "padding" : "height"}
         keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 20}
       >
-        <ScrollView
-          style={styles.scrollView}
-          contentContainerStyle={styles.scrollContent}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
-          {/* Action Buttons - Top */}
-          <View style={styles.topActionContainer}>
-            {/* ✅ Hide/Disable Mark Bin button during carton scanning if carton ID is required but not set */}
-            <TouchableOpacity
-              style={[
-                styles.topActionButton,
-                saving === true ||
-                (!cartonId && cartonIdInput.trim().length > 0)
-                  ? { opacity: 0.5 }
-                  : {},
-              ]}
-              onPress={handleMarkBinCompleted}
-              disabled={
-                Boolean(saving) ||
-                (!cartonId && cartonIdInput.trim().length > 0)
-              }
-            >
-              <Text style={styles.topActionButtonText}>Mark Bin</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.topActionButton, styles.topActionButtonGreen]}
-              onPress={handleSubmitBinCount}
-              disabled={saving || countLines.length === 0}
-            >
-              <Text style={styles.topActionButtonText}>Submit Bin</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Bin Header Card */}
+        <View style={styles.screenBody}>
           <View style={styles.binHeaderCard}>
-            <Text style={styles.headerTitle}>Bin: {binCode}</Text>
-            {cartonId && (
-              <View style={styles.cartonIdContainer}>
-                <Text
-                  style={styles.cartonIdText}
-                  numberOfLines={2}
-                  ellipsizeMode="tail"
-                >
-                  Carton: {cartonId}
-                </Text>
+            <View style={styles.headerTopRow}>
+              <Text style={styles.headerTitle} numberOfLines={1}>
+                Bin: {binCode}
+              </Text>
+              <View style={styles.headerTopBadges}>
+                <View style={styles.modeBadge}>
+                  <Text style={styles.modeBadgeText}>{countMode}</Text>
+                </View>
+                {shouldLoadExpectedItems && !isBlindCount ? (
+                  <View style={styles.directedBadge}>
+                    <Text style={styles.directedBadgeText}>Directed</Text>
+                  </View>
+                ) : null}
+              </View>
+            </View>
+
+            <View style={styles.headerStatsCenter}>
+              <Text style={styles.headerStatsValue}>
+                {scannedItemCount} item{scannedItemCount === 1 ? "" : "s"}
+              </Text>
+              <Text style={styles.headerStatsDivider}>|</Text>
+              <Text style={styles.headerStatsValue}>
+                Total Qty: {totalScannedQty}
+              </Text>
+            </View>
+
+            {!isBlindCount ? (
+              <View style={styles.scanModeSwitchRow}>
                 <TouchableOpacity
-                  style={styles.changeCartonButton}
-                  onPress={handleChangeCartonId}
+                  style={[
+                    styles.scanModeSwitchBtn,
+                    !scanOnlineEnabled && styles.scanModeSwitchBtnActive,
+                  ]}
+                  onPress={() => handleScanModeChange(false)}
                 >
-                  <Text style={styles.changeCartonButtonText}>
-                    Change Carton
+                  <Text
+                    style={[
+                      styles.scanModeSwitchText,
+                      !scanOnlineEnabled && styles.scanModeSwitchTextActive,
+                    ]}
+                  >
+                    Local
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.scanModeSwitchBtn,
+                    scanOnlineEnabled && styles.scanModeSwitchBtnActive,
+                  ]}
+                  onPress={() => handleScanModeChange(true)}
+                >
+                  <Text
+                    style={[
+                      styles.scanModeSwitchText,
+                      scanOnlineEnabled && styles.scanModeSwitchTextActive,
+                    ]}
+                  >
+                    Online
                   </Text>
                 </TouchableOpacity>
               </View>
-            )}
-            {taskTitle && (
-              <Text style={styles.taskTitleText}>Task: {taskTitle}</Text>
-            )}
-            <View style={styles.headerBadges}>
-              {isBlindCount && (
-                <View style={styles.blindBadge}>
-                  <Text style={styles.blindBadgeText}>Blind Count</Text>
-                </View>
-              )}
-              <Text style={styles.headerSubtext}>
-                {countLines.length} item(s) scanned
-              </Text>
+            ) : null}
+
+            <View style={styles.headerContentRow}>
+              <View style={styles.headerLeftColumn}>
+                {cartonId ? (
+                  <View style={styles.headerMetaRow}>
+                    <Text style={styles.cartonIdText} numberOfLines={1}>
+                      CTN: {cartonId}
+                      {isCartonLocked ? " (locked)" : ""}
+                    </Text>
+                    {!isCartonLocked ? (
+                      <TouchableOpacity
+                        style={styles.changeCartonButton}
+                        onPress={handleChangeCartonId}
+                      >
+                        <Text style={styles.changeCartonButtonText}>
+                          Change Carton
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                ) : (
+                  <Text style={styles.headerSubtext}>Scan carton to start</Text>
+                )}
+              </View>
+
+              <View style={styles.headerRightColumn}>
+                {isBlindCount ? (
+                  <View style={styles.blindBadge}>
+                    <Text style={styles.blindBadgeText}>Blind</Text>
+                  </View>
+                ) : null}
+                {erpBatch ? (
+                  <Text style={styles.batchText} numberOfLines={2}>
+                    {erpBatch}
+                  </Text>
+                ) : null}
+              </View>
+            </View>
+
+            <View style={styles.headerActionsRow}>
+              <TouchableOpacity
+                style={[
+                  styles.headerActionButton,
+                  styles.headerActionButtonMark,
+                  saving === true ||
+                  (!cartonId && cartonIdInput.trim().length > 0)
+                    ? { opacity: 0.5 }
+                    : {},
+                ]}
+                onPress={handleMarkBinCompleted}
+                disabled={
+                  Boolean(saving) ||
+                  (!cartonId && cartonIdInput.trim().length > 0)
+                }
+              >
+                <Text style={styles.headerActionButtonText}>Mark Bin</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.headerActionButton,
+                  styles.headerActionButtonPush,
+                ]}
+                onPress={handlePushToErp}
+                disabled={saving || countLines.length === 0 || !cartonId}
+              >
+                <Text style={styles.headerActionButtonText}>Push to ERP</Text>
+              </TouchableOpacity>
+
+              {erpBatch ? (
+                <TouchableOpacity
+                  style={[
+                    styles.headerActionButton,
+                    styles.headerActionButtonSync,
+                  ]}
+                  onPress={handleSyncStockFromServer}
+                  disabled={syncingStock}
+                >
+                  <Text style={styles.headerActionButtonText}>
+                    {syncingStock ? "Sync…" : "Sync Stock"}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
             </View>
           </View>
 
-          {/* ✅ NEW: Carton ID Scanning Section - Show if carton ID is not set */}
-          {!cartonId && (
-            <View style={styles.cartonIdCard}>
-              <Text style={styles.cartonIdCardTitle}>📦 Scan Carton ID</Text>
-              <Text style={styles.cartonIdCardSubtitle}>
-                One bin can have multiple cartons. Please scan the carton ID
-                first.
-              </Text>
-              <View style={styles.cartonIdInputRow}>
+          {!cartonId && !isCartonLocked ? (
+            <View style={styles.flexFill}>
+              <View style={styles.cartonIdCard}>
+                <Text style={styles.cartonIdCardTitle}>Scan or Create Carton</Text>
+                <Text style={styles.cartonIdCardSubtitle}>
+                  Scan the carton in this bin before counting items
+                </Text>
                 <BarcodeInput
                   ref={cartonIdInputRef}
                   autoFocus
-                  placeholder="Scan or enter carton ID"
-                  onChangeText={(t) => setCartonIdInput(t.toUpperCase())}
+                  placeholder="Carton ID (e.g. NEWCTN)"
+                  showSoftInputOnFocus
+                  showKeyboardButton
+                  keyboardToggle
+                  keyboardButtonLabel="⌨"
+                  showClearButton
+                  actionsPosition="top"
+                  compactActions
+                  onChangeText={(t) => setCartonIdInput(normalizeCartonId(t))}
                   onBarcodeScanned={(raw) =>
-                    handleCartonIdScan(raw.trim().toUpperCase())
+                    handleCartonIdScan(normalizeCartonId(raw))
                   }
-                  containerStyle={styles.cartonIdInputStack}
+                  containerStyle={styles.cartonIdInputRow}
                   inputStyle={styles.cartonIdInput}
-                  submitButtonStyle={styles.cartonIdSubmitButton}
+                  submitButtonStyle={[
+                    styles.cartonScanActionButton,
+                    styles.cartonIdSubmitButton,
+                  ]}
+                  keyboardButtonStyle={styles.cartonScanActionButton}
+                  clearButtonStyle={[
+                    styles.cartonScanActionButton,
+                    styles.cartonScanClearButton,
+                  ]}
+                  clearButtonTextStyle={styles.cartonScanClearButtonText}
                   submitTextStyle={styles.cartonIdSubmitButtonText}
+                  keyboardButtonTextStyle={styles.cartonScanKeyboardButtonText}
+                  submitLabel="Use"
                 />
-              </View>
-              <View style={styles.cartonIdActionRow}>
-                {/* ✅ NEW: Generate Carton ID Button */}
-                <TouchableOpacity
-                  style={styles.generateCartonButton}
-                  onPress={handleGenerateCartonId}
-                >
-                  <Text style={styles.generateCartonButtonText}>
-                    🔧 Generate Carton ID
-                  </Text>
-                </TouchableOpacity>
+                <View style={styles.cartonIdActionRow}>
+                  <TouchableOpacity
+                    style={styles.createCartonButton}
+                    onPress={handleCreateNewCarton}
+                  >
+                    <Text style={styles.createCartonButtonText}>New Carton</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.generateCartonButton}
+                    onPress={handleGenerateCartonId}
+                  >
+                    <Text style={styles.generateCartonButtonText}>Generate</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
-          )}
+          ) : null}
 
-          {/* Scan Card - Only show if carton ID is set */}
-          {cartonId && (
-            <View style={styles.scanCard}>
-              <TouchableOpacity
-                style={styles.scanButton}
-                onPress={() => setShowScanner(true)}
-              >
-                <Text style={styles.scanButtonText}>Scan Item Barcode</Text>
-                <Text style={styles.scanButtonSubtext}>
-                  Scan repeatedly to increment quantity
-                </Text>
-              </TouchableOpacity>
-
-              {/* Manual barcode: wedge + keyboard toggle (see BarcodeInput) */}
-              <View style={styles.manualInputSection}>
-                <Text style={styles.manualInputLabel}>Scan Item Barcode</Text>
-                <BarcodeInput
-                  ref={barcodeInputRef}
-                  autoFocus={!editingLineId}
-                  debounceMs={180}
-                  placeholder="Scan or enter barcode"
-                  onBarcodeScanned={handleItemScan}
-                  onError={(message, err) =>
-                    console.warn("BarcodeInput:", message, err)
-                  }
-                  disabled={!!editingLineId}
-                  inputStyle={styles.manualInput}
-                />
+          {cartonId ? (
+            <>
+              <View style={styles.scanCard}>
+                <View style={styles.manualInputSection}>
+                  <BarcodeInput
+                    ref={barcodeInputRef}
+                    autoFocus={!editingLineId}
+                    debounceMs={180}
+                    placeholder="Scan or enter barcode"
+                    onBarcodeScanned={handleItemScan}
+                    showSoftInputOnFocus={false}
+                    showKeyboardButton
+                    keyboardToggle
+                    keyboardButtonLabel="⌨"
+                    showClearButton
+                    actionsPosition="top"
+                    compactActions
+                    onError={(message, err) =>
+                      console.warn("BarcodeInput:", message, err)
+                    }
+                    disabled={!!editingLineId}
+                    containerStyle={styles.manualBarcodeInputRow}
+                    inputStyle={styles.manualInput}
+                    submitButtonStyle={[
+                      styles.manualScanActionButton,
+                      styles.manualScanSubmitButton,
+                    ]}
+                    keyboardButtonStyle={styles.manualScanActionButton}
+                    clearButtonStyle={[
+                      styles.manualScanActionButton,
+                      styles.manualScanClearButton,
+                    ]}
+                    clearButtonTextStyle={styles.manualClearButtonText}
+                    submitTextStyle={styles.manualSubmitButtonText}
+                    keyboardButtonTextStyle={styles.manualKeyboardButtonText}
+                    submitLabel="Submit"
+                  />
+                </View>
               </View>
-            </View>
-          )}
 
-          {/* Expected/Scanned Items List - Only show after carton ID is scanned */}
-          {cartonId && countLines.length > 0 && (
-            <View style={styles.listSection}>
-              <Text style={styles.listTitle}>
-                {isBlindCount ? "Scanned Items" : "Expected Items"}
-              </Text>
-              <Text style={styles.listSubtitle}>Carton: {cartonId}</Text>
               <FlatList
+                ref={listRef}
                 data={countLines}
                 keyExtractor={(item) => item.line_id}
                 renderItem={renderCountLine}
-                scrollEnabled={false}
-                style={styles.list}
+                style={styles.flexFill}
+                contentContainerStyle={styles.listContent}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator
+                ListEmptyComponent={renderListEmpty}
               />
-            </View>
-          )}
-          {cartonId && countLines.length === 0 && (
-            <View style={styles.listSection}>
-              <Text style={styles.listTitle}>Expected Items</Text>
-              <Text style={styles.listSubtitle}>Carton: {cartonId}</Text>
-              <View style={styles.emptyList}>
-                <Text style={styles.emptyListText}>
-                  No items found for this carton
-                </Text>
-              </View>
-            </View>
-          )}
-        </ScrollView>
+            </>
+          ) : null}
+        </View>
 
         {/* Scanner Modal */}
         {showScanner && (
@@ -2135,80 +2151,294 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
-  scrollView: {
+  screenBody: {
     flex: 1,
   },
-  scrollContent: {
-    paddingTop: 0,
-    paddingBottom: 12,
+  flexFill: {
+    flex: 1,
+  },
+  cartonScrollContent: {
+    padding: 12,
+    paddingBottom: 24,
+  },
+  listContent: {
+    paddingHorizontal: 12,
+    paddingBottom: 16,
+    flexGrow: 1,
   },
   binHeaderCard: {
     backgroundColor: "#9C27B0",
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    marginBottom: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    marginBottom: 4,
     borderRadius: 0,
   },
-  headerTitle: {
-    fontSize: 24,
-    fontWeight: "bold",
-    color: "#FFF",
-    marginBottom: 6,
-  },
-  headerBadges: {
+  headerTopRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
+    justifyContent: "space-between",
+    gap: 8,
+    marginBottom: 4,
+  },
+  headerTopBadges: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexShrink: 0,
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+    gap: 4,
+    maxWidth: "55%",
+  },
+  headerStatsCenter: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "stretch",
+    marginBottom: 6,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.15)",
+    borderRadius: 8,
+    gap: 10,
+  },
+  headerStatsValue: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#FFF",
+  },
+  headerStatsDivider: {
+    fontSize: 14,
+    color: "rgba(255, 255, 255, 0.6)",
+    fontWeight: "600",
+  },
+  scanModeSwitchRow: {
+    flexDirection: "row",
+    alignSelf: "stretch",
+    backgroundColor: "rgba(255, 255, 255, 0.12)",
+    borderRadius: 8,
+    padding: 3,
+    marginBottom: 6,
+    gap: 4,
+  },
+  scanModeSwitchBtn: {
+    flex: 1,
+    paddingVertical: 6,
+    alignItems: "center",
+    borderRadius: 6,
+  },
+  scanModeSwitchBtnActive: {
+    backgroundColor: "rgba(255, 255, 255, 0.28)",
+  },
+  scanModeSwitchText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "rgba(255, 255, 255, 0.65)",
+  },
+  scanModeSwitchTextActive: {
+    color: "#FFF",
+  },
+  headerContentRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    marginBottom: 4,
+  },
+  headerLeftColumn: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center",
+  },
+  headerRightColumn: {
+    flexShrink: 0,
+    alignItems: "flex-end",
+    justifyContent: "flex-start",
+    gap: 4,
+    maxWidth: "42%",
+  },
+  headerMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  headerActionsRow: {
+    flexDirection: "row",
+    alignItems: "stretch",
+    gap: 6,
+    marginTop: 2,
+  },
+  headerActionButton: {
+    flex: 1,
+    height: 38,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    paddingHorizontal: 4,
+  },
+  headerActionButtonMark: {
+    backgroundColor: "rgba(255, 255, 255, 0.22)",
+  },
+  headerActionButtonPush: {
+    backgroundColor: "#4CAF50",
+    borderColor: "#43A047",
+  },
+  headerActionButtonSync: {
+    backgroundColor: "#2196F3",
+    borderColor: "#1E88E5",
+  },
+  headerActionButtonText: {
+    color: "#FFF",
+    fontSize: 11,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  headerTitle: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#FFF",
+    minWidth: 0,
   },
   blindBadge: {
     backgroundColor: "#FF9800",
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
   },
   blindBadgeText: {
     color: "#FFF",
+    fontSize: 10,
+    fontWeight: "600",
+  },
+  directedBadge: {
+    backgroundColor: "#4F46E5",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  directedBadgeText: {
+    color: "#FFF",
+    fontSize: 10,
+    fontWeight: "600",
+  },
+  modeBadge: {
+    backgroundColor: "#7B1FA2",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  modeBadgeText: {
+    color: "#FFF",
+    fontSize: 10,
+    fontWeight: "600",
+  },
+  batchText: {
+    fontSize: 9,
+    color: "#E1BEE7",
+    fontWeight: "600",
+    textAlign: "right",
+  },
+  expectedHintText: {
     fontSize: 12,
+    color: "#64748B",
+    lineHeight: 18,
+    marginBottom: 8,
+  },
+  onlineScanBadge: {
+    backgroundColor: "#0F766E",
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  onlineScanBadgeText: {
+    color: "#FFF",
+    fontSize: 10,
     fontWeight: "600",
   },
   taskTitleText: {
-    fontSize: 13,
+    fontSize: 11,
     fontWeight: "600",
     color: "#FFF",
-    marginTop: 4,
+    marginTop: 2,
     backgroundColor: "rgba(255, 255, 255, 0.2)",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    alignSelf: "flex-start",
+  },
+  cartonIdText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#FFF",
+    backgroundColor: "rgba(33, 150, 243, 0.35)",
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 4,
     alignSelf: "flex-start",
   },
-  cartonIdText: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: "#FFF",
-    backgroundColor: "rgba(33, 150, 243, 0.3)", // Blue background
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-    alignSelf: "flex-start",
-  },
   headerSubtext: {
-    fontSize: 14,
+    fontSize: 12,
     color: "#E1BEE7",
+    fontStyle: "italic",
   },
   scanCard: {
     backgroundColor: "#2196F3",
-    marginHorizontal: 12,
-    marginBottom: 8,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 12,
+    marginHorizontal: 10,
+    marginBottom: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
     overflow: "hidden",
+  },
+  scanOnlineToggle: {
+    backgroundColor: "rgba(255, 255, 255, 0.15)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 8,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  scanOnlineToggleCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: "#FFF",
+    marginRight: 10,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  scanOnlineToggleCircleActive: {
+    backgroundColor: "#0F766E",
+    borderColor: "#0F766E",
+  },
+  scanOnlineToggleCheck: {
+    color: "#FFF",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
+  scanOnlineToggleTextWrap: {
+    flex: 1,
+  },
+  scanOnlineToggleLabel: {
+    color: "#FFF",
+    fontSize: 15,
+    fontWeight: "bold",
+  },
+  scanOnlineToggleDescription: {
+    color: "#E3F2FD",
+    fontSize: 12,
+    marginTop: 2,
   },
   scanButton: {
     paddingVertical: 8,
@@ -2226,29 +2456,117 @@ const styles = StyleSheet.create({
   },
   manualInputSection: {
     backgroundColor: "#FFF",
-    padding: 12,
-    marginTop: 6,
-    borderTopWidth: 1,
-    borderTopColor: "rgba(255, 255, 255, 0.3)",
+    padding: 8,
+    borderRadius: 8,
   },
   manualInputLabel: {
-    fontSize: 14,
-    fontWeight: "600",
+    fontSize: 16,
+    fontWeight: "700",
     color: "#333",
+    marginBottom: 4,
+  },
+  manualInputHint: {
+    fontSize: 13,
+    color: "#666",
+    marginBottom: 12,
+    lineHeight: 18,
+  },
+  manualInputHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     marginBottom: 8,
   },
   manualInputRow: {
     flexDirection: "row",
     gap: 8,
   },
+  manualBarcodeInputRow: {
+    alignSelf: "stretch",
+    width: "100%",
+  },
+  manualBarcodeActions: {
+    flexDirection: "row",
+    gap: 6,
+    justifyContent: "flex-end",
+  },
   manualInput: {
-    flex: 1,
+    alignSelf: "stretch",
+    width: "100%",
     backgroundColor: "#F5F5F5",
-    borderWidth: 1,
-    borderColor: "#DDD",
+    borderWidth: 2,
+    borderColor: "#BBDEFB",
     borderRadius: 8,
-    padding: 12,
-    fontSize: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 20,
+    fontWeight: "600",
+    minHeight: 52,
+  },
+  manualScanActionButton: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 38,
+    maxHeight: 38,
+    paddingHorizontal: 4,
+    backgroundColor: "#E3F2FD",
+    borderColor: "#BBDEFB",
+  },
+  manualScanSubmitButton: {
+    backgroundColor: "#4CAF50",
+    borderColor: "#43A047",
+  },
+  manualScanClearButton: {
+    backgroundColor: "#FFEBEE",
+    borderColor: "#FFCDD2",
+  },
+  keyboardToggleButton: {
+    minWidth: 42,
+    minHeight: 28,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    backgroundColor: "#E0F2FE",
+    borderColor: "#7DD3FC",
+    borderWidth: 1,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  keyboardToggleButtonText: {
+    fontSize: 12,
+    fontWeight: "bold",
+    color: "#0369A1",
+  },
+  manualSubmitButton: {
+    minWidth: 58,
+    minHeight: 34,
+    paddingHorizontal: 8,
+  },
+  manualKeyboardButton: {
+    minWidth: 48,
+    minHeight: 34,
+    paddingHorizontal: 8,
+    backgroundColor: "#E3F2FD",
+    borderColor: "#BBDEFB",
+  },
+  manualKeyboardButtonText: {
+    color: "#1565C0",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  manualClearButton: {
+    minWidth: 40,
+    minHeight: 34,
+    paddingHorizontal: 6,
+  },
+  manualClearButtonText: {
+    fontSize: 14,
+    lineHeight: 16,
+  },
+  manualSubmitButtonText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#FFF",
   },
   submitBarcodeButton: {
     backgroundColor: "#4CAF50",
@@ -2286,6 +2604,11 @@ const styles = StyleSheet.create({
     padding: 40,
     alignItems: "center",
   },
+  emptyListCompact: {
+    paddingVertical: 20,
+    paddingHorizontal: 16,
+    alignItems: "center",
+  },
   emptyListText: {
     fontSize: 14,
     color: "#666",
@@ -2293,34 +2616,35 @@ const styles = StyleSheet.create({
   },
   countLineCard: {
     backgroundColor: "#FFF",
-    padding: 12,
-    borderRadius: 10,
-    marginBottom: 8,
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 6,
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 2,
+    elevation: 2,
   },
   countLineHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "flex-start",
-    marginBottom: 12,
+    marginBottom: 6,
   },
   countLineLeft: {
     flex: 1,
   },
   itemCode: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: "bold",
     color: "#333",
-    marginBottom: 4,
+    marginBottom: 2,
   },
   itemName: {
     fontSize: 14,
-    color: "#666",
-    marginBottom: 4,
+    color: "#0F766E",
+    fontWeight: "700",
+    marginBottom: 2,
   },
   barcodeText: {
     fontSize: 12,
@@ -2346,12 +2670,72 @@ const styles = StyleSheet.create({
   countLineBody: {
     borderTopWidth: 1,
     borderTopColor: "#E0E0E0",
-    paddingTop: 12,
+    paddingTop: 8,
   },
   qtyRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 16,
+  },
+  qtySummaryRow: {
+    flexDirection: "row",
+    gap: 6,
+    marginBottom: 6,
+  },
+  qtySummaryBox: {
+    flex: 1,
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+    borderWidth: 1,
+  },
+  expectedQtyBox: {
+    backgroundColor: "#EEF2FF",
+    borderColor: "#C7D2FE",
+  },
+  countedQtyBox: {
+    backgroundColor: "#F3E8FF",
+    borderColor: "#E9D5FF",
+  },
+  balanceQtyBox: {
+    backgroundColor: "#F8FAFC",
+    borderColor: "#E2E8F0",
+  },
+  qtySummaryLabel: {
+    fontSize: 11,
+    color: "#64748B",
+    fontWeight: "700",
+    marginBottom: 4,
+    textTransform: "uppercase",
+  },
+  qtySummaryValue: {
+    fontSize: 18,
+    fontWeight: "bold",
+  },
+  expectedQtyValue: {
+    color: "#4F46E5",
+  },
+  countedQtyValue: {
+    color: "#9C27B0",
+  },
+  countedQtyEditable: {
+    textDecorationLine: "underline",
+  },
+  tapToEditHint: {
+    fontSize: 10,
+    color: "#9C27B0",
+    marginTop: 2,
+    fontWeight: "600",
+  },
+  qtyHintText: {
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  qtyActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
   },
   qtySection: {
     flex: 1,
@@ -2374,6 +2758,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#999",
   },
+  qtyStatusText: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
   varianceSection: {
     flex: 1,
     alignItems: "center",
@@ -2395,6 +2783,19 @@ const styles = StyleSheet.create({
   },
   editButtonText: {
     color: "#FFF",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  clearLineButton: {
+    backgroundColor: "#FFEBEE",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#FFCDD2",
+  },
+  clearLineButtonText: {
+    color: "#C62828",
     fontSize: 14,
     fontWeight: "600",
   },
@@ -2458,6 +2859,9 @@ const styles = StyleSheet.create({
   topActionButtonGreen: {
     backgroundColor: "#4CAF50",
   },
+  topActionButtonBlue: {
+    backgroundColor: "#2196F3",
+  },
   topActionButtonText: {
     color: "#FFF",
     fontSize: 12,
@@ -2511,24 +2915,26 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
   },
   cartonIdContainer: {
-    flexDirection: "column",
-    marginTop: 6,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    marginTop: 2,
     gap: 6,
   },
   changeCartonButton: {
     backgroundColor: "rgba(255, 255, 255, 0.2)",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
     borderRadius: 6,
-    alignSelf: "flex-start",
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.3)",
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    flexShrink: 0,
   },
   changeCartonButtonText: {
     fontSize: 11,
     color: "#FFF",
-    fontWeight: "600",
+    fontWeight: "700",
   },
   cartonIdCard: {
     backgroundColor: "#0F766E",
@@ -2557,14 +2963,11 @@ const styles = StyleSheet.create({
   },
   cartonIdInputRow: {
     alignSelf: "stretch",
-  },
-  cartonIdInputStack: {
-    alignSelf: "stretch",
-    flexDirection: "column",
-    alignItems: "stretch",
-    gap: 10,
+    width: "100%",
   },
   cartonIdInput: {
+    alignSelf: "stretch",
+    width: "100%",
     backgroundColor: "#FFF",
     borderWidth: 2,
     borderColor: "#CCFBF1",
@@ -2575,31 +2978,63 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: "600",
   },
+  cartonScanActionButton: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 38,
+    maxHeight: 38,
+    paddingHorizontal: 4,
+    backgroundColor: "rgba(255, 255, 255, 0.9)",
+    borderColor: "rgba(255, 255, 255, 0.6)",
+    borderRadius: 10,
+  },
+  cartonScanClearButton: {
+    backgroundColor: "#FEE2E2",
+    borderColor: "#FECACA",
+  },
+  cartonScanClearButtonText: {
+    color: "#B91C1C",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  cartonScanKeyboardButtonText: {
+    color: "#0F766E",
+    fontSize: 12,
+    fontWeight: "700",
+  },
   cartonIdActionRow: {
     flexDirection: "row",
     gap: 10,
-    marginTop: 10,
+    marginTop: 12,
     alignItems: "stretch",
   },
   cartonIdSubmitButton: {
-    alignSelf: "stretch",
     backgroundColor: "#F97316",
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderRadius: 12,
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 0,
-    minHeight: 54,
+    borderColor: "#EA580C",
   },
   cartonIdSubmitButtonText: {
     color: "#FFF",
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: "bold",
+  },
+  createCartonButton: {
+    flex: 1,
+    backgroundColor: "rgba(255, 255, 255, 0.28)",
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.5)",
+    justifyContent: "center",
+  },
+  createCartonButtonText: {
+    color: "#FFF",
+    fontSize: 14,
+    fontWeight: "700",
   },
   generateCartonButton: {
     flex: 1,
-    marginTop: 0,
     backgroundColor: "rgba(255, 255, 255, 0.16)",
     paddingVertical: 14,
     paddingHorizontal: 16,
@@ -2652,5 +3087,157 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: "#666",
     fontWeight: "bold",
+  },
+  binSetupContainer: {
+    flex: 1,
+    backgroundColor: "#F5F5F5",
+  },
+  binSetupScrollContent: {
+    paddingBottom: 24,
+  },
+  binSetupHeader: {
+    backgroundColor: "#9C27B0",
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 16,
+  },
+  binSetupTitle: {
+    fontSize: 24,
+    fontWeight: "bold",
+    color: "#FFF",
+    marginBottom: 4,
+  },
+  binSetupSubtitle: {
+    fontSize: 15,
+    color: "#E1BEE7",
+  },
+  binSetupCard: {
+    backgroundColor: "#FFF",
+    marginHorizontal: 16,
+    marginTop: 12,
+    padding: 14,
+    borderRadius: 12,
+    elevation: 2,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+  },
+  binSetupSection: {
+    marginHorizontal: 16,
+    marginTop: 12,
+  },
+  binSetupFieldLabel: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#333",
+    marginBottom: 8,
+  },
+  binSetupFieldHint: {
+    fontSize: 13,
+    color: "#666",
+    marginTop: -4,
+    marginBottom: 8,
+  },
+  binSetupScanMethodRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  binSetupScanMethodButton: {
+    flex: 1,
+    backgroundColor: "#FFF",
+    borderWidth: 2,
+    borderColor: "#DDD",
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    alignItems: "center",
+  },
+  binSetupScanMethodText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#333",
+    textAlign: "center",
+  },
+  binSetupCardDisabled: {
+    opacity: 0.72,
+  },
+  binSetupBlockedHint: {
+    fontSize: 13,
+    color: "#9C27B0",
+    fontWeight: "600",
+    marginBottom: 8,
+  },
+  binSetupInputWrap: {
+    alignSelf: "stretch",
+    width: "100%",
+  },
+  binSetupInput: {
+    flex: 1,
+    backgroundColor: "#FFF",
+    borderWidth: 2,
+    borderColor: "#9C27B0",
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    fontSize: 18,
+    fontWeight: "600",
+    minHeight: 56,
+  },
+  binSetupInputDisabled: {
+    borderColor: "#CCC",
+    backgroundColor: "#F5F5F5",
+    color: "#999",
+  },
+  binSetupSubmitButton: {
+    backgroundColor: "#9C27B0",
+    borderColor: "#9C27B0",
+    minWidth: 80,
+    minHeight: 56,
+  },
+  binSetupSubmitButtonDisabled: {
+    backgroundColor: "#CCC",
+    borderColor: "#CCC",
+  },
+  binSetupSubmitButtonText: {
+    color: "#FFF",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  binSetupLoading: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    marginTop: 10,
+  },
+  binSetupLoadingText: {
+    fontSize: 13,
+    color: "#666",
+  },
+  binSetupModeRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  binSetupModeButton: {
+    flex: 1,
+    backgroundColor: "#FFF",
+    borderWidth: 2,
+    borderColor: "#DDD",
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  binSetupModeButtonActive: {
+    borderColor: "#9C27B0",
+    backgroundColor: "#F3E5F5",
+  },
+  binSetupModeText: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#333",
+  },
+  binSetupModeTextActive: {
+    color: "#7B1FA2",
   },
 });

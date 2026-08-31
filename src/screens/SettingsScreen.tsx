@@ -314,6 +314,18 @@ export default function SettingsScreen() {
     }
   };
 
+  const openChangePassword = () => {
+    if (!apiUrl.trim()) {
+      Alert.alert("Error", "Please configure and save API URL first");
+      return;
+    }
+    if (!userCode.trim()) {
+      Alert.alert("Error", "Please enter your User Code first");
+      return;
+    }
+    (navigation as any).navigate("ChangePassword");
+  };
+
   const handleSync = async () => {
     if (deviceSessionRestricted) {
       Alert.alert(
@@ -529,11 +541,14 @@ export default function SettingsScreen() {
       {settingsTab === 0 ? (
       <View style={styles.form}>
         <Text style={styles.label}>API URL</Text>
+        <Text style={styles.hint}>
+          Server base only — e.g. http://192.168.5.202:3000 (do not add /api at the end)
+        </Text>
             <TextInput
               style={styles.input}
               value={apiUrl}
               onChangeText={setApiUrl}
-              placeholder="https://api.example.com"
+              placeholder="http://192.168.5.202:3000"
               autoCapitalize="none"
               keyboardType="url"
             />
@@ -573,6 +588,9 @@ export default function SettingsScreen() {
             />
 
             <Text style={styles.label}>Password</Text>
+            <Text style={styles.helpText}>
+              Saved for automatic sign-in. Leave blank only if you sign in manually each time.
+            </Text>
             <TextInput
               style={styles.input}
               value={password}
@@ -581,6 +599,19 @@ export default function SettingsScreen() {
               secureTextEntry
               autoCapitalize="none"
             />
+
+            <TouchableOpacity
+              style={styles.settingsNavRow}
+              onPress={openChangePassword}
+            >
+              <View style={styles.settingsNavRowTextWrap}>
+                <Text style={styles.settingsNavRowTitle}>Change password</Text>
+                <Text style={styles.settingsNavRowSubtitle}>
+                  Update your WMS server password
+                </Text>
+              </View>
+              <Text style={styles.settingsNavRowChevron}>›</Text>
+            </TouchableOpacity>
 
             <Text style={styles.label}>Item master sync</Text>
             <Text style={styles.helpText}>
@@ -1208,6 +1239,12 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     color: "#333",
   },
+  hint: {
+    fontSize: 13,
+    color: "#666",
+    marginTop: -4,
+    marginBottom: 8,
+  },
   input: {
     backgroundColor: "#fff",
     borderWidth: 1,
@@ -1216,6 +1253,35 @@ const styles = StyleSheet.create({
     padding: 16,
     fontSize: 16,
     marginBottom: 16,
+  },
+  settingsNavRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#ddd",
+    borderRadius: 8,
+    padding: 14,
+    marginBottom: 16,
+  },
+  settingsNavRowTextWrap: {
+    flex: 1,
+    paddingRight: 8,
+  },
+  settingsNavRowTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#007AFF",
+    marginBottom: 2,
+  },
+  settingsNavRowSubtitle: {
+    fontSize: 13,
+    color: "#666",
+  },
+  settingsNavRowChevron: {
+    fontSize: 24,
+    color: "#999",
+    fontWeight: "300",
   },
   demoInfo: {
     backgroundColor: "#E3F2FD",

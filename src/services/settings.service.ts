@@ -5,6 +5,7 @@ import * as SQLite from "expo-sqlite";
 import { File, Paths } from "expo-file-system";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_API_URL, DEFAULT_DEMO_MODE } from "../config/default-settings";
+import { normalizeApiBaseUrl } from "../utils/apiUrl";
 
 /** Persists across app restarts so device_id does not change if SQLite row is recreated. */
 const INSTALL_DEVICE_ID_FILE = "printechs_wms_install_device_id.txt";
@@ -229,7 +230,7 @@ const executeSaveSettings = async (settings: Partial<Settings>) => {
             ? settings.api_url === null
               ? null // Explicitly clear
               : settings.api_url && typeof settings.api_url === 'string' && settings.api_url.trim()
-              ? settings.api_url.trim()
+              ? normalizeApiBaseUrl(settings.api_url.trim()) || null
               : null // Empty string becomes null
             : existing?.api_url || null;
         const deviceIdValue =

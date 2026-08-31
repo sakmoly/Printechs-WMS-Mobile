@@ -196,18 +196,20 @@ export default function PickingScanBinScreen() {
 
       <View style={styles.inputSection}>
         <Text style={styles.inputLabel}>Bin Code</Text>
-        <View style={styles.inputRow}>
-          <BarcodeInput
-            ref={binInputRef}
-            autoFocus
-            placeholder="Scan or enter bin code"
-            onBarcodeScanned={async (raw) =>
-              validateBin(raw.trim().toUpperCase())
-            }
-            containerStyle={{ flex: 1 }}
-            inputStyle={styles.input}
-          />
-        </View>
+        <BarcodeInput
+          ref={binInputRef}
+          autoFocus
+          placeholder="Scan or enter bin code"
+          showSoftInputOnFocus
+          onBarcodeScanned={async (raw) =>
+            validateBin(raw.trim().toUpperCase())
+          }
+          containerStyle={styles.barcodeInputWrap}
+          inputStyle={styles.input}
+          submitButtonStyle={styles.submitButton}
+          submitTextStyle={styles.submitButtonText}
+          submitLabel="Submit"
+        />
       </View>
 
       {loading && (
@@ -290,9 +292,9 @@ const styles = StyleSheet.create({
     color: PickingTheme.colors.textPrimary,
     marginBottom: PickingTheme.spacing.sm,
   },
-  inputRow: {
-    flexDirection: "row",
-    gap: PickingTheme.spacing.md,
+  barcodeInputWrap: {
+    alignSelf: "stretch",
+    width: "100%",
   },
   input: {
     flex: 1,
@@ -302,18 +304,20 @@ const styles = StyleSheet.create({
     borderRadius: PickingTheme.borderRadius.small,
     padding: PickingTheme.spacing.md,
     ...PickingTheme.typography.body,
+    minHeight: 60,
   },
-  scanButton: {
-    backgroundColor: PickingTheme.colors.buttonBlue,
-    paddingHorizontal: PickingTheme.spacing.lg,
-    paddingVertical: PickingTheme.spacing.md,
+  submitButton: {
+    backgroundColor: PickingTheme.colors.headerPurple,
+    borderColor: PickingTheme.colors.headerPurple,
     borderRadius: PickingTheme.borderRadius.small,
-    justifyContent: "center",
+    minWidth: 80,
+    paddingHorizontal: 14,
+    minHeight: 60,
   },
-  scanButtonText: {
-    ...PickingTheme.typography.body,
+  submitButtonText: {
     color: PickingTheme.colors.textWhite,
-    fontWeight: "600",
+    fontWeight: "700",
+    fontSize: 15,
   },
   loadingContainer: {
     padding: PickingTheme.spacing.lg,

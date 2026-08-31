@@ -16,6 +16,7 @@ import { apiService } from "../services/api.service";
 import { getSettings } from "../services/settings.service";
 import { StatusBadge } from "../components/StatusBadge";
 import { addEvent } from "../services/event-queue.service";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 
 interface TransferInItem {
   item_code: string;
@@ -65,6 +66,7 @@ export default function TransferInReceivingScreen() {
 
       if (ti) {
         setTransferIn(ti);
+        ensureItemsCachedForTransactionLines(ti.items, `Transfer In receive:${ti.title}`);
       } else {
         Alert.alert("Error", "Transfer In not found");
         navigation.goBack();

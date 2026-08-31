@@ -12,6 +12,7 @@ import {
 import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { apiService } from "../services/api.service";
 import { getDatabase } from "../database/database";
+import { ensureItemsCachedForCodes } from "../services/transaction-item-cache.service";
 import { TransferIn } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 
@@ -130,6 +131,15 @@ export default function TransferInListScreen() {
         }
       }
 
+      const allTiItemCodes = transferInsList.flatMap((ti) =>
+        (ti.items || []).map((i: { item_code?: string }) =>
+          String(i.item_code || "").trim()
+        )
+      );
+      void ensureItemsCachedForCodes(allTiItemCodes, "Transfer In list sync").catch(
+        () => {}
+      );
+
       setTransferIns(transferInsList);
       setErrorMessage(null); // Clear any previous errors
     } catch (error: any) {
@@ -187,7 +197,17 @@ export default function TransferInListScreen() {
         
         setTransferIns(parsed);
         console.log(`📦 TransferInListScreen: Loaded ${parsed.length} Transfer In(s) from cache`);
-        
+
+        const cachedTiItemCodes = parsed.flatMap((ti) =>
+          (ti.items || []).map((i: { item_code?: string }) =>
+            String(i.item_code || "").trim()
+          )
+        );
+        void ensureItemsCachedForCodes(
+          cachedTiItemCodes,
+          "Transfer In list cache"
+        ).catch(() => {});
+
         // If we have cached data, clear the error message
         if (parsed.length > 0) {
           setErrorMessage(null);

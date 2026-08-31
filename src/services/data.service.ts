@@ -3159,9 +3159,9 @@ export const dataService = {
   // Generate session ID based on ASN-Device-User combination
   generateSessionId: (asn_no: string, device_id: string, user_id: string): string => {
     // Remove special characters and normalize
-    const cleanASN = asn_no.replace(/[^A-Z0-9]/g, "").toUpperCase();
-    const cleanDevice = device_id.replace(/[^A-Z0-9]/g, "").toUpperCase();
-    const cleanUser = user_id.replace(/[^A-Z0-9]/g, "").toUpperCase();
+    const cleanASN = asn_no.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const cleanDevice = device_id.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const cleanUser = user_id.toUpperCase().replace(/[^A-Z0-9]/g, "");
     
     // Format: SESSION-{ASN_NUMBER}-{DEVICE_ID}-{USER_ID}
     return `SESSION-${cleanASN}-${cleanDevice}-${cleanUser}`;
@@ -3214,9 +3214,9 @@ export const dataService = {
       const normalizedASN = normalizeASN(asn_no);
       
       // Generate expected session ID pattern
-      const cleanASN = normalizedASN.replace(/[^A-Z0-9]/g, "").toUpperCase();
-      const cleanDevice = device_id.replace(/[^A-Z0-9]/g, "").toUpperCase();
-      const cleanUser = user_id.replace(/[^A-Z0-9]/g, "").toUpperCase();
+      const cleanASN = normalizedASN.toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const cleanDevice = device_id.toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const cleanUser = user_id.toUpperCase().replace(/[^A-Z0-9]/g, "");
       const expectedSessionId = `SESSION-${cleanASN}-${cleanDevice}-${cleanUser}`;
       
       // Get all sessions for this ASN and user, then filter by session ID pattern

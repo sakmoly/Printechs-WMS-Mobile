@@ -14,6 +14,7 @@ import { apiService } from "../services/api.service";
 import { TransferIn } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 import { getDatabase } from "../database/database";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 
 export default function TransferInDetailScreen() {
   const navigation = useNavigation();
@@ -50,6 +51,7 @@ export default function TransferInDetailScreen() {
 
       if (ti) {
         setTransferIn(ti);
+        ensureItemsCachedForTransactionLines(ti.items, `Transfer In:${ti.title}`);
       } else {
         Alert.alert("Error", "Transfer In not found");
         navigation.goBack();

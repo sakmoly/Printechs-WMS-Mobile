@@ -29,6 +29,8 @@ import { syncAllUnsyncedSessions } from "./src/services/session-sync.service";
 // Screens
 import LoginScreen from "./src/screens/LoginScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
+import ChangePasswordScreen from "./src/screens/ChangePasswordScreen";
+import SetupPasswordScreen from "./src/screens/SetupPasswordScreen";
 import HomeScreen from "./src/screens/HomeScreen";
 import StartInboundScreen from "./src/screens/StartInboundScreen";
 import UnloadScreen from "./src/screens/UnloadScreen";
@@ -62,6 +64,7 @@ import CycleCountDashboardScreen from "./src/screens/CycleCountDashboardScreen";
 import CycleCountScanBinScreen from "./src/screens/CycleCountScanBinScreen";
 import CycleCountBinCountingScreen from "./src/screens/CycleCountBinCountingScreen";
 import CycleCountDraftsScreen from "./src/screens/CycleCountDraftsScreen";
+import CycleCountHistoryScreen from "./src/screens/CycleCountHistoryScreen";
 import RemainingItemsScreen from "./src/screens/RemainingItemsScreen";
 import RelocationHomeScreen from "./src/screens/RelocationHomeScreen";
 import RelocationScanFromBinScreen from "./src/screens/RelocationScanFromBinScreen";
@@ -425,6 +428,16 @@ function AppNavigation() {
         />
         <Stack.Screen name="Settings" component={SettingsScreen} />
         <Stack.Screen
+          name="ChangePassword"
+          component={ChangePasswordScreen}
+          options={{ title: "Change Password" }}
+        />
+        <Stack.Screen
+          name="SetupPassword"
+          component={SetupPasswordScreen}
+          options={{ title: "Create Password" }}
+        />
+        <Stack.Screen
           name="Home"
           component={HomeScreen}
           options={{
@@ -529,6 +542,10 @@ function AppNavigation() {
         <Stack.Screen
           name="CycleCountDrafts"
           component={CycleCountDraftsScreen}
+        />
+        <Stack.Screen
+          name="CycleCountHistory"
+          component={CycleCountHistoryScreen}
         />
         <Stack.Screen
           name="RemainingItems"

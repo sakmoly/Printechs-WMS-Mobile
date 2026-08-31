@@ -105,6 +105,7 @@ export default function BoxManagementScreen() {
   const [hasItemsWithoutTO, setHasItemsWithoutTO] = useState(false);
   const [totalASNQty, setTotalASNQty] = useState(0);
   const [totalTOAllocatedQty, setTotalTOAllocatedQty] = useState(0);
+  const [totalPutawayScannedQty, setTotalPutawayScannedQty] = useState(0);
   const [remainingItemsQty, setRemainingItemsQty] = useState(0);
   const [refreshingTO, setRefreshingTO] = useState(false);
   /** Per store: optional carton ID registration (supplier / warehouse reuse) */
@@ -286,6 +287,7 @@ export default function BoxManagementScreen() {
     if (!activeASN) {
       setTotalASNQty(0);
       setTotalTOAllocatedQty(0);
+      setTotalPutawayScannedQty(0);
       setRemainingItemsQty(0);
       return;
     }
@@ -296,6 +298,7 @@ export default function BoxManagementScreen() {
       if (!db) {
         setTotalASNQty(0);
         setTotalTOAllocatedQty(0);
+        setTotalPutawayScannedQty(0);
         setRemainingItemsQty(0);
         return;
       }
@@ -314,6 +317,23 @@ export default function BoxManagementScreen() {
       const totalASN = result?.total_qty || 0;
       setTotalASNQty(totalASN);
 
+      const putawayScannedResult = await db.getFirstAsync<{
+        total_qty: number;
+      }>(
+        `SELECT COALESCE(SUM(si.scanned_qty), 0) as total_qty
+         FROM scanned_items si
+         LEFT JOIN box_cache b ON b.box_id = si.box_id
+         WHERE (si.asn_no = ? OR si.asn_no = ?)
+           AND (
+             UPPER(TRIM(COALESCE(si.box_id, ''))) LIKE 'PAW-%'
+             OR UPPER(TRIM(COALESCE(si.box_id, ''))) LIKE 'PUTAWAY-%'
+             OR UPPER(TRIM(COALESCE(b.purpose, ''))) = 'PUTAWAY'
+           )`,
+        [activeASN, normalizedASN],
+      );
+      const totalPutawayScanned = putawayScannedResult?.total_qty || 0;
+      setTotalPutawayScannedQty(totalPutawayScanned);
+
       // ✅ FIX: Get Total TO Allocated quantity from API (not cache)
       // Fetch TO from API to get allocations
       let totalTO = 0;
@@ -328,7 +348,9 @@ export default function BoxManagementScreen() {
           return;
         }
 
-        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
+          include_completed: true,
+        });
         if (toResponse) {
           const toData =
             toResponse?.data ||
@@ -348,7 +370,7 @@ export default function BoxManagementScreen() {
           if (Array.isArray(allocations) && allocations.length > 0) {
             totalTO = allocations.reduce(
               (sum: number, alloc: any) =>
-                sum + (alloc.allocated_qty || alloc.qty || 0),
+                sum + (alloc.allocated_qty || alloc.to_qty || alloc.qty || 0),
               0,
             );
           }
@@ -392,20 +414,23 @@ export default function BoxManagementScreen() {
       }
       setTotalTOAllocatedQty(totalTO);
 
-      // Remaining putaway = ASN total minus TO allocation sum from API.
+      // Remaining putaway = ASN total minus TO allocation sum from API,
+      // then subtract items already scanned into Putaway boxes.
       // Do NOT override with full ASN when `transferOrder` string is missing but API still returned
       // allocations (totalTO > 0) — that caused Remaining to show 800 while TO Allocated showed 400.
-      const remaining = Math.max(0, totalASN - totalTO);
+      const remaining = Math.max(0, totalASN - totalTO - totalPutawayScanned);
       setRemainingItemsQty(remaining);
 
       console.log(`📊 Remaining Items Calculation:`);
       console.log(`  - Total ASN: ${totalASN}`);
       console.log(`  - Total TO Allocated: ${totalTO}`);
+      console.log(`  - Putaway Scanned: ${totalPutawayScanned}`);
       console.log(`  - Remaining (Putaway): ${remaining}`);
     } catch (error: any) {
       console.warn(`⚠️ Error calculating remaining items:`, error.message);
       setTotalASNQty(0);
       setTotalTOAllocatedQty(0);
+      setTotalPutawayScannedQty(0);
       setRemainingItemsQty(0);
     }
   };
@@ -478,7 +503,9 @@ export default function BoxManagementScreen() {
           return;
         }
 
-        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
+          include_completed: true,
+        });
         if (toResponse) {
           const toData =
             toResponse?.data ||
@@ -691,7 +718,9 @@ export default function BoxManagementScreen() {
       // Fetch TO from API (try activeASN, then normalized ASN if 404)
       let toResponse: any = null;
       try {
-        toResponse = await apiService.getTransferOrderByASN(activeASN);
+        toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
+          include_completed: true,
+        });
         if (toResponse === null) {
           const normalizedASNForTO = normalizeASN(activeASN);
           if (normalizedASNForTO !== activeASN) {
@@ -699,7 +728,9 @@ export default function BoxManagementScreen() {
               `🔄 Retrying Transfer Order with normalized ASN: ${normalizedASNForTO}`,
             );
             toResponse =
-              await apiService.getTransferOrderByASN(normalizedASNForTO);
+              await apiService.getLiveTransferOrderByASN(normalizedASNForTO, {
+                include_completed: true,
+              });
           }
         }
       } catch (_) {
@@ -928,7 +959,10 @@ export default function BoxManagementScreen() {
                       normalizedASN,
                       resolved.storeToPersist,
                       lineItem,
-                      allocation.allocated_qty || allocation.qty || 0,
+                      allocation.allocated_qty ||
+                        allocation.to_qty ||
+                        allocation.qty ||
+                        0,
                     ],
                   );
                 }
@@ -3416,13 +3450,16 @@ export default function BoxManagementScreen() {
 
   // Check if there are Putaway boxes (to show the section even if no items without TO)
   const hasPutawayBoxes = putawayBoxes.length > 0;
+  const availablePutawayBoxQty = !transferOrder
+    ? Math.max(0, totalASNQty - totalPutawayScannedQty)
+    : remainingItemsQty;
   // ✅ FIX: Show Putaway section if:
   // 1. No TO exists (no transfer order) AND there's available quantity (totalASNQty > 0), OR
   // 2. Remaining items > 0 (Total ASN - Total TO > 0), OR
   // 3. There are Putaway boxes already created
   // This allows creating Putaway boxes even when there's no Transfer Order but there's available quantity
   const showPutawaySection =
-    (!transferOrder && totalASNQty > 0) || // No TO but has available quantity
+    (!transferOrder && availablePutawayBoxQty > 0) || // No TO but has available quantity
     remainingItemsQty > 0 || // Has remaining items after TO allocation
     hasPutawayBoxes; // Already has Putaway boxes
 
@@ -3563,6 +3600,14 @@ export default function BoxManagementScreen() {
                     {totalTOAllocatedQty}
                   </Text>
                 </View>
+                <View style={styles.putawayCalculationRow}>
+                  <Text style={styles.putawayCalculationLabel}>
+                    Putaway Scanned:
+                  </Text>
+                  <Text style={styles.putawayCalculationValue}>
+                    {totalPutawayScannedQty}
+                  </Text>
+                </View>
                 <View
                   style={[
                     styles.putawayCalculationRow,
@@ -3597,8 +3642,9 @@ export default function BoxManagementScreen() {
                 </View>
                 {remainingItemsQty === 0 && (
                   <Text style={styles.putawayCalculationNote}>
-                    ✅ All items are allocated to Transfer Order. No Putaway
-                    needed.
+                    {totalPutawayScannedQty > 0
+                      ? "✅ All Putaway items are already scanned."
+                      : "✅ All items are allocated to Transfer Order. No Putaway needed."}
                   </Text>
                 )}
               </View>
@@ -3635,7 +3681,7 @@ export default function BoxManagementScreen() {
                 1. No TO exists AND there's available quantity (totalASNQty > 0), OR
                 2. Remaining items > 0 (Total ASN - Total TO > 0)
                 This allows creating Putaway boxes even when there's no Transfer Order but there's available quantity */}
-            {((!transferOrder && totalASNQty > 0) || remainingItemsQty > 0) && (
+            {availablePutawayBoxQty > 0 && (
               <TouchableOpacity
                 style={[
                   styles.createPutawayButton,
@@ -3647,7 +3693,7 @@ export default function BoxManagementScreen() {
                 <Text style={styles.createPutawayButtonText}>
                   {loading
                     ? "Creating..."
-                    : `+ Create Putaway BOX (${!transferOrder && totalASNQty > 0 ? totalASNQty : remainingItemsQty} items)`}
+                    : `+ Create Putaway BOX (${availablePutawayBoxQty} items)`}
                 </Text>
               </TouchableOpacity>
             )}

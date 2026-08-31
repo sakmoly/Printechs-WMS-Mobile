@@ -199,11 +199,15 @@ export default function RelocationScanToBinScreen() {
             ref={binInputRef}
             autoFocus
             placeholder="Scan or enter bin code"
+            showSoftInputOnFocus
             onBarcodeScanned={async (raw) =>
               validateBin(raw.trim().toUpperCase())
             }
-            containerStyle={{ alignSelf: "stretch" }}
+            containerStyle={styles.barcodeInputWrap}
             inputStyle={styles.input}
+            submitButtonStyle={styles.submitButton}
+            submitTextStyle={styles.submitButtonText}
+            submitLabel="Submit"
           />
         </View>
 
@@ -325,7 +329,12 @@ const styles = StyleSheet.create({
     marginBottom: PickingTheme.spacing.sm,
     fontWeight: "600",
   },
+  barcodeInputWrap: {
+    alignSelf: "stretch",
+    width: "100%",
+  },
   input: {
+    flex: 1,
     backgroundColor: PickingTheme.colors.backgroundLight,
     borderRadius: PickingTheme.borderRadius.medium,
     padding: PickingTheme.spacing.md,
@@ -333,6 +342,20 @@ const styles = StyleSheet.create({
     fontSize: 16,
     borderWidth: 2,
     borderColor: PickingTheme.colors.borderLight,
+    minHeight: 60,
+  },
+  submitButton: {
+    backgroundColor: PickingTheme.colors.headerOrange,
+    borderColor: PickingTheme.colors.headerOrange,
+    borderRadius: PickingTheme.borderRadius.medium,
+    minWidth: 80,
+    paddingHorizontal: 14,
+    minHeight: 60,
+  },
+  submitButtonText: {
+    color: PickingTheme.colors.textWhite,
+    fontWeight: "700",
+    fontSize: 15,
   },
   loadingContainer: {
     alignItems: "center",

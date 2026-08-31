@@ -416,6 +416,20 @@ export const CREATE_ITEM_BARCODE_MAP_TABLE = `
   );
 `;
 
+// Stock Ledger Carton Cache (carton-level qty for cycle count expected)
+export const CREATE_STOCK_LEDGER_CARTON_CACHE_TABLE = `
+  CREATE TABLE IF NOT EXISTS stock_ledger_carton_cache (
+    item_code TEXT NOT NULL,
+    warehouse TEXT NOT NULL,
+    bin_location TEXT NOT NULL,
+    carton_id TEXT NOT NULL DEFAULT '',
+    qty REAL DEFAULT 0,
+    reserved_qty REAL DEFAULT 0,
+    updated_on TEXT,
+    PRIMARY KEY (item_code, warehouse, bin_location, carton_id)
+  );
+`;
+
 // Stock Ledger Cache Table
 export const CREATE_STOCK_LEDGER_CACHE_TABLE = `
   CREATE TABLE IF NOT EXISTS stock_ledger_cache (
@@ -483,6 +497,7 @@ export const ALL_MIGRATIONS = [
   CREATE_BIN_MASTER_CACHE_TABLE,
   CREATE_ITEM_BARCODE_MAP_TABLE,
   CREATE_STOCK_LEDGER_CACHE_TABLE,
+  CREATE_STOCK_LEDGER_CARTON_CACHE_TABLE,
   CREATE_STOCK_TRANSACTION_CACHE_TABLE,
   CREATE_MATERIAL_REQUEST_PICKING_SESSIONS_TABLE,
   CREATE_TRANSFER_IN_RECEIVING_SESSIONS_TABLE,

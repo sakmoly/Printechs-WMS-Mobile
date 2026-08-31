@@ -23,6 +23,7 @@ import { getDatabase } from "../database/database";
 import { dataService } from "../services/data.service";
 import { getSettings } from "../services/settings.service";
 import { pickingSessionService, PickingSession } from "../services/picking-session.service";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 import { formatDateOnly } from "../utils/date";
 
 export default function MaterialRequestDetailScreen() {
@@ -204,6 +205,10 @@ export default function MaterialRequestDetailScreen() {
           console.log(`📊 Using status from backend: ${newMR.status}`);
           return newMR;
         });
+        ensureItemsCachedForTransactionLines(
+          mrWithPickedQty.items,
+          `MR:${mrWithPickedQty.title}`
+        );
         } else {
         // Material Request not found in API response - check if it was deleted
         console.log(`⚠️ Material Request not found in API response, checking if deleted...`);
@@ -1905,6 +1910,13 @@ export default function MaterialRequestDetailScreen() {
           .sort((a, b) => b.qty - a.qty); // Sort by quantity descending
       }
 
+      formattedStock = formattedStock.map((entry) => ({
+        ...entry,
+        cartons: entry.cartons?.length
+          ? [...entry.cartons].sort((a, b) => b.qty - a.qty)
+          : entry.cartons,
+      }));
+
       console.log(
         `📦 Formatted stock (${formattedStock.length} with qty > 0):`,
         JSON.stringify(formattedStock).substring(0, 500)
@@ -2356,14 +2368,17 @@ export default function MaterialRequestDetailScreen() {
                           {hasCartons && item.cartons && item.cartons.length > 0 ? (
                             <View style={styles.cartonsList}>
                               {item.cartons.map((carton, cartonIdx) => (
-                                <Text 
-                                  key={cartonIdx}
-                                  style={styles.cartonIdUnderLocation}
-                                  numberOfLines={1}
-                                  ellipsizeMode="tail"
-                                >
-                                  {carton.carton_id}
-                                </Text>
+                                <View key={cartonIdx} style={styles.cartonRow}>
+                                  <Text style={styles.cartonBullet}>•</Text>
+                                  <Text
+                                    style={styles.cartonId}
+                                    numberOfLines={1}
+                                    ellipsizeMode="tail"
+                                  >
+                                    {carton.carton_id}
+                                  </Text>
+                                  <Text style={styles.cartonQty}>{carton.qty}</Text>
+                                </View>
                               ))}
                             </View>
                           ) : (
@@ -2748,8 +2763,30 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   cartonsList: {
-    marginTop: 2,
-    marginLeft: 4,
+    marginTop: 4,
+    paddingLeft: 8,
+  },
+  cartonRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 4,
+  },
+  cartonBullet: {
+    fontSize: 12,
+    color: "#999",
+    marginRight: 6,
+  },
+  cartonId: {
+    fontSize: 12,
+    color: "#666",
+    flex: 1,
+  },
+  cartonQty: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#9C27B0",
+    width: 50,
+    textAlign: "right",
   },
   cartonIdUnderLocation: {
     fontSize: 12,

@@ -15,6 +15,7 @@ import { getDatabase } from "../database/database";
 import { CycleCount } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 import { getSettings } from "../services/settings.service";
+import { ensureItemsCachedForCodes } from "../services/transaction-item-cache.service";
 
 // Removed mock data - data should come from backend API
 
@@ -102,6 +103,15 @@ export default function CycleCountListScreen() {
           console.warn(`⚠️ Failed to cache Cycle Count ${cc.title}:`, error.message);
         }
       }
+
+      const allCcItemCodes = ccList.flatMap((cc) =>
+        (cc.items || cc.lines || []).map((i: { item_code?: string }) =>
+          String(i.item_code || "").trim()
+        )
+      );
+      void ensureItemsCachedForCodes(allCcItemCodes, "Cycle Count list sync").catch(
+        () => {}
+      );
 
       setCycleCounts(ccList);
       setErrorMessage(null); // Clear any previous errors

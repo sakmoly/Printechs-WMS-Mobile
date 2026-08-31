@@ -17,6 +17,7 @@ import { MaterialRequest } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { formatDateOnly } from "../utils/date";
+import { ensureItemsCachedForCodes } from "../services/transaction-item-cache.service";
 
 // Helper function to get status sort order
 const getStatusSortOrder = (status: string | undefined): number => {
@@ -283,6 +284,15 @@ export default function MaterialRequestListScreen() {
         }
       }
 
+      const allMrItemCodes = mrList.flatMap((mr) =>
+        (mr.items || []).map((i: { item_code?: string }) =>
+          String(i.item_code || "").trim()
+        )
+      );
+      void ensureItemsCachedForCodes(allMrItemCodes, "MR list sync").catch(
+        () => {}
+      );
+
       // Calculate picked quantities from event queue for each Material Request
       const mrListWithPickedQty = await Promise.all(
         mrList.map(async (mr) => {
@@ -397,6 +407,16 @@ export default function MaterialRequestListScreen() {
           );
 
           setMaterialRequests(sortedCachedMaterialRequests);
+
+          const cachedMrItemCodes = parsedWithPickedQty.flatMap((mr) =>
+            (mr.items || []).map((i: { item_code?: string }) =>
+              String(i.item_code || "").trim()
+            )
+          );
+          void ensureItemsCachedForCodes(
+            cachedMrItemCodes,
+            "MR list cache"
+          ).catch(() => {});
         } else {
           console.warn("⚠️ No cached Material Requests found.");
           // No mock data - Material Requests should come from backend only

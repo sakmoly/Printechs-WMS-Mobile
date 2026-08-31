@@ -1,5 +1,7 @@
 import { getSettings, saveSettings } from "./settings.service";
 import { ScanEvent } from "../types";
+import { joinApiUrl, normalizeApiBaseUrl } from "../utils/apiUrl";
+import { parseAuthErrorPayload, throwAuthError } from "../utils/password-auth";
 
 /** Query params for GET /api/master/items (paging + incremental). */
 export type PullItemMasterParams = {
@@ -55,7 +57,7 @@ const authenticate = async (): Promise<string | null> => {
 
   for (const loginEndpoint of loginEndpoints) {
     try {
-      const url = `${settings.api_url.replace(/\/$/, "")}${loginEndpoint}`;
+      const url = joinApiUrl(settings.api_url, loginEndpoint);
       console.log(`🔐 Login attempt: ${url}`);
       console.log(`📤 Request body:`, {
         user_code: settings.user_code || settings.user_id,
@@ -253,7 +255,7 @@ const makeRequest = async (
   let authToken = await authenticate();
 
   // In production mode with API URL configured, make real API call
-  const url = `${settings.api_url.replace(/\/$/, "")}${endpoint}`;
+  const url = joinApiUrl(settings.api_url, endpoint);
   console.log(`🌐 API Request: ${method} ${url}`);
   
   // ✅ DEBUG: Log events/batch requests to verify structure
@@ -289,6 +291,26 @@ const makeRequest = async (
     console.log(
       `📦 Carton Status Update Request:`,
       JSON.stringify(body, null, 2)
+    );
+  }
+
+  // ✅ DEBUG: Log ERP push-capture (user + device on task header)
+  if (endpoint === "/api/cycle-count/push-capture" && method === "POST" && body?.payload) {
+    const task = body.payload.task || {};
+    console.log(
+      `📤 Cycle Count push-capture request:`,
+      JSON.stringify(
+        {
+          external_ref: task.external_ref,
+          counted_by: task.counted_by,
+          device_id: task.device_id,
+          mobile_device_id: task.mobile_device_id,
+          payload_device_id: body.payload.device_id,
+          line_count: body.payload.lines?.length ?? 0,
+        },
+        null,
+        2
+      )
     );
   }
 
@@ -569,7 +591,7 @@ const makeRequest = async (
         });
 
         // Retry the request with new authentication
-        return makeRequest(endpoint, method, body, false);
+        return makeRequest(endpoint, method, body, false, timeoutMs);
       }
 
       if (response.status === 403 && retryAuth) {
@@ -588,7 +610,7 @@ const makeRequest = async (
             auth_token: undefined,
             auth_token_expires: undefined,
           });
-          return makeRequest(endpoint, method, body, false);
+          return makeRequest(endpoint, method, body, false, timeoutMs);
         }
       }
 
@@ -1194,6 +1216,20 @@ const simulateApiResponse = async (
 
   if (endpoint.startsWith("/api/transfer-cartons")) {
     return [];
+  }
+
+  // Online item lookup (cycle count Scan Online)
+  if (endpoint.includes("/api/master/items/lookup")) {
+    const query = endpoint.includes("?") ? endpoint.split("?")[1] : "";
+    const sp = new URLSearchParams(query);
+    const scanned = (sp.get("barcode") || sp.get("item_code") || "").trim();
+    return {
+      ok: true,
+      found: false,
+      message: scanned
+        ? `Item or barcode '${scanned}' not found in system`
+        : "Item not found",
+    };
   }
 
   // Master Data Pull APIs — paged item master (demo)
@@ -2272,6 +2308,47 @@ export const apiService = {
     return await makeRequest(`/api/transfer-order/by-asn/${asn_no}`, "GET");
   },
 
+  getLiveTransferOrderByASN: async (
+    asn_no: string,
+    params?: { inbound_session?: string; include_completed?: boolean }
+  ) => {
+    const encodedASN = encodeURIComponent(asn_no.trim());
+    const queryParams = new URLSearchParams();
+    if (params?.inbound_session) {
+      queryParams.set("inbound_session", params.inbound_session.trim());
+    }
+    queryParams.set(
+      "include_completed",
+      params?.include_completed === false ? "false" : "true"
+    );
+    const query = queryParams.toString();
+    return await makeRequest(
+      `/api/transfer-order/by-asn/${encodedASN}/live${query ? `?${query}` : ""}`,
+      "GET"
+    );
+  },
+
+  getReceiveSortDistributionDetails: async (params: {
+    asn_no: string;
+    item_code: string;
+    inbound_session?: string;
+    carton_id?: string | null;
+  }) => {
+    const queryParams = new URLSearchParams();
+    queryParams.set("asn_no", params.asn_no.trim());
+    queryParams.set("item_code", params.item_code.trim());
+    if (params.inbound_session) {
+      queryParams.set("inbound_session", params.inbound_session.trim());
+    }
+    if (params.carton_id) {
+      queryParams.set("carton_id", params.carton_id.trim());
+    }
+    return await makeRequest(
+      `/api/receive-sort/distribution-details?${queryParams.toString()}`,
+      "GET"
+    );
+  },
+
   /**
    * Get boxes for a specific ASN and store.
    * 
@@ -2378,6 +2455,24 @@ export const apiService = {
     return makeRequest(path, "GET", undefined, true, ITEM_MASTER_API_TIMEOUT_MS);
   },
 
+  lookupItem: async (params: {
+    barcode?: string;
+    item_code?: string;
+    online?: boolean;
+  }) => {
+    const q = new URLSearchParams();
+    if (params.barcode) q.set("barcode", params.barcode.trim());
+    if (params.item_code) q.set("item_code", params.item_code.trim());
+    if (params.online) q.set("online", "true");
+    return makeRequest(
+      `/api/master/items/lookup?${q.toString()}`,
+      "GET",
+      undefined,
+      true,
+      ITEM_MASTER_API_TIMEOUT_MS
+    );
+  },
+
   pullASNData: async () => {
     return makeRequest("/api/master/asns", "GET");
   },
@@ -2474,6 +2569,129 @@ export const apiService = {
     return result;
   },
 
+  /**
+   * First-time WMS password when server user has no password_hash (POST /api/auth/setup-password).
+   * Does not require auth. Caller should login afterward for a mobile device session.
+   */
+  setupInitialPassword: async (
+    user_code: string,
+    new_password: string,
+    confirm_password: string
+  ): Promise<void> => {
+    const settings = await getSettings();
+    if (settings.demo_mode === 1 || !settings.api_url) {
+      throw new Error("API URL is required to set a password");
+    }
+
+    const url = joinApiUrl(settings.api_url, "/api/auth/setup-password");
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_code: user_code.trim(),
+          new_password,
+          confirm_password,
+        }),
+        signal: controller.signal,
+      });
+
+      const responseText = await response.text();
+      let responseData: any = {};
+      if (responseText) {
+        try {
+          responseData = JSON.parse(responseText);
+        } catch {
+          responseData = { message: responseText };
+        }
+      }
+
+      if (!response.ok) {
+        const { message, code } = parseAuthErrorPayload(
+          responseData,
+          `Failed to set password (${response.status})`
+        );
+        throwAuthError(message, code);
+      }
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        throw new Error("Password setup timeout: server took too long to respond");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+
+  /**
+   * Change password for the logged-in user (POST /api/auth/change-password, Bearer required).
+   */
+  changePassword: async (
+    user_code: string,
+    current_password: string,
+    new_password: string
+  ): Promise<void> => {
+    const settings = await getSettings();
+    if (settings.demo_mode === 1 || !settings.api_url) {
+      throw new Error("API URL is required to change password");
+    }
+
+    const url = joinApiUrl(settings.api_url, "/api/auth/change-password");
+    const authToken = await authenticate();
+    if (!authToken) {
+      throw new Error(
+        "Please sign in with your current password before changing it."
+      );
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          user_code: user_code.trim(),
+          current_password,
+          new_password,
+        }),
+        signal: controller.signal,
+      });
+
+      const responseText = await response.text();
+      let responseData: any = {};
+      if (responseText) {
+        try {
+          responseData = JSON.parse(responseText);
+        } catch {
+          responseData = { message: responseText };
+        }
+      }
+
+      if (!response.ok) {
+        const { message, code } = parseAuthErrorPayload(
+          responseData,
+          `Failed to change password (${response.status})`
+        );
+        throwAuthError(message, code);
+      }
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        throw new Error("Change password timeout: server took too long to respond");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+
   // Authentication
   login: async (
     user_code: string,
@@ -2509,7 +2727,7 @@ export const apiService = {
       }
 
       try {
-        const url = `${settings.api_url.replace(/\/$/, "")}${loginEndpoint}`;
+        const url = joinApiUrl(settings.api_url, loginEndpoint);
 
         // Trim credentials to remove any leading/trailing whitespace
         const trimmedUserCode = user_code?.trim() || "";
@@ -2695,13 +2913,17 @@ export const apiService = {
               );
             }
 
-            // Create detailed error message
-            const errorMessage =
-              errorData.error?.message ||
-              errorData.message ||
-              errorData.error ||
-              (errorText ? errorText.substring(0, 100) : null) ||
-              `Login failed: ${response.status} ${response.statusText}`;
+            const { message: errorMessage, code: authErrCode } =
+              parseAuthErrorPayload(
+                errorData,
+                errorText
+                  ? errorText.substring(0, 100)
+                  : `Login failed: ${response.status} ${response.statusText}`
+              );
+
+            if (authErrCode === "PASSWORD_NOT_SET") {
+              throwAuthError(errorMessage, "PASSWORD_NOT_SET");
+            }
 
             // If it's not 404 and not the last endpoint, throw to try next
             if (loginEndpoint !== loginEndpoints[loginEndpoints.length - 1]) {
@@ -2710,10 +2932,10 @@ export const apiService = {
                 continue;
               }
               // For other errors (like 400, 401), throw to show error immediately
-              throw new Error(errorMessage);
+              throwAuthError(errorMessage, authErrCode);
             } else {
               // Last endpoint, throw the error
-              throw new Error(errorMessage);
+              throwAuthError(errorMessage, authErrCode);
             }
           }
         } catch (fetchError: any) {
@@ -2769,7 +2991,7 @@ export const apiService = {
         return { success: false, message: "API URL is required" };
       }
 
-      // Normalize URL (remove trailing slash, ensure protocol)
+      // Normalize URL (remove trailing slash, ensure protocol, strip duplicate /api)
       let normalizedUrl = apiUrl.trim();
       if (
         !normalizedUrl.startsWith("http://") &&
@@ -2777,15 +2999,14 @@ export const apiService = {
       ) {
         normalizedUrl = `https://${normalizedUrl}`;
       }
-      normalizedUrl = normalizedUrl.replace(/\/+$/, ""); // Remove trailing slashes
+      normalizedUrl = normalizeApiBaseUrl(normalizedUrl);
 
       // Test with a simple health check endpoint or a lightweight GET request
-      // Try /api/health first, fallback to root endpoint
-      const testEndpoints = ["/api/health", "/api/ping", "/"];
+      const testEndpoints = ["/health", "/api/health", "/api/ping", "/"];
 
       for (const endpoint of testEndpoints) {
         try {
-          const url = `${normalizedUrl}${endpoint}`;
+          const url = joinApiUrl(normalizedUrl, endpoint);
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout for test
 
@@ -3855,6 +4076,77 @@ export const apiService = {
     lines?: any[]; // Required - array of cycle count lines (can be empty for new task)
   }) => {
     return makeRequest(`/api/cycle-count`, "POST", data);
+  },
+
+  /** Push cycle count capture to ERP via wms-api proxy (forwards to ERPNext). */
+  syncCycleCountTaskCaptureOnly: async (payload: {
+    task: {
+      external_ref: string;
+      count_mode?: string;
+      company?: string;
+      warehouse: string;
+      warehouse_code?: string;
+      bin_location: string;
+      posting_date: string;
+      status?: string;
+      counted_by: string;
+      device_id: string;
+      mobile_device_id?: string;
+    };
+    lines: {
+      item_code: string;
+      bin_location: string;
+      carton_id?: string;
+      counted_qty: number;
+    }[];
+  }) => {
+    const deviceId = String(payload.task.device_id || "").trim();
+    const capturePayload = {
+      ...payload,
+      task: {
+        ...payload.task,
+        device_id: deviceId,
+        mobile_device_id: deviceId,
+      },
+      device_id: deviceId,
+      mobile_device_id: deviceId,
+      counted_by: payload.task.counted_by,
+    };
+    console.log(
+      `📤 Cycle Count push-capture identity:`,
+      JSON.stringify({
+        external_ref: capturePayload.task.external_ref,
+        counted_by: capturePayload.task.counted_by,
+        device_id: deviceId,
+        mobile_device_id: deviceId,
+      })
+    );
+    return makeRequest("/api/cycle-count/push-capture", "POST", {
+      payload: capturePayload,
+    }).then((response) => {
+      const msg = response?.message ?? response;
+      console.log(
+        `📥 Cycle Count push-capture response:`,
+        JSON.stringify(
+          {
+            api_version: msg?.api_version,
+            task: msg?.task,
+            device_id: msg?.device_id,
+            counted_by: msg?.counted_by,
+            audit_debug: msg?.audit_debug,
+            ok: msg?.ok,
+          },
+          null,
+          2
+        )
+      );
+      return response;
+    });
+  },
+
+  /** Pull posted stock balances from ERP after finance posts the batch. */
+  getCycleCountStockSync: async (batch_name: string) => {
+    return makeRequest("/api/cycle-count/stock-sync", "POST", { batch_name });
   },
 
   // ============================================

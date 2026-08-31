@@ -14,6 +14,7 @@ import { apiService } from "../services/api.service";
 import { CycleCount } from "../types";
 import { StatusBadge } from "../components/StatusBadge";
 import { getSettings } from "../services/settings.service";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 
 // Removed mock data - data should come from backend API
 // Mock data function removed
@@ -314,6 +315,10 @@ export default function CycleCountDetailScreen() {
           cc.items = cc.lines;
         }
         setCycleCount(cc);
+        ensureItemsCachedForTransactionLines(
+          cc.items || cc.lines,
+          `Cycle Count:${cc.title}`
+        );
       } else {
         // No data from API
         console.warn(`⚠️ CycleCountDetailScreen: No data found for ${cycleCountTitle}`);

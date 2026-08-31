@@ -48,6 +48,39 @@ export default function LoginScreen() {
     }
   };
 
+  const completeLogin = async (loginUser: string, loginPassword: string) => {
+    const settings = await getSettings();
+    await saveSettings({
+      user_code: loginUser,
+      ...(settings.user_id ? {} : { user_id: loginUser }),
+      password: loginPassword,
+      auth_token: undefined,
+      auth_token_expires: undefined,
+    });
+
+    const token = await apiService.login(loginUser, loginPassword);
+    if (token) {
+      await refreshSettings();
+      await refreshDeviceSessionStatus();
+      navigation.dispatch(
+        CommonActions.reset({
+          index: 0,
+          routes: [{ name: "Home" as never }],
+        })
+      );
+      return true;
+    }
+    Alert.alert("Login Failed", "Invalid credentials or server error");
+    return false;
+  };
+
+  const openSetupPassword = () => {
+    navigation.navigate(
+      "SetupPassword" as never,
+      { userCode: userCode.trim() } as never
+    );
+  };
+
   const handleLogin = async () => {
     if (demoMode) {
       // In demo mode, go directly to home
@@ -68,7 +101,6 @@ export default function LoginScreen() {
 
     setLoggingIn(true);
     try {
-      // Get settings once (reuse from loadSettings if possible, but ensure we have latest)
       const settings = await getSettings();
 
       if (!settings.api_url) {
@@ -80,37 +112,28 @@ export default function LoginScreen() {
         return;
       }
 
-      // Update user_code, password, and clear token in a single database operation
       const loginUser = userCode.trim();
-      await saveSettings({
-        user_code: loginUser,
-        user_id: loginUser,
-        password: password,
-        auth_token: undefined,
-        auth_token_expires: undefined,
-      });
-
-      // Try to authenticate - this will use the updated user_code and password
-      const token = await apiService.login(userCode.trim(), password);
-
-      if (token) {
-        // Refresh settings to update context (this is quick, just one DB read)
-        await refreshSettings();
-        await refreshDeviceSessionStatus();
-        navigation.dispatch(
-          CommonActions.reset({
-            index: 0,
-            routes: [{ name: "Home" as never }],
-          })
-        );
-      } else {
-        Alert.alert("Login Failed", "Invalid credentials or server error");
-      }
+      await completeLogin(loginUser, password);
     } catch (error: any) {
       console.error("Login error:", error);
 
       const errCode = (error as { code?: string }).code;
-      const isSessionExists =
+      if (errCode === "PASSWORD_NOT_SET") {
+        Alert.alert(
+          "Create your password",
+          "No WMS password is set for this account yet. Create one to continue.",
+          [
+            { text: "Cancel", style: "cancel" },
+            {
+              text: "Create password",
+              onPress: openSetupPassword,
+            },
+          ]
+        );
+        return;
+      }
+
+      if (
         errCode === "AUTH_SESSION_EXISTS" ||
         String(error?.message || "").includes("Login session issue") ||
         String(error?.message || "").includes(
@@ -118,9 +141,8 @@ export default function LoginScreen() {
         ) ||
         String(error?.message || "").includes(
           "already logged in on another mobile"
-        );
-
-      if (isSessionExists) {
+        )
+      ) {
         Alert.alert(
           "Login session issue",
           error?.message ||
@@ -132,9 +154,12 @@ export default function LoginScreen() {
               onPress: async () => {
                 setLoggingIn(true);
                 try {
+                  const currentSettings = await getSettings();
                   await saveSettings({
                     user_code: userCode.trim(),
-                    user_id: userCode.trim(),
+                    ...(currentSettings.user_id
+                      ? {}
+                      : { user_id: userCode.trim() }),
                     password: password,
                     auth_token: undefined,
                     auth_token_expires: undefined,
@@ -178,10 +203,11 @@ export default function LoginScreen() {
       let errorMessage = error.message || "Failed to login";
 
       if (
+        errCode === "AUTH_INVALID" ||
         errorMessage.includes("Invalid credentials") ||
         errorMessage.includes("AUTH_FAILED")
       ) {
-        errorMessage = `Invalid credentials.\n\nPlease verify:\n1. User Code: "${userCode}"\n2. Password is correct (case-sensitive)\n3. User exists on the server\n\nCommon issues:\n• Password might be different on server\n• User might not be created yet\n• Check server logs for authentication errors\n\nTip: If this is a new setup, ensure the user exists in the server database with the correct password.`;
+        errorMessage = `Invalid credentials.\n\nPlease verify:\n1. User Code: "${userCode}"\n2. Password is correct (case-sensitive)\n3. User exists on the server\n\nIf you recently changed your password, use the new one.\nIf this is a new account with no password yet, tap "First time? Create your password" below.`;
       } else if (errorMessage.includes("401")) {
         errorMessage = `Authentication failed (401).\n\nPlease check:\n1. User Code and Password are correct\n2. User exists in the server database\n3. Server login endpoint is working\n4. Password is not hashed (server should compare plain text or hash the input)`;
       } else if (
@@ -309,6 +335,17 @@ export default function LoginScreen() {
           )}
         </TouchableOpacity>
 
+        {!demoMode ? (
+          <TouchableOpacity
+            style={styles.modeToggleLink}
+            onPress={openSetupPassword}
+          >
+            <Text style={styles.modeToggleLinkText}>
+              First time? Create your password
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+
         <TouchableOpacity
           style={styles.settingsLink}
           onPress={() => navigation.navigate("Settings" as never)}
@@ -408,6 +445,16 @@ const styles = StyleSheet.create({
     color: "#007AFF",
     fontSize: 16,
     fontWeight: "600",
+  },
+  modeToggleLink: {
+    padding: 12,
+    alignItems: "center",
+  },
+  modeToggleLinkText: {
+    color: "#5856D6",
+    fontSize: 15,
+    fontWeight: "600",
+    textAlign: "center",
   },
   networkStatusContainer: {
     alignItems: "center",

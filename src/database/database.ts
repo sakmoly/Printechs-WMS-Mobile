@@ -306,6 +306,60 @@ export async function runSchemaMigrations(db: SQLite.SQLiteDatabase) {
       }
     }
 
+    // cycle_count_sessions: count_mode + erp_batch for ERP push/sync
+    try {
+      const sessionColumns = await db.getAllAsync<{ name: string }>(
+        "PRAGMA table_info(cycle_count_sessions)"
+      );
+      if (sessionColumns.length > 0) {
+        if (!sessionColumns.some((col) => col.name === "count_mode")) {
+          console.log("📝 Adding count_mode column to cycle_count_sessions...");
+          await db.execAsync(
+            "ALTER TABLE cycle_count_sessions ADD COLUMN count_mode TEXT"
+          );
+        }
+        if (!sessionColumns.some((col) => col.name === "erp_batch")) {
+          console.log("📝 Adding erp_batch column to cycle_count_sessions...");
+          await db.execAsync(
+            "ALTER TABLE cycle_count_sessions ADD COLUMN erp_batch TEXT"
+          );
+        }
+        if (!sessionColumns.some((col) => col.name === "erp_locked_carton_id")) {
+          console.log(
+            "📝 Adding erp_locked_carton_id column to cycle_count_sessions..."
+          );
+          await db.execAsync(
+            "ALTER TABLE cycle_count_sessions ADD COLUMN erp_locked_carton_id TEXT"
+          );
+        }
+      }
+    } catch (error: any) {
+      if (!error?.message?.includes("no such table")) {
+        console.error(
+          "❌ Error checking/adding cycle count session columns:",
+          error
+        );
+      }
+    }
+
+    // stock_ledger_carton_cache table
+    try {
+      await db.execAsync(`
+        CREATE TABLE IF NOT EXISTS stock_ledger_carton_cache (
+          item_code TEXT NOT NULL,
+          warehouse TEXT NOT NULL,
+          bin_location TEXT NOT NULL,
+          carton_id TEXT NOT NULL DEFAULT '',
+          qty REAL DEFAULT 0,
+          reserved_qty REAL DEFAULT 0,
+          updated_on TEXT,
+          PRIMARY KEY (item_code, warehouse, bin_location, carton_id)
+        );
+      `);
+    } catch (error: any) {
+      console.error("❌ Error creating stock_ledger_carton_cache:", error);
+    }
+
     if (
       hasActiveAsn &&
       hasActiveSession &&

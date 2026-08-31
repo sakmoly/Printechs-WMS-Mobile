@@ -8,6 +8,9 @@ import {
   itemCodeFromAllocationRow,
 } from "../utils/allocation-row-fields";
 import { generateUUID } from "../utils/uuid";
+import {
+  ensureItemsCachedForCodes,
+} from "./transaction-item-cache.service";
 import { syncItemMasterPaged } from "./item-master-sync.service";
 import { createdByFromApiBox } from "../utils/box-created-by";
 
@@ -202,6 +205,7 @@ export const syncMasterDataFromDesktop = async (
       );
 
       console.log(`📋 ASN Sync: Received ${asns.length} ASNs from API`);
+      const asnItemCodes = new Set<string>();
       if (asns.length > 0) {
         console.log(
           `📋 Sample ASN structure:`,
@@ -432,6 +436,9 @@ export const syncMasterDataFromDesktop = async (
               if (carton.items && Array.isArray(carton.items)) {
                 for (const item of carton.items) {
                   try {
+                    if (item.item_code) {
+                      asnItemCodes.add(String(item.item_code).trim());
+                    }
                     await db.runAsync(
                       `INSERT OR REPLACE INTO asn_carton_map 
                          (asn_no, carton_id, item_code, shipped_qty) 
@@ -460,6 +467,7 @@ export const syncMasterDataFromDesktop = async (
             );
             for (const detail of asn.details) {
               if (detail.carton_id && detail.item_code) {
+                asnItemCodes.add(String(detail.item_code).trim());
                 if (!syncedCartonIds.has(detail.carton_id)) {
                   syncedCartonIds.add(detail.carton_id);
                   console.log(`  📦 Carton: ${detail.carton_id}`);
@@ -717,6 +725,18 @@ export const syncMasterDataFromDesktop = async (
           console.error(`Failed to sync ASN ${asn.asn_no}:`, error);
           result.asns.failed++;
         }
+      }
+
+      if (asnItemCodes.size > 0) {
+        void ensureItemsCachedForCodes(
+          Array.from(asnItemCodes),
+          "ASN master sync"
+        ).catch((err) => {
+          console.warn(
+            "⚠️ ASN transaction item cache failed:",
+            err?.message || err
+          );
+        });
       }
     } catch (error: any) {
       const errorMsg = error.message || error.toString() || "Unknown error";
@@ -1735,6 +1755,14 @@ export const syncMasterDataFromDesktop = async (
               stock.updated_on || stock.updated_at || new Date().toISOString(),
             ],
           );
+
+          if (stock.carton_id || stock.carton) {
+            const { upsertCartonStockFromMasterRow } = await import(
+              "./stock-ledger-local.service"
+            );
+            await upsertCartonStockFromMasterRow(stock);
+          }
+
           result.stockLedger.synced++;
 
           // Yield to UI thread every 100 stock entries

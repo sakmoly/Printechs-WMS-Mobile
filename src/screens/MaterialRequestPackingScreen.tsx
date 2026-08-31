@@ -30,6 +30,7 @@ import { getSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { MaterialRequest } from "../types";
 import { resolveItemFromBarcode } from "../services/item-master.service";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 import {
   clearScannerTimer,
   onScannerTextChange,
@@ -469,6 +470,10 @@ export default function MaterialRequestPackingScreen() {
         }
         setMaterialRequest(mrWithPickedQty);
         setSelectedStore(mr.to_showroom || "");
+        ensureItemsCachedForTransactionLines(
+          mrWithPickedQty.items,
+          `MR packing:${mrWithPickedQty.title}`
+        );
         // Check for existing Transfer Carton
         await checkExistingTC(mr.to_showroom);
 

@@ -38,6 +38,7 @@ export default function CycleCountDashboardScreen() {
     completedToday: 0,
     variancesPendingApproval: 0,
     draftSessions: 0,
+    pushedSessions: 0,
   });
 
   const loadWarehouses = useCallback(async () => {
@@ -81,11 +82,16 @@ export default function CycleCountDashboardScreen() {
         [today]
       );
 
+      const pushedSessions = await db.getFirstAsync<{ count: number }>(
+        "SELECT COUNT(*) as count FROM cycle_count_sessions WHERE status IN ('Submitted', 'Completed')"
+      );
+
       setStats({
         pendingBins: 0, // TODO: Get from API
         completedToday: completedToday?.count || 0,
         variancesPendingApproval: 0, // TODO: Get from API
         draftSessions: draftSessions?.count || 0,
+        pushedSessions: pushedSessions?.count || 0,
       });
     } catch (error: any) {
       console.error("Error loading stats:", error);
@@ -102,22 +108,35 @@ export default function CycleCountDashboardScreen() {
   );
 
   const handleStartDirectedCount = () => {
-    // TODO: Navigate to Directed Count List when implemented
-    Alert.alert(
-      "Coming Soon",
-      "Directed Count feature will be available soon. For now, please use Ad-hoc Count."
-    );
-    // (navigation as any).navigate("CycleCountDirectedList");
+    (navigation as any).navigate("CycleCountBinCounting", {
+      countType: "Directed",
+      countMode: "Reconciliation",
+      isBlindCount: false,
+      scanOnline: false,
+      openingStock: false,
+      forceNewSession: true,
+      skipCartonRestore: true,
+    });
   };
 
   const handleStartAdhocCount = () => {
-    (navigation as any).navigate("CycleCountScanBin", {
+    (navigation as any).navigate("CycleCountBinCounting", {
       countType: "Adhoc",
+      countMode: "Reconciliation",
+      isBlindCount: false,
+      scanOnline: false,
+      openingStock: false,
+      forceNewSession: true,
+      skipCartonRestore: true,
     });
   };
 
   const handleViewDrafts = () => {
     (navigation as any).navigate("CycleCountDrafts");
+  };
+
+  const handleViewHistory = () => {
+    (navigation as any).navigate("CycleCountHistory");
   };
 
   const handleViewVariances = () => {
@@ -174,9 +193,12 @@ export default function CycleCountDashboardScreen() {
         counted_qty?: number;
       }[] = [];
       
-      // Blind Count is controlled in the scan bin screen, not in task creation
-      // Always fetch expected items for preview in task creation screen
-      {
+      const shouldLoadExpectedForTask =
+        String(taskForm.count_type || "").toLowerCase() === "directed" &&
+        taskForm.opening_stock !== true;
+
+      // Only directed non-opening-stock counts should preload expected/bin stock.
+      if (shouldLoadExpectedForTask) {
         // ✅ NEW: Priority 1: Fetch expected items from BACKEND stock ledger (real-time data)
         // This allows users to see expected items immediately before creating task
         try {
@@ -212,6 +234,7 @@ export default function CycleCountDashboardScreen() {
                   countDate,
                   createdBy,
                   generatedTitle,
+                  openingStock: taskForm.opening_stock === true,
                 });
                 setShowPreviewModal(true);
                 setCreatingTask(false);
@@ -255,6 +278,7 @@ export default function CycleCountDashboardScreen() {
                 countDate,
                 createdBy,
                 generatedTitle,
+                openingStock: taskForm.opening_stock === true,
               });
               setShowPreviewModal(true);
               setCreatingTask(false);
@@ -268,6 +292,10 @@ export default function CycleCountDashboardScreen() {
           console.warn(`⚠️ Error fetching expected items: ${error.message}`);
           // Continue with empty lines - will create placeholder line below
         }
+      } else {
+        console.log(
+          `⏭️ Skipping expected item preload. count_type=${taskForm.count_type}, opening_stock=${taskForm.opening_stock}`
+        );
       }
       
       // ✅ If no preview was shown (items were empty or blind count), proceed with task creation
@@ -421,12 +449,20 @@ export default function CycleCountDashboardScreen() {
             onPress: () => {
               setShowCreateTaskModal(false);
               setShowPreviewModal(false); // ✅ Close preview modal if open
-              // Navigate to scan bin screen with the created task info
-              (navigation as any).navigate("CycleCountScanBin", {
+              (navigation as any).navigate("CycleCountBinCounting", {
+                sessionId,
                 countType: taskForm.count_type || "Adhoc",
+                countMode: "Reconciliation",
+                binCode: binCodeUpper,
+                binInfo: {
+                  bin_code: binCodeUpper,
+                  bin_id: binCodeUpper,
+                  warehouse_id: taskForm.warehouse_id || "",
+                },
+                isBlindCount: false,
+                scanOnline: false,
+                openingStock: isOpeningStock,
                 preCreatedTaskTitle: taskTitle,
-                preCreatedBinCode: binCodeUpper,
-                preCreatedSessionId: sessionId, // Pass session ID so it uses existing session
               });
             },
           },
@@ -526,6 +562,17 @@ export default function CycleCountDashboardScreen() {
           <Text style={styles.actionButtonText}>My Drafts</Text>
           <Text style={styles.actionButtonSubtext}>
             {stats.draftSessions} draft session(s)
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.actionButton, styles.historyButton]}
+          onPress={handleViewHistory}
+        >
+          <Text style={styles.actionButtonIcon}>📤</Text>
+          <Text style={styles.actionButtonText}>Pushed / History</Text>
+          <Text style={styles.actionButtonSubtext}>
+            {stats.pushedSessions} pushed session(s) — re-push or sync stock
           </Text>
         </TouchableOpacity>
 
@@ -869,6 +916,10 @@ const styles = StyleSheet.create({
   infoButton: {
     borderLeftWidth: 4,
     borderLeftColor: "#FF9800",
+  },
+  historyButton: {
+    borderLeftWidth: 4,
+    borderLeftColor: "#4CAF50",
   },
   createButton: {
     borderLeftWidth: 4,

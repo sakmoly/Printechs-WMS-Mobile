@@ -4,6 +4,237 @@ import { apiService } from "./api.service";
 import { getDatabase } from "../database/database";
 import { normalizeItemMasterBarcode } from "../utils/itemMasterBarcode";
 
+export const cacheItemMasterRecord = async (
+  item: ItemMaster,
+  updatedOn?: string | null
+) => {
+  try {
+    const db = await getDatabase();
+    const barcode = normalizeItemMasterBarcode(item.barcode, item.item_code);
+    const ts = updatedOn || new Date().toISOString();
+    await db.runAsync(
+      `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) 
+       VALUES (?, ?, ?, ?)`,
+      [item.item_code, barcode, item.item_name || null, ts]
+    );
+    if (barcode && barcode !== item.item_code) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO item_barcode_map (
+           barcode, item_code, uom, pack_size, barcode_type, updated_on
+         ) VALUES (?, ?, 'EA', 1, 'Unit', ?)`,
+        [barcode, item.item_code, ts]
+      );
+    }
+    console.log(
+      `💾 Cached resolved item: item_code="${item.item_code}", barcode="${barcode}"`
+    );
+  } catch (cacheError: any) {
+    console.warn(`⚠️ Failed to cache resolved item:`, cacheError.message);
+  }
+};
+
+const cacheResolvedItem = cacheItemMasterRecord;
+
+const itemFromLookupResponse = (
+  response: any,
+  scannedValue: string
+): { item: ItemMaster; updatedOn?: string | null } | null => {
+  if (!response || typeof response !== "object") {
+    return null;
+  }
+
+  if (
+    response.ok === false ||
+    response.found === false ||
+    response.data?.found === false
+  ) {
+    return null;
+  }
+
+  const raw =
+    response.item ||
+    response.data?.item ||
+    (response.data &&
+    typeof response.data === "object" &&
+    !Array.isArray(response.data) &&
+    (response.data.item_code || response.data.code)
+      ? response.data
+      : null) ||
+    response.result ||
+    null;
+
+  const lookupItem = raw ? (Array.isArray(raw) ? raw[0] : raw) : null;
+  if (!lookupItem || typeof lookupItem !== "object") {
+    return null;
+  }
+
+  const itemCode = String(
+    lookupItem.item_code ||
+      lookupItem.code ||
+      lookupItem.name ||
+      lookupItem.item ||
+      ""
+  ).trim();
+  if (!itemCode) {
+    return null;
+  }
+
+  const barcode = normalizeItemMasterBarcode(
+    lookupItem.barcode || lookupItem.item_barcode || scannedValue,
+    itemCode
+  );
+
+  return {
+    item: {
+      item_code: itemCode,
+      barcode,
+      item_name:
+        lookupItem.item_name ||
+        lookupItem.name1 ||
+        lookupItem.description ||
+        null,
+    },
+    updatedOn: lookupItem.updated_on || lookupItem.modified || null,
+  };
+};
+
+/** Lookup one item via wms-api /api/master/items/lookup and cache locally. */
+export async function lookupAndCacheItemFromApi(
+  params: { barcode?: string; item_code?: string },
+  scannedValue: string
+): Promise<ItemMaster | null> {
+  const settings = await getSettings();
+  if (!settings.api_url) return null;
+  try {
+    const response = await apiService.lookupItem(params);
+    const parsed = itemFromLookupResponse(response, scannedValue);
+    if (!parsed) return null;
+    await cacheItemMasterRecord(parsed.item, parsed.updatedOn);
+    return parsed.item;
+  } catch (error: any) {
+    console.warn(
+      `⚠️ Item lookup API failed (${params.barcode || params.item_code}):`,
+      error?.message || error
+    );
+    return null;
+  }
+}
+
+async function findItemInLocalDatabase(
+  scannedValue: string
+): Promise<ItemMaster | null> {
+  const scan = scannedValue.trim();
+  if (!scan) return null;
+
+  try {
+    const db = await getDatabase();
+    const inputUpper = scan.toUpperCase();
+
+    const fromMap = await db.getFirstAsync<{
+      item_code: string;
+      barcode: string;
+    }>(
+      "SELECT item_code, barcode FROM item_barcode_map WHERE barcode = ? OR UPPER(barcode) = ? OR item_code = ? OR UPPER(item_code) = ?",
+      [scan, inputUpper, scan, inputUpper]
+    );
+    if (fromMap) {
+      const itemMaster = await db.getFirstAsync<ItemMaster>(
+        "SELECT item_code, barcode, item_name FROM item_master WHERE item_code = ?",
+        [fromMap.item_code]
+      );
+      return (
+        itemMaster || {
+          item_code: fromMap.item_code,
+          barcode: fromMap.barcode,
+          item_name: undefined,
+        }
+      );
+    }
+
+    const item = await db.getFirstAsync<ItemMaster>(
+      `SELECT item_code, barcode, item_name FROM item_master
+       WHERE barcode = ? OR UPPER(barcode) = ? OR item_code = ? OR UPPER(item_code) = ?
+       LIMIT 1`,
+      [scan, inputUpper, scan, inputUpper]
+    );
+    return item || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cycle count online scan: resolve exactly one scanned item through backend.
+ * This avoids downloading the full item master for large ERPNext item catalogs.
+ */
+export const resolveItemFromOnlineScan = async (
+  scannedValue: string
+): Promise<ItemMaster | null> => {
+  const scan = scannedValue.trim();
+  if (!scan) return null;
+
+  const localItem = await findItemInLocalDatabase(scan);
+  if (localItem) {
+    console.log(
+      `✅ Online scan: item "${scan}" found in local cache (item_code=${localItem.item_code})`
+    );
+    return localItem;
+  }
+
+  const tryLookup = async (mode: "barcode" | "item_code") => {
+    const response = await apiService.lookupItem({
+      [mode]: scan,
+      online: true,
+    });
+    console.log(
+      `🌐 Online lookup response (${mode}):`,
+      JSON.stringify(response)?.substring(0, 500)
+    );
+    const parsed = itemFromLookupResponse(response, scan);
+    if (!parsed && response && typeof response === "object") {
+      const reason =
+        (response as any).message ||
+        (response as any).online_lookup_reason ||
+        (response as any).error?.message;
+      if (reason) {
+        throw new Error(String(reason));
+      }
+    }
+    return parsed;
+  };
+
+  try {
+    console.log(`🌐 Online cycle count item lookup by barcode: "${scan}"`);
+    let resolved = await tryLookup("barcode");
+    if (!resolved) {
+      console.log(`🌐 Online cycle count item lookup by item_code: "${scan}"`);
+      resolved = await tryLookup("item_code");
+    }
+
+    if (!resolved) {
+      throw new Error(
+        `Backend lookup returned no item for "${scan}". Check server log for [Master] items/lookup.`
+      );
+    }
+
+    await cacheResolvedItem(resolved.item, resolved.updatedOn);
+    return resolved.item;
+  } catch (error: any) {
+    const status = (error as any).status;
+    const detail = error?.message || "Unknown error";
+    console.warn(
+      `⚠️ Online item lookup failed for "${scan}":`,
+      detail,
+      status ? `(HTTP ${status})` : ""
+    );
+    throw new Error(
+      status
+        ? `Online lookup failed (HTTP ${status}): ${detail}`
+        : `Online lookup failed: ${detail}`
+    );
+  }
+};
+
 /**
  * Resolve item_code from barcode or item code
  * Accepts both barcode (e.g., 100000000001) and item code (e.g., ITEM-0001)
@@ -83,7 +314,31 @@ export const resolveItemFromBarcode = async (
     console.warn("⚠️ Database lookup failed:", error.message);
   }
 
-  // Priority 2: If not found locally, check backend server (if available)
+  // Priority 2: Single-item lookup API (same as Postman / cycle count online)
+  if (settings.api_url) {
+    const fromBarcode = await lookupAndCacheItemFromApi(
+      { barcode: originalInput },
+      originalInput
+    );
+    if (fromBarcode) {
+      console.log(
+        `✅ Item found via lookup API (barcode): item_code="${fromBarcode.item_code}"`
+      );
+      return fromBarcode;
+    }
+    const fromItemCode = await lookupAndCacheItemFromApi(
+      { item_code: originalInput },
+      originalInput
+    );
+    if (fromItemCode) {
+      console.log(
+        `✅ Item found via lookup API (item_code): item_code="${fromItemCode.item_code}"`
+      );
+      return fromItemCode;
+    }
+  }
+
+  // Priority 3: If not found locally, check backend server (full catalog download)
   if (settings.api_url) {
     try {
       console.log(`🔍 Fetching from server for: ${originalInput}`);
@@ -212,28 +467,14 @@ export const resolveItemFromBarcode = async (
             `✅ Item found in backend: item_code="${resolvedItemCode}", barcode="${resolvedBarcode}"`
           );
 
-          // Cache the item in local database for future lookups
-          try {
-            const db = await getDatabase();
-            await db.runAsync(
-              `INSERT OR REPLACE INTO item_master (item_code, barcode, item_name, updated_on) 
-             VALUES (?, ?, ?, ?)`,
-              [
-                resolvedItemCode,
-                resolvedBarcode,
-                foundItem.item_name || null,
-                foundItem.updated_on || new Date().toISOString(),
-              ]
-            );
-            console.log(
-              `💾 Cached item in local database: item_code="${resolvedItemCode}", barcode="${resolvedBarcode}"`
-            );
-          } catch (cacheError: any) {
-            console.warn(
-              `⚠️ Failed to cache item in database:`,
-              cacheError.message
-            );
-          }
+          await cacheResolvedItem(
+            {
+              item_code: resolvedItemCode,
+              barcode: resolvedBarcode,
+              item_name: foundItem.item_name || null,
+            },
+            foundItem.updated_on
+          );
 
           return {
             item_code: resolvedItemCode,

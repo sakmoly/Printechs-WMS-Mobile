@@ -68,10 +68,14 @@ import {
 } from "../services/workflow-state.service";
 import { resendReceiveLinesToBackend } from "../services/receive-lines-resend.service";
 import { settingsMatchUnloadedActor } from "../utils/unload-actor-match";
-import { createdByFromSettings } from "../utils/box-created-by";
+import {
+  createdByFromApiBox,
+  createdByFromSettings,
+} from "../utils/box-created-by";
 import { isDeviceOnline } from "../utils/network-check";
 
 const RECEIVED_WITH_SHORTAGE_STATUS = "Received with Shortage";
+const SHOW_SCAN_DETAILS_CARD = false;
 
 const isCompletedCartonStatus = (status?: string | null) => {
   const normalized = String(status || "").trim().toUpperCase();
@@ -168,6 +172,14 @@ export default function ReceiveSortScreen() {
     useState<WorkflowState>("SELECT_CARTON");
   const [lockedCarton, setLockedCarton] = useState<string | null>(null);
   const [scannerFocusSignal, setScannerFocusSignal] = useState(0);
+  const refocusScanner = useCallback((delayMs = 160) => {
+    const refocus = () => setScannerFocusSignal((signal) => signal + 1);
+    if (delayMs <= 0) {
+      refocus();
+      return;
+    }
+    setTimeout(refocus, delayMs);
+  }, []);
   const [cartonItems, setCartonItems] = useState<any[]>([]);
   /** True while `loadCartonItems` is reading local `asn_carton_map` (per-device DB). */
   const [cartonLinesLoading, setCartonLinesLoading] = useState(false);
@@ -323,6 +335,12 @@ export default function ReceiveSortScreen() {
     }[];
   } | null>(null);
   const [lastScannedItem, setLastScannedItem] = useState<string | null>(null);
+  const [lastScannedBox, setLastScannedBox] = useState<string | null>(null);
+  const [quickScanDetailsCollapsed, setQuickScanDetailsCollapsed] =
+    useState(false);
+  const [transferOrderAllocations, setTransferOrderAllocations] = useState<
+    any[]
+  >([]);
   /** Inline feedback after scans (success/errors that would otherwise be silent). */
   const [scanFeedback, setScanFeedback] = useState<{
     kind: "ok" | "err";
@@ -353,6 +371,12 @@ export default function ReceiveSortScreen() {
   }, []);
   const [showExpectedItemsModal, setShowExpectedItemsModal] = useState(false);
   const [showScannedItemsModal, setShowScannedItemsModal] = useState(false);
+  const [showDistributionDetailsModal, setShowDistributionDetailsModal] =
+    useState(false);
+  const [distributionDetailsLoading, setDistributionDetailsLoading] =
+    useState(false);
+  const [liveDistributionDetails, setLiveDistributionDetails] =
+    useState<any | null>(null);
   const [expectedItemsSearchQuery, setExpectedItemsSearchQuery] = useState("");
   const [scannedItemsSearchQuery, setScannedItemsSearchQuery] = useState("");
   const [manualQtyItem, setManualQtyItem] = useState<string | null>(null);
@@ -399,6 +423,12 @@ export default function ReceiveSortScreen() {
   const [pendingItemScan, setPendingItemScan] = useState<string | null>(null);
   const [pendingBoxScan, setPendingBoxScan] = useState<string | null>(null);
   const [isProcessingScan, setIsProcessingScan] = useState(false); // Guard against duplicate processing
+
+  useEffect(() => {
+    if (workflowState === "SCAN_ITEM" || workflowState === "SCAN_BOX") {
+      refocusScanner();
+    }
+  }, [workflowState, currentItem, lockedCarton, refocusScanner]);
 
   // Load warehouses and stores from master table for allocation validation
   useEffect(() => {
@@ -508,10 +538,11 @@ export default function ReceiveSortScreen() {
       const scannedItemsFromDB = await db.getAllAsync<{
         item_code: string;
         box_id: string | null;
+        store: string | null;
         scanned_qty: number;
         carton_id: string | null;
       }>(
-        `SELECT item_code, box_id, scanned_qty, carton_id 
+        `SELECT item_code, box_id, store, scanned_qty, carton_id 
          FROM scanned_items 
          WHERE (asn_no = ? OR asn_no = ?) AND inbound_session = ?`,
         [activeASN, na, activeSession]
@@ -2025,7 +2056,10 @@ export default function ReceiveSortScreen() {
           `ℹ️ ReceiveSortScreen: No allocations found in local DB for ASN ${activeASN}, fetching from API...`
         );
         try {
-          const toResponse = await apiService.getTransferOrderByASN(activeASN);
+          const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
+            inbound_session: activeSession || undefined,
+            include_completed: true,
+          });
           const toData =
             toResponse?.data || toResponse?.transfer_order || toResponse;
 
@@ -2148,7 +2182,7 @@ export default function ReceiveSortScreen() {
       setAvailableStoresForBox([]); // No fallback - only show stores from TO
       setSelectedStoreForBox("");
     }
-  }, [activeASN, selectedStoreForBox]);
+  }, [activeASN, activeSession, selectedStoreForBox]);
 
   // Load stores from Transfer Order allocations (effect must be after loadTransferOrderStores definition)
   useEffect(() => {
@@ -2240,15 +2274,23 @@ export default function ReceiveSortScreen() {
     const boxes = await dataService.getBoxes(activeASN);
     // Filter out boxes with null/undefined/empty box_id to prevent React key errors
     // Also filter out CLOSED boxes - only show Open boxes
-    const validBoxes = boxes.filter(
-      (box) =>
-        box.box_id &&
-        box.box_id !== "" &&
-        box.box_id !== null &&
-        box.status !== "Closed" &&
-        box.status !== "CLOSED" &&
-        box.status !== "closed"
-    );
+    const validBoxes = boxes
+      .filter(
+        (box) =>
+          box.box_id &&
+          box.box_id !== "" &&
+          box.box_id !== null &&
+          box.status !== "Closed" &&
+          box.status !== "CLOSED" &&
+          box.status !== "closed"
+      )
+      .map((box) => ({
+        ...box,
+        created_by:
+          String((box as any).created_by || "").trim() ||
+          createdByFromApiBox(box as unknown as Record<string, unknown>) ||
+          null,
+      }));
     setAvailableBoxes(validBoxes);
     console.log(
       `📦 Loaded ${validBoxes.length} available box(es) (excluded closed boxes)`
@@ -3987,6 +4029,7 @@ export default function ReceiveSortScreen() {
 
       // Update state
       setLastScannedItem(itemCode);
+      setLastScannedBox(canonicalBoxId);
       setCurrentItemWithLog(itemCode);
 
       // Clear currentItem to allow scanning next item
@@ -4803,7 +4846,11 @@ export default function ReceiveSortScreen() {
     if (!onlyMySortBoxes) return availableBoxes;
     if (!sortBoxUser.user_id && !sortBoxUser.user_code) return availableBoxes;
     return availableBoxes.filter((box) =>
-      settingsMatchUnloadedActor(sortBoxUser, (box as any).created_by)
+      settingsMatchUnloadedActor(
+        sortBoxUser,
+        createdByFromApiBox(box as unknown as Record<string, unknown>) ||
+          (box as any).created_by
+      )
     );
   }, [availableBoxes, onlyMySortBoxes, sortBoxUser]);
 
@@ -4846,7 +4893,11 @@ export default function ReceiveSortScreen() {
           if (!onlyMySortBoxesRef.current) return list;
           if (!boxIdentity.user_id && !boxIdentity.user_code) return list;
           return list.filter((box) =>
-            settingsMatchUnloadedActor(boxIdentity, (box as any).created_by)
+            settingsMatchUnloadedActor(
+              boxIdentity,
+              createdByFromApiBox(box as unknown as Record<string, unknown>) ||
+                (box as any).created_by
+            )
           );
         };
         // Get all allocations for the current item
@@ -5035,7 +5086,11 @@ export default function ReceiveSortScreen() {
           if (!onlyMySortBoxesRef.current) return list;
           if (!boxIdentity.user_id && !boxIdentity.user_code) return list;
           return list.filter((box) =>
-            settingsMatchUnloadedActor(boxIdentity, (box as any).created_by)
+            settingsMatchUnloadedActor(
+              boxIdentity,
+              createdByFromApiBox(box as unknown as Record<string, unknown>) ||
+                (box as any).created_by
+            )
           );
         };
         setFilteredAvailableBoxes(applyMyBoxesOnly(fallbackBoxes));
@@ -5063,13 +5118,41 @@ export default function ReceiveSortScreen() {
     const loadTOAllocations = async () => {
       if (!activeASN || !lockedCarton) {
         setToAllocationsByItem(new Map());
+        setTransferOrderAllocations([]);
         return;
       }
 
       try {
-        const allocations = await dataService.getTransferOrderAllocations(
+        let allocations = await dataService.getTransferOrderAllocations(
           activeASN
         );
+        try {
+          const liveResponse = await apiService.getLiveTransferOrderByASN(
+            activeASN,
+            {
+              inbound_session: activeSession || undefined,
+              include_completed: true,
+            }
+          );
+          const liveData = liveResponse?.data || liveResponse;
+          const liveItems = Array.isArray(liveData?.items) ? liveData.items : [];
+          if (liveItems.length > 0) {
+            allocations = liveItems.map((item: any) => ({
+              to_no: liveData?.to_no || item?.to_no || null,
+              asn_no: activeASN,
+              store: item?.store,
+              item_code: item?.item_code,
+              allocated_qty:
+                Number(item?.allocated_qty ?? item?.to_qty ?? item?.qty) || 0,
+            }));
+          }
+        } catch (liveError: any) {
+          console.warn(
+            `⚠️ Live TO allocation fetch failed, using local cache:`,
+            liveError?.message || liveError
+          );
+        }
+        setTransferOrderAllocations(allocations);
 
         // Group allocations by item_code and sum allocated quantities
         const allocationsMap = new Map<string, number>();
@@ -5088,11 +5171,12 @@ export default function ReceiveSortScreen() {
       } catch (error: any) {
         console.warn(`⚠️ Error loading TO allocations:`, error.message);
         setToAllocationsByItem(new Map());
+      setTransferOrderAllocations([]);
       }
     };
 
     loadTOAllocations();
-  }, [activeASN, lockedCarton]);
+  }, [activeASN, activeSession, lockedCarton]);
 
   // Ensure workflow state is SCAN_ITEM when carton is locked but no currentItem
   // This fixes the issue where saved state might have SCAN_BOX but no currentItem
@@ -5106,17 +5190,25 @@ export default function ReceiveSortScreen() {
   }, [lockedCarton, currentItem, workflowState]);
 
   useEffect(() => {
-    if (lockedCarton && workflowState === "SCAN_ITEM" && !showCTNIdPrompt) {
-      setScannerFocusSignal((value) => value + 1);
+    if (
+      lockedCarton &&
+      (workflowState === "SCAN_ITEM" || workflowState === "SCAN_BOX") &&
+      !showCTNIdPrompt
+    ) {
+      refocusScanner();
     }
-  }, [lockedCarton, workflowState, currentItem, showCTNIdPrompt]);
+  }, [lockedCarton, workflowState, currentItem, showCTNIdPrompt, refocusScanner]);
 
   useFocusEffect(
     useCallback(() => {
-      if (lockedCarton && workflowState === "SCAN_ITEM" && !showCTNIdPrompt) {
-        setScannerFocusSignal((value) => value + 1);
+      if (
+        lockedCarton &&
+        (workflowState === "SCAN_ITEM" || workflowState === "SCAN_BOX") &&
+        !showCTNIdPrompt
+      ) {
+        refocusScanner();
       }
-    }, [lockedCarton, workflowState, showCTNIdPrompt])
+    }, [lockedCarton, workflowState, showCTNIdPrompt, refocusScanner])
   );
 
   // When supplier carton (lock) changes, resync from DB — same rules as refreshScannedStateFromDb (per-carton UI)
@@ -7905,6 +7997,7 @@ export default function ReceiveSortScreen() {
 
       // Track last scanned item
       setLastScannedItem(manualQtyItem);
+      setLastScannedBox(manualQtyBox);
 
       // Reload total scanned quantities to update Expected Items modal
       const reloadTotalScannedQuantities = async () => {
@@ -8177,8 +8270,8 @@ export default function ReceiveSortScreen() {
                 </View>
               </View>
             ) : (
-              !isComplete && (
-                <View style={styles.itemActionButtons}>
+              <View style={styles.itemActionButtons}>
+                {!isComplete && (
                   <TouchableOpacity
                     style={styles.manualQtyTriggerButton}
                     onPress={async () => {
@@ -8193,16 +8286,16 @@ export default function ReceiveSortScreen() {
                       📝 Enter Quantity
                     </Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.toBreakdownButton}
-                    onPress={() => handleTOBreakdownClick(item.item_code)}
-                  >
-                    <Text style={styles.toBreakdownButtonText}>
-                      📊 TO Breakdown
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              )
+                )}
+                <TouchableOpacity
+                  style={styles.toBreakdownButton}
+                  onPress={() => handleTOBreakdownClick(item.item_code)}
+                >
+                  <Text style={styles.toBreakdownButtonText}>
+                    📊 TO Breakdown
+                  </Text>
+                </TouchableOpacity>
+              </View>
             )}
           </View>
           {isComplete && (
@@ -8275,6 +8368,224 @@ export default function ReceiveSortScreen() {
       };
     });
   }, [scannedQuantities, scannedItems]);
+
+  const lastScannedDetails = useMemo(() => {
+    if (!lastScannedItem) return null;
+
+    const cartonItem = cartonItems.find((item) =>
+      itemCodesMatchForAllocation(item.item_code, lastScannedItem)
+    );
+    const itemCode = cartonItem?.item_code || lastScannedItem;
+    const asnQty = Number(cartonItem?.shipped_qty || 0);
+    const scannedQty = scannedQtyLookup(scannedQuantities, itemCode) || 0;
+    const remainingQty = cartonItem ? asnQty - scannedQty : 0;
+
+    const itemRows = scannedItems.filter((row) =>
+      itemCodesMatchForAllocation(row.item_code, itemCode)
+    );
+    const uniqueBoxes = itemRows
+      .map((row) => String(row.box_id || "").trim())
+      .filter(Boolean)
+      .filter((boxId, index, list) => list.indexOf(boxId) === index);
+    const lastBox =
+      lastScannedBox ||
+      (uniqueBoxes.length > 0 ? uniqueBoxes[uniqueBoxes.length - 1] : null);
+    const lastBoxInfo = lastBox
+      ? availableBoxes.find(
+          (box) =>
+            String(box.box_id || "").trim().toUpperCase() ===
+            String(lastBox).trim().toUpperCase()
+        )
+      : null;
+    const lastBoxRow = lastBox
+      ? itemRows.find(
+          (row) =>
+            String(row.box_id || "").trim().toUpperCase() ===
+            String(lastBox).trim().toUpperCase()
+        )
+      : null;
+
+    const toRows = transferOrderAllocations
+      .filter((alloc) => itemCodesMatchForAllocation(alloc.item_code, itemCode))
+      .map((alloc) => {
+        const storeScannedQty = itemRows.reduce((sum, row) => {
+          const rowBox = row.box_id
+            ? availableBoxes.find(
+                (box) =>
+                  String(box.box_id || "").trim().toUpperCase() ===
+                  String(row.box_id).trim().toUpperCase()
+              )
+            : null;
+          const rowStore = row.store || rowBox?.store || "";
+          if (!storeCodesMatchForTO(alloc.store, rowStore)) return sum;
+          return sum + (Number(row.scanned_qty) || 0);
+        }, 0);
+        const toQty = Number(alloc.allocated_qty) || 0;
+        return {
+          store: String(alloc.store || "TO Store").trim(),
+          toQty,
+          scannedQty: storeScannedQty,
+          remainingQty: toQty - storeScannedQty,
+        };
+      });
+
+    return {
+      itemCode,
+      asnQty,
+      scannedQty,
+      remainingQty,
+      lastBox,
+      lastStore: lastBoxRow?.store || lastBoxInfo?.store || null,
+      toRows,
+      isComplete: cartonItem ? remainingQty <= 0 : scannedQty > 0,
+    };
+  }, [
+    availableBoxes,
+    cartonItems,
+    lastScannedBox,
+    lastScannedItem,
+    scannedItems,
+    scannedQuantities,
+    transferOrderAllocations,
+  ]);
+
+  const currentDistributionDetails = useMemo(() => {
+    if (!currentItem || workflowState !== "SCAN_BOX") return null;
+
+    const itemCode = String(currentItem).trim();
+    const itemRows = scannedItems.filter((row) =>
+      itemCodesMatchForAllocation(row.item_code, itemCode)
+    );
+    const allocations = transferOrderAllocations.filter((alloc) =>
+      itemCodesMatchForAllocation(alloc.item_code, itemCode)
+    );
+    const isOpenBox = (box: any) =>
+      String(box?.status || "").trim().toUpperCase() === "OPEN";
+
+    const rows = allocations.map((alloc) => {
+      const scannedQty = itemRows.reduce((sum, row) => {
+        const rowBox = row.box_id
+          ? availableBoxes.find(
+              (box) =>
+                String(box.box_id || "").trim().toUpperCase() ===
+                String(row.box_id).trim().toUpperCase()
+            )
+          : null;
+        const rowStore = row.store || rowBox?.store || "";
+        if (!storeCodesMatchForTO(alloc.store, rowStore)) return sum;
+        return sum + (Number(row.scanned_qty) || 0);
+      }, 0);
+      const openBoxes = availableBoxes
+        .filter(
+          (box) =>
+            box?.box_id &&
+            isOpenBox(box) &&
+            storeCodesMatchForTO(box.store, alloc.store)
+        )
+        .map((box) => String(box.box_id).trim())
+        .filter(Boolean);
+      const toQty = Number(alloc.allocated_qty) || 0;
+
+      return {
+        store: String(alloc.store || "TO Store").trim(),
+        toQty,
+        scannedQty,
+        remainingQty: toQty - scannedQty,
+        openBoxes,
+      };
+    });
+
+    return { itemCode, rows };
+  }, [
+    availableBoxes,
+    currentItem,
+    scannedItems,
+    transferOrderAllocations,
+    workflowState,
+  ]);
+
+  const canOpenDistributionDetails = Boolean(
+    activeASN && currentItem && workflowState === "SCAN_BOX"
+  );
+
+  const closeDistributionDetailsModal = useCallback(() => {
+    setShowDistributionDetailsModal(false);
+    refocusScanner();
+  }, [refocusScanner]);
+
+  const handleOpenDistributionDetails = useCallback(async () => {
+    if (!activeASN || !currentItem || workflowState !== "SCAN_BOX") {
+      return;
+    }
+
+    setDistributionDetailsLoading(true);
+    try {
+      const response = await apiService.getReceiveSortDistributionDetails({
+        asn_no: activeASN,
+        inbound_session: activeSession || undefined,
+        item_code: currentItem,
+        carton_id: lockedCarton,
+      });
+      const payload = response?.data || response;
+      const stores = Array.isArray(payload?.stores) ? payload.stores : [];
+      const readRemainingQty = (store: any) =>
+        Number(
+          store?.remaining_qty ??
+            store?.remainingQty ??
+            store?.remaining ??
+            store?.balance_qty ??
+            store?.balance ??
+            0
+        );
+      const openStores = stores.filter(
+        (store: any) => readRemainingQty(store) > 0
+      );
+      const fullyDistributed =
+        payload?.fully_distributed === true ||
+        (stores.length > 0 && openStores.length === 0);
+
+      if (fullyDistributed) {
+        setLiveDistributionDetails(null);
+        setShowDistributionDetailsModal(false);
+        Alert.alert(
+          "Item Fully Distributed",
+          `Item ${payload?.item_code || currentItem} has no remaining distribution quantity.`,
+          [{ text: "OK", onPress: () => refocusScanner() }]
+        );
+        return;
+      }
+
+      setLiveDistributionDetails({
+        itemCode: payload?.item_code || currentItem,
+        itemName: payload?.item_name || null,
+        toNo: payload?.to_no || null,
+        serverTime: payload?.server_time || null,
+        stores: openStores.map((store: any) => ({
+          store: String(store?.store || "").trim(),
+          toQty: Number(store?.to_qty) || 0,
+          scannedQty: Number(store?.scanned_qty) || 0,
+          remainingQty: readRemainingQty(store),
+          openBoxes: Array.isArray(store?.open_boxes) ? store.open_boxes : [],
+        })),
+      });
+      setShowDistributionDetailsModal(true);
+    } catch (error: any) {
+      Alert.alert(
+        "Distribution Details",
+        error?.message || "Failed to load live distribution details from backend.",
+        [{ text: "OK", onPress: () => refocusScanner() }]
+      );
+    } finally {
+      setDistributionDetailsLoading(false);
+    }
+  }, [
+    activeASN,
+    activeSession,
+    currentItem,
+    lockedCarton,
+    refocusScanner,
+    workflowState,
+  ]);
 
   if (!activeASN || !activeSession) {
     return (
@@ -8409,6 +8720,203 @@ export default function ReceiveSortScreen() {
               : "carton"
           }
         />
+
+        {lockedCarton && (
+          <TouchableOpacity
+            style={[
+              styles.distributionDetailsInlineButton,
+              (!canOpenDistributionDetails || distributionDetailsLoading) &&
+                styles.distributionDetailsInlineButtonDisabled,
+            ]}
+            onPress={handleOpenDistributionDetails}
+            activeOpacity={0.85}
+            disabled={!canOpenDistributionDetails || distributionDetailsLoading}
+          >
+            <Text style={styles.distributionDetailsInlineButtonText}>
+              {distributionDetailsLoading
+                ? "Loading Distribution..."
+                : "Distribution Details"}
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        {SHOW_SCAN_DETAILS_CARD && lockedCarton && (
+          <View
+            style={[
+              styles.quickScanDetailsCard,
+              lastScannedDetails?.isComplete &&
+                styles.quickScanDetailsCardComplete,
+            ]}
+          >
+            <View style={styles.quickScanDetailsHeader}>
+              <TouchableOpacity
+                style={styles.quickScanDetailsTitleBlock}
+                onPress={() =>
+                  setQuickScanDetailsCollapsed((collapsed) => !collapsed)
+                }
+                activeOpacity={0.8}
+              >
+                <Text style={styles.quickScanDetailsLabel}>Scan Details</Text>
+                <Text style={styles.quickScanDetailsItemCode}>
+                  {lastScannedDetails?.itemCode || "Ready for item scan"}
+                </Text>
+                {quickScanDetailsCollapsed && lastScannedDetails && (
+                  <Text style={styles.quickScanCollapsedHint}>
+                    Scanned {lastScannedDetails.scannedQty} · Rem{" "}
+                    {lastScannedDetails.remainingQty}
+                  </Text>
+                )}
+              </TouchableOpacity>
+              <View style={styles.quickScanHeaderActions}>
+                <TouchableOpacity
+                  style={[
+                    styles.quickScanHeaderBreakdownButton,
+                    (!canOpenDistributionDetails || distributionDetailsLoading) &&
+                      styles.quickScanHeaderBreakdownButtonDisabled,
+                  ]}
+                  onPress={handleOpenDistributionDetails}
+                  activeOpacity={0.85}
+                  disabled={!canOpenDistributionDetails || distributionDetailsLoading}
+                >
+                  <Text style={styles.quickScanHeaderBreakdownButtonText}>
+                    {distributionDetailsLoading ? "Loading" : "Distribution"}
+                  </Text>
+                </TouchableOpacity>
+                <View
+                  style={[
+                    styles.quickScanStatusBadge,
+                    !lastScannedDetails || quickScanDetailsCollapsed
+                      ? styles.quickScanStatusBadgeOpen
+                      : lastScannedDetails.remainingQty === 0
+                      ? styles.quickScanStatusBadgeComplete
+                      : lastScannedDetails.remainingQty < 0
+                        ? styles.quickScanStatusBadgeOver
+                        : styles.quickScanStatusBadgeOpen,
+                  ]}
+                >
+                  <Text style={styles.quickScanStatusText}>
+                    {quickScanDetailsCollapsed
+                      ? "Expand"
+                      : !lastScannedDetails
+                        ? "Open"
+                        : lastScannedDetails.remainingQty === 0
+                      ? "Sorted"
+                      : lastScannedDetails.remainingQty < 0
+                        ? "Over"
+                        : "Open"}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            {!quickScanDetailsCollapsed && !lastScannedDetails && (
+              <>
+                <Text style={styles.quickScanPlaceholderText}>
+                  Scan an item and destination BOX. The latest item, remaining
+                  quantity, BOX, store, and TO progress will appear here.
+                </Text>
+              </>
+            )}
+
+            {!quickScanDetailsCollapsed && lastScannedDetails && (
+              <>
+                <View style={styles.quickScanQtyRow}>
+                  <View style={styles.quickScanQtyChip}>
+                    <Text style={styles.quickScanQtyLabel}>ASN Qty</Text>
+                    <Text style={styles.quickScanQtyValue}>
+                      {lastScannedDetails.asnQty}
+                    </Text>
+                  </View>
+                  <View style={styles.quickScanQtyChip}>
+                    <Text style={styles.quickScanQtyLabel}>Scanned</Text>
+                    <Text
+                      style={[
+                        styles.quickScanQtyValue,
+                        styles.quickScanQtyValueScanned,
+                      ]}
+                    >
+                      {lastScannedDetails.scannedQty}
+                    </Text>
+                  </View>
+                  <View style={styles.quickScanQtyChip}>
+                    <Text style={styles.quickScanQtyLabel}>Remaining</Text>
+                    <Text
+                      style={[
+                        styles.quickScanQtyValue,
+                        lastScannedDetails.remainingQty === 0
+                          ? styles.quickScanQtyValueComplete
+                          : lastScannedDetails.remainingQty < 0
+                            ? styles.quickScanQtyValueOver
+                            : styles.quickScanQtyValueRemaining,
+                      ]}
+                    >
+                      {lastScannedDetails.remainingQty}
+                    </Text>
+                  </View>
+                </View>
+
+                {(lastScannedDetails.lastBox || lastScannedDetails.lastStore) && (
+                  <Text style={styles.quickScanBoxLine}>
+                    Last BOX: {lastScannedDetails.lastBox || "-"}
+                    {lastScannedDetails.lastStore
+                      ? ` · Store: ${lastScannedDetails.lastStore}`
+                      : ""}
+                  </Text>
+                )}
+
+                {lastScannedDetails.toRows.length > 0 ? (
+                  <View style={styles.quickScanToSection}>
+                    <Text style={styles.quickScanToTitle}>TO Progress</Text>
+                    {lastScannedDetails.toRows.slice(0, 3).map((row, index) => (
+                      <View
+                        key={`${row.store}-${index}`}
+                        style={styles.quickScanToRow}
+                      >
+                        <Text style={styles.quickScanToStore} numberOfLines={1}>
+                          {row.store}
+                        </Text>
+                        <View style={styles.quickScanToQtyRow}>
+                          <Text style={styles.quickScanToQty}>TO {row.toQty}</Text>
+                          <Text
+                            style={[
+                              styles.quickScanToQty,
+                              styles.quickScanToQtyScanned,
+                            ]}
+                          >
+                            Scanned {row.scannedQty}
+                          </Text>
+                          <Text
+                            style={[
+                              styles.quickScanToQty,
+                              row.remainingQty === 0
+                                ? styles.quickScanToQtyComplete
+                                : row.remainingQty < 0
+                                  ? styles.quickScanToQtyOver
+                                  : styles.quickScanToQtyRemaining,
+                            ]}
+                          >
+                            Rem {row.remainingQty}
+                          </Text>
+                        </View>
+                      </View>
+                    ))}
+                    {lastScannedDetails.toRows.length > 3 && (
+                      <Text style={styles.quickScanMoreText}>
+                        +{lastScannedDetails.toRows.length - 3} more store lines
+                        in TO Breakdown
+                      </Text>
+                    )}
+                  </View>
+                ) : (
+                  <Text style={styles.quickScanNoToText}>
+                    No TO allocation found for this item. Check TO Breakdown for
+                    full details.
+                  </Text>
+                )}
+              </>
+            )}
+          </View>
+        )}
 
         {scanFeedback && (
           <View
@@ -9548,6 +10056,129 @@ export default function ReceiveSortScreen() {
                   setShowScannedItemsModal(false);
                   setScannedItemsSearchQuery("");
                 }}
+              >
+                <Text style={styles.modalCloseButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Current Item Distribution Details Modal */}
+      <Modal
+        visible={showDistributionDetailsModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={closeDistributionDetailsModal}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>
+                Distribution Details
+                {liveDistributionDetails?.itemCode
+                  ? ` - ${liveDistributionDetails.itemCode}`
+                  : ""}
+              </Text>
+              <TouchableOpacity
+                style={styles.modalCloseButton}
+                onPress={closeDistributionDetailsModal}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.modalContent}>
+              {liveDistributionDetails &&
+              liveDistributionDetails.stores.length > 0 ? (
+                <View style={styles.distributionSection}>
+                  <Text style={styles.distributionHint}>
+                    Scan an open BOX for the store line that still has remaining
+                    quantity.
+                  </Text>
+                  {liveDistributionDetails.toNo && (
+                    <Text style={styles.distributionHint}>
+                      TO: {liveDistributionDetails.toNo}
+                    </Text>
+                  )}
+                  {liveDistributionDetails.stores
+                    .filter((row: any) => Number(row?.remainingQty || 0) > 0)
+                    .map((row: any, index: number) => (
+                    <View key={`${row.store}-${index}`} style={styles.distributionCard}>
+                      <View style={styles.distributionHeader}>
+                        <Text style={styles.distributionStore}>{row.store}</Text>
+                        <Text
+                          style={[
+                            styles.distributionRemainingBadge,
+                            row.remainingQty === 0
+                              ? styles.distributionRemainingDone
+                              : row.remainingQty < 0
+                                ? styles.distributionRemainingOver
+                                : styles.distributionRemainingOpen,
+                          ]}
+                        >
+                          Rem {row.remainingQty}
+                        </Text>
+                      </View>
+                      <View style={styles.distributionQtyRow}>
+                        <Text style={styles.distributionQtyText}>
+                          TO {row.toQty}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.distributionQtyText,
+                            styles.distributionScannedText,
+                          ]}
+                        >
+                          Scanned {row.scannedQty}
+                        </Text>
+                      </View>
+                      <Text style={styles.distributionBoxLabel}>
+                        Open BOXes
+                      </Text>
+                      {row.openBoxes.length > 0 ? (
+                        <View style={styles.distributionBoxesRow}>
+                          {row.openBoxes.slice(0, 4).map((box: any) => {
+                            const boxId =
+                              typeof box === "string" ? box : box?.box_id;
+                            return (
+                            <View
+                              key={`${row.store}-${boxId}`}
+                              style={styles.distributionBoxChip}
+                            >
+                              <Text style={styles.distributionBoxChipText}>
+                                {boxId}
+                              </Text>
+                            </View>
+                            );
+                          })}
+                          {row.openBoxes.length > 4 && (
+                            <Text style={styles.distributionMoreBoxes}>
+                              +{row.openBoxes.length - 4} more
+                            </Text>
+                          )}
+                        </View>
+                      ) : (
+                        <Text style={styles.distributionNoBoxText}>
+                          No open BOX found for this store.
+                        </Text>
+                      )}
+                    </View>
+                  ))}
+                </View>
+              ) : (
+                <View style={styles.emptyModalContainer}>
+                  <Text style={styles.emptyModalText}>
+                    Scan an item first to view distribution details.
+                  </Text>
+                </View>
+              )}
+            </ScrollView>
+
+            <View style={styles.modalFooter}>
+              <TouchableOpacity
+                style={styles.modalCloseButtonLarge}
+                onPress={closeDistributionDetailsModal}
               >
                 <Text style={styles.modalCloseButtonText}>Close</Text>
               </TouchableOpacity>
@@ -10944,6 +11575,331 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: "bold",
     color: "#1976D2",
+  },
+  quickScanDetailsCard: {
+    marginTop: 8,
+    marginBottom: 16,
+    padding: 12,
+    backgroundColor: "#F8FBFF",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#90CAF9",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  quickScanDetailsCardComplete: {
+    backgroundColor: "#F1F8E9",
+    borderColor: "#81C784",
+  },
+  quickScanDetailsHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 10,
+    gap: 8,
+  },
+  quickScanDetailsTitleBlock: {
+    flex: 1,
+  },
+  quickScanHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  quickScanHeaderBreakdownButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#FFF3E0",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#FF9800",
+  },
+  quickScanHeaderBreakdownButtonDisabled: {
+    opacity: 0.45,
+    backgroundColor: "#F5F5F5",
+    borderColor: "#D0D0D0",
+  },
+  quickScanHeaderBreakdownButtonText: {
+    color: "#E65100",
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  quickScanDetailsLabel: {
+    fontSize: 11,
+    color: "#607D8B",
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  quickScanDetailsItemCode: {
+    marginTop: 2,
+    fontSize: 22,
+    fontWeight: "bold",
+    color: "#1565C0",
+  },
+  quickScanCollapsedHint: {
+    marginTop: 2,
+    fontSize: 12,
+    color: "#546E7A",
+    fontWeight: "600",
+  },
+  quickScanPlaceholderText: {
+    fontSize: 13,
+    color: "#546E7A",
+    lineHeight: 18,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 8,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#E3F2FD",
+  },
+  quickScanStatusBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+  },
+  quickScanStatusBadgeComplete: {
+    backgroundColor: "#43A047",
+  },
+  quickScanStatusBadgeOpen: {
+    backgroundColor: "#FB8C00",
+  },
+  quickScanStatusBadgeOver: {
+    backgroundColor: "#E53935",
+  },
+  quickScanStatusText: {
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: "bold",
+  },
+  quickScanQtyRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  quickScanQtyChip: {
+    flex: 1,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: "#E3F2FD",
+  },
+  quickScanQtyLabel: {
+    fontSize: 11,
+    color: "#757575",
+    fontWeight: "600",
+    marginBottom: 2,
+  },
+  quickScanQtyValue: {
+    fontSize: 18,
+    color: "#263238",
+    fontWeight: "bold",
+  },
+  quickScanQtyValueScanned: {
+    color: "#1976D2",
+  },
+  quickScanQtyValueComplete: {
+    color: "#2E7D32",
+  },
+  quickScanQtyValueRemaining: {
+    color: "#EF6C00",
+  },
+  quickScanQtyValueOver: {
+    color: "#C62828",
+  },
+  quickScanBoxLine: {
+    marginTop: 8,
+    fontSize: 12,
+    color: "#37474F",
+    fontWeight: "600",
+  },
+  quickScanToSection: {
+    marginTop: 10,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#DCEAF7",
+  },
+  quickScanToTitle: {
+    fontSize: 12,
+    color: "#1565C0",
+    fontWeight: "bold",
+    marginBottom: 6,
+  },
+  quickScanToRow: {
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#E3F2FD",
+    marginBottom: 6,
+  },
+  quickScanToStore: {
+    fontSize: 13,
+    color: "#263238",
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  quickScanToQtyRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 6,
+  },
+  quickScanToQty: {
+    flex: 1,
+    fontSize: 12,
+    color: "#455A64",
+    fontWeight: "700",
+  },
+  quickScanToQtyScanned: {
+    color: "#1976D2",
+    textAlign: "center",
+  },
+  quickScanToQtyComplete: {
+    color: "#2E7D32",
+    textAlign: "right",
+  },
+  quickScanToQtyRemaining: {
+    color: "#EF6C00",
+    textAlign: "right",
+  },
+  quickScanToQtyOver: {
+    color: "#C62828",
+    textAlign: "right",
+  },
+  quickScanMoreText: {
+    marginTop: 4,
+    fontSize: 11,
+    color: "#607D8B",
+    fontWeight: "600",
+  },
+  quickScanNoToText: {
+    marginTop: 8,
+    fontSize: 12,
+    color: "#E65100",
+    fontWeight: "600",
+  },
+  distributionDetailsInlineButton: {
+    marginTop: 8,
+    marginBottom: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    backgroundColor: "#FFF3E0",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#FF9800",
+    alignItems: "center",
+  },
+  distributionDetailsInlineButtonDisabled: {
+    opacity: 0.45,
+    backgroundColor: "#F5F5F5",
+    borderColor: "#D0D0D0",
+  },
+  distributionDetailsInlineButtonText: {
+    color: "#E65100",
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  distributionSection: {
+    padding: 16,
+  },
+  distributionHint: {
+    fontSize: 13,
+    color: "#546E7A",
+    lineHeight: 18,
+    marginBottom: 12,
+    fontWeight: "600",
+  },
+  distributionCard: {
+    backgroundColor: "#F8FBFF",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#BBDEFB",
+  },
+  distributionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 10,
+  },
+  distributionStore: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#1565C0",
+  },
+  distributionRemainingBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    color: "#FFFFFF",
+    fontSize: 12,
+    fontWeight: "bold",
+  },
+  distributionRemainingOpen: {
+    backgroundColor: "#FB8C00",
+  },
+  distributionRemainingDone: {
+    backgroundColor: "#43A047",
+  },
+  distributionRemainingOver: {
+    backgroundColor: "#E53935",
+  },
+  distributionQtyRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  distributionQtyText: {
+    fontSize: 13,
+    color: "#455A64",
+    fontWeight: "700",
+  },
+  distributionScannedText: {
+    color: "#1976D2",
+  },
+  distributionBoxLabel: {
+    fontSize: 12,
+    color: "#607D8B",
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  distributionBoxesRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  distributionBoxChip: {
+    backgroundColor: "#E3F2FD",
+    borderColor: "#90CAF9",
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  distributionBoxChipText: {
+    fontSize: 11,
+    color: "#0D47A1",
+    fontWeight: "700",
+  },
+  distributionMoreBoxes: {
+    fontSize: 11,
+    color: "#607D8B",
+    fontWeight: "700",
+    alignSelf: "center",
+  },
+  distributionNoBoxText: {
+    fontSize: 12,
+    color: "#C62828",
+    fontWeight: "600",
   },
   lastItemCard: {
     backgroundColor: "#F5F5F5",

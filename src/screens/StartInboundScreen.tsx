@@ -25,6 +25,9 @@ import { getSettings, saveSettings } from "../services/settings.service";
 import { getDatabase } from "../database/database";
 import { dataService } from "../services/data.service";
 import { normalizeASN } from "../utils/asn";
+import {
+  ensureItemsCachedForAsn,
+} from "../services/transaction-item-cache.service";
 import { canonicalStoreForToLine } from "../utils/to-store-master";
 import {
   storeFieldFromAllocationRow,
@@ -39,8 +42,8 @@ function sleep(ms: number): Promise<void> {
 
 function cleanSessionPart(value: unknown): string {
   return String(value ?? "")
-    .replace(/[^A-Z0-9]/g, "")
-    .toUpperCase();
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
 }
 
 function cleanOwnerCandidates(...values: unknown[]): string[] {
@@ -209,7 +212,7 @@ export default function StartInboundScreen() {
     const updateSessionId = async () => {
       try {
         const settings = await getSettings();
-        const userId = settings.user_id || "USER-AUTO";
+        const userId = settings.user_id || settings.user_code || "USER-AUTO";
         const deviceId = settings.device_id || "DEV-AUTO";
 
         if (sourceType === "ASN" && asnNo.trim()) {
@@ -403,6 +406,9 @@ export default function StartInboundScreen() {
     // This ensures the newly scanned ASN takes priority
     console.log(`📱 Updating activeASN in context to: ${scannedASN}`);
     setActiveASN(scannedASN);
+    void ensureItemsCachedForAsn(scannedASN, `ASN scan:${scannedASN}`).catch(
+      () => {}
+    );
 
     // Use scanned ASN format directly (no normalization)
     // Backend expects exact format from database (e.g., ASN-0001, ASN-0002)
@@ -459,7 +465,8 @@ export default function StartInboundScreen() {
     try {
       const settings = await getSettings();
       const deviceId = settings.device_id || "DEV-AUTO";
-      const userCandidates = cleanOwnerCandidates(settings.user_id, settings.user_code);
+      const operatorUserId = settings.user_id || settings.user_code || "";
+      const userCandidates = cleanOwnerCandidates(operatorUserId);
       const apiEnabled = !!settings.api_url && settings.demo_mode !== 1;
 
       let localSessions: any[] = [];
@@ -1080,8 +1087,7 @@ export default function StartInboundScreen() {
 
       const currentOwnerCandidates = cleanOwnerCandidates(
         userId,
-        settings.user_id,
-        settings.user_code
+        settings.user_id
       );
 
       // Normalize ASN only for database operations (lookups, storage) - only if ASN is provided
@@ -1631,17 +1637,32 @@ export default function StartInboundScreen() {
                 user_id: userId,
                 device_id: deviceId,
               });
+              const startPayload =
+                startResponse?.data && typeof startResponse.data === "object"
+                  ? startResponse.data
+                  : startResponse?.response &&
+                    typeof startResponse.response === "object"
+                  ? startResponse.response
+                  : startResponse;
+              const startPayloadSession =
+                startPayload?.session && typeof startPayload.session === "object"
+                  ? startPayload.session
+                  : null;
               const serverSessionId =
+                startPayload?.inbound_session ||
+                startPayload?.session_id ||
+                startPayloadSession?.inbound_session ||
+                startPayloadSession?.name ||
                 startResponse?.inbound_session ||
-                startResponse?.session_id ||
-                startResponse?.session?.inbound_session ||
-                startResponse?.session?.name ||
-                startResponse?.data?.inbound_session ||
-                startResponse?.data?.session_id ||
-                startResponse?.data?.session?.inbound_session ||
-                startResponse?.data?.session?.name;
+                startResponse?.session_id;
               if (serverSessionId) {
-                if (String(serverSessionId) !== generatedSessionId) {
+                const ownerMatchFromServer =
+                  startPayload?.owner_match === true ||
+                  startResponse?.owner_match === true;
+                if (
+                  String(serverSessionId) !== generatedSessionId &&
+                  !ownerMatchFromServer
+                ) {
                   Alert.alert(
                     "Backend Session Formula Required",
                     `Mobile requested session:\n${generatedSessionId}\n\nBackend returned:\n${serverSessionId}\n\nPlease update /api/inbound/session/start to use the requested inbound_session/requested_session_id instead of generating an IB number.`
@@ -1652,23 +1673,21 @@ export default function StartInboundScreen() {
                 const serverSessionRecord = {
                   inbound_session: String(serverSessionId),
                   device_id:
+                    startPayload?.device_id ||
+                    startPayloadSession?.device_id ||
                     startResponse?.device_id ||
-                    startResponse?.session?.device_id ||
-                    startResponse?.data?.device_id ||
-                    startResponse?.data?.session?.device_id ||
                     deviceId,
                   user_id:
+                    startPayload?.user_id ||
+                    startPayload?.started_by ||
+                    startPayloadSession?.user_id ||
+                    startPayloadSession?.started_by ||
                     startResponse?.user_id ||
                     startResponse?.started_by ||
-                    startResponse?.session?.user_id ||
-                    startResponse?.session?.started_by ||
-                    startResponse?.data?.user_id ||
-                    startResponse?.data?.started_by ||
-                    startResponse?.data?.session?.user_id ||
-                    startResponse?.data?.session?.started_by ||
                     userId,
                 };
                 if (
+                  ownerMatchFromServer ||
                   sessionRecordBelongsToCurrentUserAndDevice(
                     serverSessionRecord,
                     deviceId,
@@ -1684,7 +1703,10 @@ export default function StartInboundScreen() {
                 );
                 Alert.alert(
                   "Session Not Created",
-                  "The server returned a session for another user or device. Mobile will not create a local fallback session."
+                  "The server returned a session for another user or device. Mobile will not create a local fallback session.\n\n" +
+                    `Expected user/device: ${userId} / ${deviceId}\n` +
+                    `Returned user/device: ${serverSessionRecord.user_id} / ${serverSessionRecord.device_id}\n` +
+                    `Session: ${serverSessionId}`
                 );
                 setLoading(false);
                 return;
@@ -1895,6 +1917,9 @@ export default function StartInboundScreen() {
         }
 
         setActiveASN(displayASN);
+        void ensureItemsCachedForAsn(displayASN, `Inbound start:${displayASN}`).catch(
+          () => {}
+        );
         // Persist active ASN (preserved format) and session to settings
         await saveSettings({
           active_asn: displayASN,
@@ -1949,7 +1974,7 @@ export default function StartInboundScreen() {
     }
 
     const settings = await getSettings();
-    const userId = settings.user_id || "USER-AUTO";
+    const userId = settings.user_id || settings.user_code || "USER-AUTO";
     const deviceId = settings.device_id || "DEV-AUTO";
 
     let scannedASN: string | null = null;
@@ -2421,7 +2446,8 @@ export default function StartInboundScreen() {
                   }
                   setShowSessionList(false);
                   const settings = await getSettings();
-                  const userId = settings.user_id || "USER-AUTO";
+                  const userId =
+                    settings.user_id || settings.user_code || "USER-AUTO";
                   const deviceId = settings.device_id || "DEV-AUTO";
                   const scannedASN = asnNo.trim().toUpperCase();
                   const normalizedASN = normalizeASN(scannedASN);

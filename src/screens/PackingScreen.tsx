@@ -2015,7 +2015,9 @@ export default function PackingScreen() {
         `ℹ️ No allocations found in local database, fetching from API...`
       );
       try {
-        const toResponse = await apiService.getTransferOrderByASN(activeASN);
+        const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
+          include_completed: true,
+        });
         const toData =
           toResponse?.data || toResponse?.transfer_order || toResponse;
 
@@ -2067,7 +2069,10 @@ export default function PackingScreen() {
                       activeASN,
                       resolved.storeToPersist || rawStore,
                       lineItem,
-                      allocation.allocated_qty || allocation.qty || 0,
+                      allocation.allocated_qty ||
+                        allocation.to_qty ||
+                        allocation.qty ||
+                        0,
                     ]
                   );
                 }

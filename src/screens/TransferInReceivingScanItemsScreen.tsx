@@ -21,6 +21,7 @@ import { addEvent, syncEvents } from "../services/event-queue.service";
 import { dataService } from "../services/data.service";
 import { getDatabase } from "../database/database";
 import { resolveItemFromBarcode } from "../services/item-master.service";
+import { ensureItemsCachedForTransactionLines } from "../services/transaction-item-cache.service";
 import {
   BarcodeInput,
   type BarcodeInputHandle,
@@ -285,7 +286,11 @@ export default function TransferInReceivingScanItemsScreen() {
           ...ti,
           _backend_status: ti.status, // Keep original for reference
         });
-        
+        ensureItemsCachedForTransactionLines(
+          ti.items || ti.lines,
+          `Transfer In scan:${transferInNo}`
+        );
+
         // Log status logic for debugging
         if (ti.status === "Received" && !completed) {
           console.warn(`⚠️ Backend shows "Received" but no completed flag found. UI will show "Receiving" until Complete is clicked.`);

@@ -357,8 +357,17 @@ export default function TransferInReceivingScanCartonScreen() {
           console.warn(`⚠️ Carton validated but box_id not found in response. Response:`, JSON.stringify(validationResponse, null, 2));
         }
       } catch (validationError: any) {
+        const msg = String(validationError?.message || "");
+        if (msg.includes("401") || msg.toLowerCase().includes("authentication")) {
+          Alert.alert(
+            "Sign-in required",
+            "Could not validate the carton because the app is not signed in.\n\nGo to Settings, check User Code and Password, then try again."
+          );
+          setLoading(false);
+          return false;
+        }
         // If validation endpoint doesn't exist (404), allow to proceed (backend may validate later)
-        if (validationError?.message?.includes("404") || validationError?.message?.includes("not found")) {
+        if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
           console.warn(`⚠️ Transfer In validate-carton endpoint not available (404). Allowing carton to proceed.`);
           // Continue - backend may validate during receiving
         } else {
@@ -458,29 +467,33 @@ export default function TransferInReceivingScanCartonScreen() {
             ref={cartonInputRef}
             value={cartonId}
             autoFocus
-            placeholder="Scan custom barcode or carton ID"
+            placeholder="Tap to type or scan carton ID"
             onChangeText={(text) => {
               setCartonId(text);
               setCartonReady(false);
               setBoxId(null);
             }}
-            onBarcodeScanned={(raw) => {
+            onBarcodeScanned={async (raw) => {
               const scannedCarton = normalizeCustomCartonId(raw);
               setCartonId(scannedCarton);
               setCartonReady(false);
               setBoxId(null);
-              return false;
+              return handleContinue(scannedCarton);
+            }}
+            onError={(message) => {
+              Alert.alert("Carton Scan Error", message);
             }}
             containerStyle={styles.cartonInputStack}
             inputStyle={styles.cartonInput}
             actionsContainerStyle={styles.cartonInputActions}
             submitButtonStyle={styles.cartonSubmitButton}
             submitTextStyle={styles.cartonSubmitButtonText}
-            showSoftInputOnFocus={false}
+            showSoftInputOnFocus
             showKeyboardButton
             keyboardButtonStyle={styles.keyboardButton}
             keyboardButtonTextStyle={styles.keyboardButtonText}
             keyboardButtonLabel="Keyboard"
+            submitLabel="Validate & Continue"
           />
         </View>
 
