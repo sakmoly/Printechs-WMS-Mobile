@@ -14,6 +14,7 @@ import { useApp } from "../context/AppContext";
 import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { apiService } from "../services/api.service";
 import { saveSettings } from "../services/settings.service";
+import { getAppVersionDetails } from "../utils/appVersion";
 
 export default function HomeScreen() {
   const navigation = useNavigation();
@@ -167,6 +168,9 @@ export default function HomeScreen() {
                 {settings.device_id}
               </Text>
             ) : null}
+            <Text style={styles.bannerMetaTiny} numberOfLines={1}>
+              v{getAppVersionDetails()}
+            </Text>
           </View>
         </View>
         {deviceSessionRestricted && (

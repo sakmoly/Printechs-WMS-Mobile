@@ -48,6 +48,30 @@ export function compactStoreCodeKey(store: string | null | undefined): string {
     .replace(/[^A-Z0-9]/g, "");
 }
 
+/**
+ * Leading warehouse code from a TO line label, e.g. "006 - Alhfof..." → "006".
+ */
+export function extractLeadingStoreCode(
+  store: string | null | undefined
+): string | null {
+  const s = String(store ?? "").trim();
+  if (!s) return null;
+  const match = s.match(/^([A-Za-z0-9]{2,12})\s*[-–—]/);
+  return match?.[1]?.trim() ?? null;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True when `long` starts with master/short code `code` (e.g. "006 - Alhfof" vs "006"). */
+function storeCodePrefixesLongForm(long: string, code: string): boolean {
+  const c = String(code ?? "").trim();
+  if (!c) return false;
+  const re = new RegExp(`^${escapeRegExp(c)}(\\s*[-–—]|\\s|$)`, "i");
+  return re.test(String(long ?? "").trim());
+}
+
 /** True if two store strings refer to the same TO / box store (strict or compact). */
 export function storeCodesMatchForTO(
   a: string | null | undefined,
@@ -57,5 +81,9 @@ export function storeCodesMatchForTO(
   const sb = String(b ?? "").trim();
   if (!sa || !sb) return false;
   if (sa.toUpperCase() === sb.toUpperCase()) return true;
-  return compactStoreCodeKey(sa) === compactStoreCodeKey(sb);
+  if (compactStoreCodeKey(sa) === compactStoreCodeKey(sb)) return true;
+  if (storeCodePrefixesLongForm(sa, sb) || storeCodePrefixesLongForm(sb, sa)) {
+    return true;
+  }
+  return false;
 }

@@ -1042,13 +1042,16 @@ export const dataService = {
     });
   },
 
-  /** Distinct `warehouse_store_cache.code` rows for TO store validation / normalization. */
-  getWarehouseStoreMasterRows: async (): Promise<{ code: string }[]> => {
+  /** Distinct warehouse_store_cache rows for TO store validation / normalization. */
+  getWarehouseStoreMasterRows: async (): Promise<
+    { code: string; name?: string }[]
+  > => {
     return withRetry(async () => {
       const db = await getDatabase();
       if (!db) return [];
-      const rows = await db.getAllAsync<{ code: string }>(
-        `SELECT DISTINCT TRIM(code) AS code FROM warehouse_store_cache 
+      const rows = await db.getAllAsync<{ code: string; name?: string }>(
+        `SELECT DISTINCT TRIM(code) AS code, TRIM(name) AS name
+         FROM warehouse_store_cache 
          WHERE code IS NOT NULL AND TRIM(code) != '' 
          ORDER BY code`
       );

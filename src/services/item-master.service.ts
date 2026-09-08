@@ -403,6 +403,10 @@ export const resolveItemFromBarcode = async (
         const searchInput = originalInput.trim();
         const searchInputUpper = searchInput.toUpperCase();
 
+        const isWmsContainerId = /^(BOX|PAW|PUTAWAY|CTN|TC)-/i.test(
+          searchInputUpper
+        );
+
         const foundItem = items.find((item: any) => {
           const itemBarcode = String(item.barcode || "").trim();
           const itemCode = String(item.item_code || "").trim();
@@ -419,15 +423,24 @@ export const resolveItemFromBarcode = async (
             return true;
           }
 
-          // Partial match: check if barcode contains the search input or vice versa
-          // This handles cases like "JEANS-041-BLK-32" matching "SKU-JEANS-041-BLK-32"
+          // Never fuzzy-match WMS box/carton ids to items (e.g. BOX-006-171550 must not match item "15").
+          if (isWmsContainerId) {
+            return false;
+          }
+
+          // Partial match when the scan looks like an item barcode/SKU fragment.
+          // Only allow "item contains scan", not "scan contains item" — short codes like "15"
+          // must not match inside longer ids such as BOX-006-171550.
           if (
-            (itemBarcode &&
-              (itemBarcodeUpper.includes(searchInputUpper) ||
-                searchInputUpper.includes(itemBarcodeUpper))) ||
-            (itemCode &&
-              (itemCodeUpper.includes(searchInputUpper) ||
-                searchInputUpper.includes(itemCodeUpper)))
+            itemBarcode &&
+            itemBarcodeUpper.includes(searchInputUpper)
+          ) {
+            return true;
+          }
+          if (
+            itemCode &&
+            itemCodeUpper.length >= 4 &&
+            itemCodeUpper.includes(searchInputUpper)
           ) {
             return true;
           }

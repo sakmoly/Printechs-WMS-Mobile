@@ -28,11 +28,10 @@ import { normalizeASN } from "../utils/asn";
 import {
   ensureItemsCachedForAsn,
 } from "../services/transaction-item-cache.service";
-import { canonicalStoreForToLine } from "../utils/to-store-master";
 import {
-  storeFieldFromAllocationRow,
-  itemCodeFromAllocationRow,
-} from "../utils/allocation-row-fields";
+  fetchTransferOrderNumberFromAsnHeader,
+  loadTransferOrderForAsn,
+} from "../services/transfer-order-load.service";
 import { ProgressIndicator } from "../components/ProgressIndicator";
 import { isDeviceOnline } from "../utils/network-check";
 
@@ -640,33 +639,41 @@ export default function StartInboundScreen() {
     }
   };
 
+  const refreshTransferOrderCacheInBackground = (asn: string) => {
+    void (async () => {
+      try {
+        const online = await isDeviceOnline();
+        if (!online) return;
+        await loadTransferOrderForAsn(asn, {
+          allowApiRefresh: true,
+          forceApiRefresh: true,
+          deferCachePersist: true,
+        });
+      } catch (err: any) {
+        console.warn(
+          `⚠️ StartInbound: background TO cache refresh failed:`,
+          err?.message
+        );
+      }
+    })();
+  };
+
   const loadTransferOrders = async (asn: string) => {
     setLoadingTO(true);
     try {
       const settings = await getSettings();
-
-      // Use demo data if:
-      // 1. Demo mode is explicitly enabled (demo_mode === 1)
-      // 2. No API URL is configured (auto-fallback to demo mode)
       const useDemoData = settings.demo_mode === 1 || !settings.api_url;
 
       if (useDemoData) {
-        // Use demo transfer order
         setTransferOrder("TO-00012");
         setTransferOrders(["TO-00012"]);
 
-        // Check if allocations already exist (from seeder) - don't override them
         const normalizedASN = normalizeASN(asn);
         const existingAllocations =
           await dataService.getTransferOrderAllocations(normalizedASN);
 
-        // Only create allocations if they don't exist
         if (existingAllocations.length === 0) {
-          // Cache demo transfer order allocations
-          // Different items and quantities per store to show variety
           const db = await getDatabase();
-
-          // Different items and quantities per store for variety
           const demoAllocations = [
             { store: "SR-01", item_code: "ITEM-0001", allocated_qty: 2 },
             { store: "SR-01", item_code: "ITEM-0002", allocated_qty: 1 },
@@ -692,186 +699,72 @@ export default function StartInboundScreen() {
             );
           }
         }
+        return;
+      }
+
+      const online = await isDeviceOnline();
+
+      // 1) Instant: local TO cache from a prior session / sync.
+      const cached = await loadTransferOrderForAsn(asn, {
+        allowApiRefresh: false,
+      });
+      if (cached.toNo) {
+        setTransferOrder(cached.toNo);
+        setTransferOrders([cached.toNo]);
+        setLoadingTO(false);
+        if (online) refreshTransferOrderCacheInBackground(asn);
+        return;
+      }
+
+      if (!online) {
+        setTransferOrder("");
+        setTransferOrders([]);
+        return;
+      }
+
+      // 2) Fast: ASN header often has linked TO without downloading all TO lines.
+      const toFromAsnHeader = await fetchTransferOrderNumberFromAsnHeader(asn);
+      if (toFromAsnHeader) {
+        setTransferOrder(toFromAsnHeader);
+        setTransferOrders([toFromAsnHeader]);
+        setLoadingTO(false);
+        refreshTransferOrderCacheInBackground(asn);
+        return;
+      }
+
+      // 3) Full by-asn fetch (large TOs): show TO as soon as parsed; cache in background.
+      const loaded = await loadTransferOrderForAsn(asn, {
+        allowApiRefresh: true,
+        deferCachePersist: true,
+      });
+      if (loaded.toNo) {
+        setTransferOrder(loaded.toNo);
+        setTransferOrders([loaded.toNo]);
       } else {
-        // Try to fetch from API (only if API URL is configured)
-        // Use ASN format directly (no normalization) - backend expects exact format from database
-        // ASN is already in the format from backend (e.g., ASN-0001, ASN-0002)
-        const asnToQuery = asn; // Use ASN format as-is (preserving exact format from backend)
         console.log(
-          `📋 Using ASN format "${asnToQuery}" for API call (preserving exact format)`
+          `ℹ️ No transfer order found for ASN ${asn}. User can still proceed without transfer order.`
         );
-
-        try {
-          const toResponse = await apiService.getTransferOrderByASN(asnToQuery);
-          const toData =
-            toResponse?.data ||
-            (typeof toResponse?.transfer_order === "object"
-              ? toResponse?.transfer_order
-              : null) ||
-            toResponse;
-
-          const extractToNumber = (obj: any): string | undefined => {
-            if (!obj || typeof obj !== "object") return undefined;
-            const v =
-              obj.to_no ||
-              obj.transfer_order ||
-              obj.to_number ||
-              obj.transfer_order_no ||
-              obj.linked_to ||
-              obj.linked_transfer_order ||
-              obj.document_name ||
-              obj.name ||
-              obj.title ||
-              obj.id;
-            return v != null && String(v).trim().length > 0
-              ? String(v).trim()
-              : undefined;
-          };
-
-          let toNo = extractToNumber(toData);
-          let allocations =
-            toData?.allocations ||
-            toData?.items ||
-            toData?.item_lines ||
-            toData?.allocation ||
-            toData?.line_items ||
-            toData?.lines ||
-            toResponse?.allocations ||
-            toResponse?.items ||
-            [];
-
-          // Same pattern as BoxManagementScreen: by-asn may 404 or return ERP-style
-          // `{ name: "WMS-TO-00001" }` until export; ASN details may still list the linked TO.
-          if (!toNo || toResponse === null) {
-            try {
-              const asnRes = await apiService.getASN(asnToQuery);
-              const asnData = asnRes?.data || asnRes;
-              const fromAsn =
-                asnData?.transfer_order ||
-                asnData?.to_no ||
-                asnData?.transfer_order_no ||
-                asnData?.linked_to ||
-                asnData?.linked_transfer_order;
-              if (fromAsn && String(fromAsn).trim()) {
-                toNo = String(fromAsn).trim();
-              }
-              if (
-                (!allocations || !Array.isArray(allocations) || allocations.length === 0) &&
-                asnData
-              ) {
-                const fromLines =
-                  asnData.details ||
-                  asnData.lines ||
-                  asnData.items ||
-                  asnData?.data?.details ||
-                  [];
-                if (Array.isArray(fromLines) && fromLines.length > 0) {
-                  allocations = fromLines;
-                }
-              }
-            } catch (asnErr: any) {
-              console.warn(
-                "⚠️ StartInbound: ASN fallback for Transfer Order:",
-                asnErr?.message
-              );
-            }
-          }
-
-          const hasValidTO =
-            !!toNo && String(toNo).trim().length > 0;
-          if (hasValidTO) {
-            const toNoStr = String(toNo).trim();
-            setTransferOrder(toNoStr);
-            setTransferOrders([toNoStr]);
-
-            if (allocations && Array.isArray(allocations)) {
-              const db = await getDatabase();
-              let masterRows: { code: string }[] = [];
-              try {
-                masterRows = await dataService.getWarehouseStoreMasterRows();
-              } catch {
-                masterRows = [];
-              }
-              for (const alloc of allocations) {
-                const rawStore = storeFieldFromAllocationRow(alloc);
-                const lineItem = itemCodeFromAllocationRow(alloc);
-                if (rawStore && lineItem) {
-                  const resolved = canonicalStoreForToLine(
-                    rawStore,
-                    masterRows
-                  );
-                  if (resolved.unknownInMaster) {
-                    console.warn(
-                      `⚠️ StartInbound TO store "${rawStore}" not in warehouse master (item ${lineItem}). ` +
-                        (resolved.suggestions.length
-                          ? `Similar: ${resolved.suggestions.join(", ")}`
-                          : "")
-                    );
-                  }
-                  await db.runAsync(
-                    "INSERT OR REPLACE INTO transfer_order_cache (to_no, asn_no, store, item_code, allocated_qty) VALUES (?, ?, ?, ?, ?)",
-                    [
-                      toNoStr,
-                      asn,
-                      resolved.storeToPersist || rawStore,
-                      lineItem,
-                      alloc.allocated_qty ?? alloc.qty ?? 0,
-                    ]
-                  );
-                }
-              }
-            }
-          } else {
-            // No transfer order found - this is OK, user can still proceed
-            console.log(
-              `ℹ️ No transfer order found for ASN ${asnToQuery}. User can still proceed without transfer order.`
-            );
-            setTransferOrder("");
-            setTransferOrders([]);
-          }
-        } catch (apiError: any) {
-          // If API call fails (404 = no transfer order), that's OK
-          // User can still proceed without transfer order
-          if (
-            apiError.message?.includes("404") ||
-            apiError.message?.includes("ASN_NOT_FOUND") ||
-            apiError.message?.includes("TRANSFER_ORDER_NOT_FOUND")
-          ) {
-            console.log(
-              `ℹ️ No transfer order found for ASN ${asnToQuery} (this is OK - user can proceed without transfer order)`
-            );
-            setTransferOrder("");
-            setTransferOrders([]);
-          } else {
-            // For other errors (network, 500, etc.), show warning but still allow proceeding
-            console.warn(
-              "⚠️ Failed to fetch transfer order (non-404 error):",
-              apiError.message
-            );
-            setTransferOrder("");
-            setTransferOrders([]);
-          }
-        }
+        setTransferOrder("");
+        setTransferOrders([]);
       }
     } catch (error: any) {
-      // Handle 404 errors gracefully - ASN can be received without Transfer Order
       const errorMessage = error?.message || error?.toString() || "";
-      const is404Error = 
+      const is404Error =
         errorMessage.includes("404") ||
         errorMessage.includes("No transfer order found") ||
         errorMessage.includes("not found") ||
         errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
-      
+
       if (is404Error) {
-        // 404 is expected - ASN can be received without Transfer Order
         console.log(
-          `ℹ️ StartInboundScreen: No transfer order found for ASN (this is OK - ASN can be received without Transfer Order)`
+          `ℹ️ StartInboundScreen: No transfer order found for ASN (OK without TO)`
         );
       } else {
-        // Other errors (network, 500, etc.) - log as warning
-        console.warn("⚠️ StartInboundScreen: Failed to load transfer orders:", errorMessage);
+        console.warn(
+          "⚠️ StartInboundScreen: Failed to load transfer orders:",
+          errorMessage
+        );
       }
-      // Don't fall back to demo data - allow proceeding without transfer order
       setTransferOrder("");
       setTransferOrders([]);
     } finally {
@@ -2378,13 +2271,15 @@ export default function StartInboundScreen() {
           <TouchableOpacity
             style={[
               styles.button,
-              (loading || allCartonsCompleted) && styles.buttonDisabled,
+              (loading || loadingTO || allCartonsCompleted) && styles.buttonDisabled,
             ]}
             onPress={handleStart}
-            disabled={loading || allCartonsCompleted}
+            disabled={loading || loadingTO || allCartonsCompleted}
           >
             <Text style={styles.buttonText}>
-              {loading
+              {loadingTO
+                ? "Loading Transfer Order..."
+                : loading
                 ? "Starting..."
                 : allCartonsCompleted
                 ? "All Cartons Received"

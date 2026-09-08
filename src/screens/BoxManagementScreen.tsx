@@ -13,6 +13,8 @@ import {
   Share,
 } from "react-native";
 import { useApp } from "../context/AppContext";
+import { SafeAreaView } from "react-native-safe-area-context";
+import ScreenFooterFrame from "../components/ScreenFooterFrame";
 import { useNavigation, useRoute } from "@react-navigation/native";
 import { StatusBadge } from "../components/StatusBadge";
 import { ProgressIndicator } from "../components/ProgressIndicator";
@@ -36,6 +38,11 @@ import {
   itemCodeFromAllocationRow,
 } from "../utils/allocation-row-fields";
 import { mergeCartonLinesFromAsnPayload } from "../utils/merge-asn-payload-into-carton-map";
+import {
+  loadTransferOrderForAsn,
+  sumAllocatedQty,
+  uniqueStoreCodesFromAllocations,
+} from "../services/transfer-order-load.service";
 
 const buildAsnKeySet = (asn: string | null | undefined) =>
   new Set(
@@ -69,8 +76,31 @@ const boxItemsPayload = (response: unknown) =>
 
 const masterRowsFromStores = (stores: any[] | null | undefined) =>
   (stores || [])
-    .map((ws: any) => ({ code: String(ws?.code || "").trim() }))
+    .map((ws: any) => ({
+      code: String(ws?.code || "").trim(),
+      name: String(ws?.name || "").trim(),
+    }))
     .filter((ws) => ws.code);
+
+/** Human-readable store name from warehouse master (e.g. 002 → Unaizah - Almoosa). */
+const storeDisplayNameFromMaster = (
+  storeCode: string,
+  masterList: Array<{ code?: string; name?: string }> | null | undefined,
+): string | null => {
+  const code = String(storeCode ?? "").trim();
+  if (!code) return null;
+  const info = (masterList || []).find((ws) =>
+    storeCodesMatchForTO(ws.code, code),
+  );
+  const name = String(info?.name ?? "").trim();
+  if (!name || name.toUpperCase() === code.toUpperCase()) return null;
+  const prefix = new RegExp(
+    `^${code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[-–—]\\s*`,
+    "i",
+  );
+  const stripped = name.replace(prefix, "").trim();
+  return stripped || name;
+};
 
 /** Putaway (PAW-*) marked completed on backend — no Reopen/Delete from mobile; admin uses backend. */
 function isPutawayBoxMobileLockedStatus(
@@ -223,9 +253,9 @@ export default function BoxManagementScreen() {
     const masterRows = await getWarehouseMasterRowsForValidation(preferredRows);
     if (masterRows.length === 0) {
       console.warn(
-        "⚠️ Warehouse Master is not loaded; rejecting all store codes for safety.",
+        "⚠️ Warehouse Master is not loaded; showing raw TO store codes.",
       );
-      return [];
+      return Array.from(new Set(rawStores.map((s) => String(s).trim()).filter(Boolean))).sort();
     }
     const accepted: string[] = [];
     const rejected: string[] = [];
@@ -314,8 +344,7 @@ export default function BoxManagementScreen() {
         [activeASN, normalizedASN],
       );
 
-      const totalASN = result?.total_qty || 0;
-      setTotalASNQty(totalASN);
+      let totalASN = result?.total_qty || 0;
 
       const putawayScannedResult = await db.getFirstAsync<{
         total_qty: number;
@@ -332,92 +361,80 @@ export default function BoxManagementScreen() {
         [activeASN, normalizedASN],
       );
       const totalPutawayScanned = putawayScannedResult?.total_qty || 0;
-      setTotalPutawayScannedQty(totalPutawayScanned);
 
-      // ✅ FIX: Get Total TO Allocated quantity from API (not cache)
-      // Fetch TO from API to get allocations
+      // TO allocated qty: local cache first, then standard by-asn API (not /live).
       let totalTO = 0;
       try {
         const online = await isDeviceOnline();
-        if (!online) {
-          console.warn(
-            `⚠️ Device is offline - cannot calculate TO allocations. Please sync when online.`,
-          );
-          setTotalTOAllocatedQty(0);
-          setRemainingItemsQty(totalASN); // Assume all items are remaining if we can't get TO data
-          return;
-        }
-
-        const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
-          include_completed: true,
+        const loaded = await loadTransferOrderForAsn(activeASN, {
+          allowApiRefresh: online,
         });
-        if (toResponse) {
-          const toData =
-            toResponse?.data ||
-            (typeof toResponse?.transfer_order === "object"
-              ? toResponse?.transfer_order
-              : null) ||
-            toResponse;
-          const allocations =
-            toData?.allocations ||
-            toData?.items ||
-            toData?.item_lines ||
-            toData?.allocation ||
-            toData?.line_items ||
-            toData?.lines ||
-            [];
-
-          if (Array.isArray(allocations) && allocations.length > 0) {
-            totalTO = allocations.reduce(
-              (sum: number, alloc: any) =>
-                sum + (alloc.allocated_qty || alloc.to_qty || alloc.qty || 0),
-              0,
-            );
-          }
-        } else {
-          // ✅ FIX: No TO found (404/null) - this is OK, all items need putaway
+        totalTO = sumAllocatedQty(loaded.allocations);
+        if (totalTO === 0 && !loaded.toNo) {
           console.log(
             `ℹ️ No Transfer Order found for ASN ${activeASN} - all items will need putaway`,
           );
-          totalTO = 0; // No TO means no allocations, so totalTO = 0
         }
       } catch (error: any) {
         console.warn(
-          `⚠️ Error fetching TO allocations from API:`,
+          `⚠️ Error loading TO allocations for remaining qty:`,
           error.message,
         );
-        // Check if it's a 404 (no TO found) - this is OK, not an error
-        const is404Error =
-          error.message?.includes("404") ||
-          error.message?.includes("No transfer order found") ||
-          error.message?.includes("not found") ||
-          error.message?.includes("TRANSFER_ORDER_NOT_FOUND");
-
-        if (is404Error) {
-          // ✅ FIX: 404 means no TO exists - this is OK, all items need putaway
-          console.log(
-            `ℹ️ No Transfer Order found (404) - all items will need putaway`,
+        try {
+          const localRows = await dataService.getTransferOrderAllocations(activeASN);
+          totalTO = localRows.reduce(
+            (sum, row) => sum + Number(row.allocated_qty || 0),
+            0,
           );
-          totalTO = 0; // No TO means no allocations
-        } else {
-          // Other errors (offline, 500, etc.)
-          const isOffline =
-            error.message?.includes("Network") ||
-            error.message?.includes("fetch");
-          if (isOffline) {
-            console.warn(
-              `⚠️ Device appears offline - cannot calculate TO allocations. Please sync when online.`,
-            );
-          }
-          totalTO = 0; // Default to 0 if we can't fetch
+        } catch {
+          totalTO = 0;
         }
       }
+
+      // Local asn_carton_map can be partial; upgrade from ASN API when TO sum exceeds local ASN.
+      if (totalASN === 0 || (totalTO > 0 && totalASN < totalTO)) {
+        try {
+          const online = await isDeviceOnline();
+          if (online) {
+            const asnRes = await apiService.getASN(activeASN);
+            const asnData = asnRes?.data || asnRes;
+            let apiTotal = Number(asnData?.total_shipped_qty ?? 0);
+            const details =
+              asnData?.details ||
+              asnData?.lines ||
+              asnData?.items ||
+              asnData?.data?.details ||
+              [];
+            if (Array.isArray(details) && details.length > 0) {
+              const sumDetails = details.reduce(
+                (sum: number, row: any) =>
+                  sum + Number(row.shipped_qty ?? row.qty ?? 0),
+                0,
+              );
+              if (sumDetails > apiTotal) {
+                apiTotal = sumDetails;
+              }
+            }
+            if (apiTotal > totalASN) {
+              console.log(
+                `📊 ASN total: local ${totalASN} → API ${apiTotal} (TO allocated ${totalTO})`,
+              );
+              totalASN = apiTotal;
+            }
+          }
+        } catch (asnErr: any) {
+          console.warn(
+            `⚠️ Could not fetch ASN total from API for putaway calc:`,
+            asnErr?.message,
+          );
+        }
+      }
+
+      setTotalASNQty(totalASN);
+      setTotalPutawayScannedQty(totalPutawayScanned);
       setTotalTOAllocatedQty(totalTO);
 
-      // Remaining putaway = ASN total minus TO allocation sum from API,
-      // then subtract items already scanned into Putaway boxes.
-      // Do NOT override with full ASN when `transferOrder` string is missing but API still returned
-      // allocations (totalTO > 0) — that caused Remaining to show 800 while TO Allocated showed 400.
+      // Remaining putaway = ASN total minus TO allocation sum, minus putaway already scanned.
       const remaining = Math.max(0, totalASN - totalTO - totalPutawayScanned);
       setRemainingItemsQty(remaining);
 
@@ -482,78 +499,31 @@ export default function BoxManagementScreen() {
         [normalizedASN],
       );
 
-      // ✅ FIX: Get TO allocations from API (not cache)
+      // TO allocations: local cache first, then standard by-asn API (not /live).
       let allocatedItemCodes = new Set<string>();
       try {
         const online = await isDeviceOnline();
-        if (!online) {
-          console.warn(
-            `⚠️ Device is offline - cannot check TO allocations. Please sync when online.`,
-          );
-          // Don't use cache - show all items as unallocated when offline
-          setItemsWithoutTO(
-            scannedItems.map((item) => ({
-              item_code: item.item_code,
-              scanned_qty: item.scanned_qty,
-              store: item.store,
-              box_id: item.box_id,
-            })),
-          );
-          setHasItemsWithoutTO(scannedItems.length > 0);
-          return;
-        }
-
-        const toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
-          include_completed: true,
+        const loaded = await loadTransferOrderForAsn(activeASN, {
+          allowApiRefresh: online,
         });
-        if (toResponse) {
-          const toData =
-            toResponse?.data ||
-            (typeof toResponse?.transfer_order === "object"
-              ? toResponse?.transfer_order
-              : null) ||
-            toResponse;
-          const allocations =
-            toData?.allocations ||
-            toData?.items ||
-            toData?.item_lines ||
-            toData?.allocation ||
-            toData?.line_items ||
-            toData?.lines ||
-            [];
-
-          if (Array.isArray(allocations) && allocations.length > 0) {
-            allocatedItemCodes = new Set(
-              allocations.map((a: any) => a.item_code).filter(Boolean),
-            );
-          }
+        if (loaded.allocations.length > 0) {
+          allocatedItemCodes = new Set(
+            loaded.allocations.map((a) => a.item_code).filter(Boolean),
+          );
         }
       } catch (error: any) {
         console.warn(
-          `⚠️ Error fetching TO allocations from API:`,
+          `⚠️ Error loading TO allocations for items-without-TO check:`,
           error.message,
         );
-        const isOffline =
-          error.message?.includes("Network") ||
-          error.message?.includes("fetch");
-        if (isOffline) {
-          console.warn(
-            `⚠️ Device appears offline - cannot check TO allocations. Please sync when online.`,
+        try {
+          const localRows = await dataService.getTransferOrderAllocations(activeASN);
+          allocatedItemCodes = new Set(
+            localRows.map((r) => r.item_code).filter(Boolean),
           );
-          // Don't use cache - show all items as unallocated when offline
-          setItemsWithoutTO(
-            scannedItems.map((item) => ({
-              item_code: item.item_code,
-              scanned_qty: item.scanned_qty,
-              store: item.store,
-              box_id: item.box_id,
-            })),
-          );
-          setHasItemsWithoutTO(scannedItems.length > 0);
-          return;
+        } catch {
+          allocatedItemCodes = new Set();
         }
-        // For other errors, assume no allocations (all items are unallocated)
-        allocatedItemCodes = new Set();
       }
 
       // Find items that are NOT allocated to any TO
@@ -676,528 +646,120 @@ export default function BoxManagementScreen() {
     }
 
     try {
-      // ✅ FIX: Always fetch from API directly - do NOT use local cache
-      // User requirement: Transfer Order data must come from backend API, not local cache
-      // If offline, ask user to sync instead of using stale cache
-      console.log(
-        `🔄 Fetching Transfer Order directly from API for ASN: ${activeASN}`,
-      );
-      console.log(
-        `✅ DATA SOURCE: Always using backend API - NOT reading from local cache`,
-      );
-      console.log(
-        `✅ API Endpoint: GET /api/transfer-order/by-asn/${activeASN}`,
-      );
-
-      // Check if device is online
       const online = await isDeviceOnline();
-      if (!online) {
-        console.warn(
-          `⚠️ Device is offline - cannot fetch Transfer Order from API`,
+      console.log(
+        `🔄 Loading Transfer Order for ASN: ${activeASN} (local cache → GET /by-asn${online ? "" : ", offline — cache only"})`,
+      );
+
+      const loaded = await loadTransferOrderForAsn(activeASN, {
+        allowApiRefresh: online,
+      });
+
+      let resolvedToNo = loaded.toNo;
+      let storeCodes = uniqueStoreCodesFromAllocations(loaded.allocations);
+
+      if (resolvedToNo) {
+        setTransferOrder(resolvedToNo);
+        console.log(
+          `✅ Transfer Order: ${resolvedToNo} (${loaded.allocations.length} allocation(s), source: ${loaded.source})`,
         );
-        Alert.alert(
-          "Offline Mode",
-          "Your device is currently offline.\n\n" +
-            "Transfer Order data must be fetched from the backend API.\n\n" +
-            "Please connect to the internet and sync data, or try again when online.",
-          [
-            {
-              text: "OK",
-              onPress: () => {
-                setTransferOrder(null);
-                setDistributionStores([]);
-              },
-            },
-          ],
-        );
+      } else {
         setTransferOrder(null);
-        setDistributionStores([]);
-        return;
+        console.log(`ℹ️ No Transfer Order found for ASN ${activeASN}`);
       }
 
-      // Fetch TO from API (try activeASN, then normalized ASN if 404)
-      let toResponse: any = null;
-      try {
-        toResponse = await apiService.getLiveTransferOrderByASN(activeASN, {
-          include_completed: true,
-        });
-        if (toResponse === null) {
-          const normalizedASNForTO = normalizeASN(activeASN);
-          if (normalizedASNForTO !== activeASN) {
-            console.log(
-              `🔄 Retrying Transfer Order with normalized ASN: ${normalizedASNForTO}`,
-            );
-            toResponse =
-              await apiService.getLiveTransferOrderByASN(normalizedASNForTO, {
-                include_completed: true,
-              });
-          }
-        }
-      } catch (_) {
-        toResponse = null;
-      }
-      try {
-        console.log("📋 Transfer Order API Response (raw):", toResponse);
-        console.log(
-          "📋 Transfer Order API Response (stringified):",
-          JSON.stringify(toResponse, null, 2),
-        );
-        console.log(
-          `✅ DATA SOURCE: Transfer Order data comes from backend API - NO CACHE - NO MOCK DATA`,
-        );
-        console.log("📋 Transfer Order API Response type:", typeof toResponse);
-        console.log(
-          "📋 Transfer Order API Response is null?",
-          toResponse === null,
-        );
-        console.log(
-          "📋 Transfer Order API Response is undefined?",
-          toResponse === undefined,
-        );
-        console.log(
-          "📋 Transfer Order API Response keys:",
-          toResponse ? Object.keys(toResponse) : "null/undefined",
-        );
-
-        // Handle different response formats (backend may wrap in .data or use different TO keys)
-        // IMPORTANT: If transfer_order is a string (e.g. "WMS-TO-00006"), do NOT use it as toData —
-        // use the full toResponse so we have access to allocations and to_no at top level.
-        const toData =
-          toResponse?.data ||
-          (typeof toResponse?.transfer_order === "object"
-            ? toResponse?.transfer_order
-            : null) ||
-          toResponse;
-        console.log("📋 Extracted toData:", toData);
-        console.log("📋 toData type:", typeof toData);
-        console.log(
-          "📋 toData keys:",
-          toData && typeof toData === "object" ? Object.keys(toData) : toData,
-        );
-
-        // If toResponse is null, try to get TO and stores from ASN details (backend may embed them in ASN)
-        if (toResponse === null) {
-          console.log(
-            `ℹ️ No Transfer Order from by-asn API - trying ASN details for TO and stores...`,
-          );
-          try {
-            const asnRes = await apiService.getASN(activeASN);
-            const asnData = asnRes?.data || asnRes;
+      // If TO exists but allocations had no store codes, try ASN details for store list.
+      if (storeCodes.length === 0 && online) {
+        try {
+          const asnRes = await apiService.getASN(activeASN);
+          const asnData = asnRes?.data || asnRes;
+          if (!resolvedToNo) {
             const toNoFromASN =
               asnData?.transfer_order ||
               asnData?.to_no ||
               asnData?.transfer_order_no ||
               asnData?.linked_to;
-            const details: any[] =
-              asnData?.details ||
-              asnData?.lines ||
-              asnData?.items ||
-              asnData?.data?.details ||
-              [];
-            const storeFromRow = (r: any) =>
-              r.store ||
-              r.store_code ||
-              r.destination ||
-              r.to_store ||
-              r.warehouse ||
-              r.destination_store;
-            const storesFromDetails = Array.from(
-              new Set(
-                details
-                  .map((r: any) => storeFromRow(r))
-                  .filter((s: any) => s && String(s).trim() !== ""),
-              ),
-            ) as string[];
-            const directStoresFromASN =
-              asnData?.stores ||
-              asnData?.store_codes ||
-              asnData?.destinations ||
-              [];
-            const directList = Array.isArray(directStoresFromASN)
-              ? directStoresFromASN
-                  .map((s: any) =>
-                    typeof s === "string" ? s : (s?.code ?? s?.store ?? ""),
-                  )
-                  .filter(Boolean)
-              : [];
-            const allStoresFromASN =
-              storesFromDetails.length > 0 ? storesFromDetails : directList;
             if (toNoFromASN && String(toNoFromASN).trim()) {
-              setTransferOrder(String(toNoFromASN).trim());
-              console.log(`✅ Transfer Order from ASN details: ${toNoFromASN}`);
-            }
-            if (allStoresFromASN.length > 0) {
-              setDistributionStores(
-                await canonicalStoresFromWarehouseMaster(
-                  allStoresFromASN,
-                  preferredMasterRows,
-                ),
-              );
-              console.log(`✅ Stores from ASN details:`, allStoresFromASN);
-              return;
-            }
-          } catch (asnErr: any) {
-            console.warn(
-              `⚠️ Could not get stores from ASN details:`,
-              asnErr?.message,
-            );
-          }
-          setTransferOrder(null);
-          setDistributionStores([]);
-          return;
-        }
-
-        // Accept multiple possible keys for TO number (e.g. WMS-TO-00006 from backend)
-        const toNo =
-          toData?.to_no ||
-          toData?.transfer_order ||
-          toData?.to_number ||
-          toData?.transfer_order_no ||
-          toData?.id ||
-          toData?.title;
-        const hasValidTO = toData && toNo && String(toNo).trim().length > 0;
-
-        if (hasValidTO) {
-          setTransferOrder(String(toNo).trim());
-          console.log(`✅ Transfer Order found from API: ${toNo}`);
-          console.log(
-            `✅ Setting transferOrder state to: ${toNo} (from API, not cache)`,
-          );
-
-          // Extract stores from allocations (try toData first, then top-level toResponse for WMS-TO-* style APIs)
-          const allocations =
-            toData?.allocations ||
-            toData?.items ||
-            toData?.item_lines ||
-            toData?.allocation ||
-            toData?.line_items ||
-            toData?.lines ||
-            toResponse?.allocations ||
-            toResponse?.items ||
-            toResponse?.item_lines ||
-            (Array.isArray(toData) ? toData : []);
-
-          console.log(`📦 Extracted allocations from API:`, allocations);
-          console.log(`📦 Allocations type:`, typeof allocations);
-          console.log(`📦 Allocations isArray:`, Array.isArray(allocations));
-          console.log(
-            `📦 Allocations length:`,
-            Array.isArray(allocations) ? allocations.length : "N/A",
-          );
-
-          if (
-            allocations &&
-            Array.isArray(allocations) &&
-            allocations.length > 0
-          ) {
-            console.log(`📦 First allocation sample from API:`, allocations[0]);
-            console.log(
-              `✅ DATA SOURCE: Stores extracted from TO allocations (API) - NO CACHE - NO MOCK DATA`,
-            );
-            console.log(
-              `✅ Stores found in TO allocations:`,
-              Array.from(
-                new Set(
-                  allocations
-                    .map((a: any) => a.store || a.store_code)
-                    .filter(Boolean),
-                ),
-              ),
-            );
-
-            // ✅ FIX: Update local cache from API response (for sync purposes only)
-            // Cache is updated from API, but never used for display - always use API data
-            const normalizedASN = normalizeASN(activeASN);
-            const db = await getDatabase();
-
-            try {
-              // Clear old allocations for this ASN before saving new ones from API
-              console.log(
-                `🗑️ Updating local cache from API response (cache updated from API, not used for display)...`,
-              );
-              await db.runAsync(
-                `DELETE FROM transfer_order_cache WHERE asn_no = ? OR asn_no = ?`,
-                [activeASN, normalizedASN],
-              );
-              console.log(`✅ Cleared old cache data`);
-
-              // Save API response to local cache (for sync/offline reference only - NOT used for display)
-              console.log(
-                `💾 Updating local cache with ${allocations.length} TO allocations from API response...`,
-              );
-              const masterRowsForTo =
-                await getWarehouseMasterRowsForValidation(preferredMasterRows);
-              for (const allocation of allocations) {
-                const rawStore = storeFieldFromAllocationRow(allocation);
-                const lineItem = itemCodeFromAllocationRow(allocation);
-                if (rawStore && lineItem) {
-                  const resolved = canonicalStoreForToLine(
-                    rawStore,
-                    masterRowsForTo,
-                  );
-                  if (
-                    masterRowsForTo.length === 0 ||
-                    resolved.unknownInMaster ||
-                    !resolved.storeToPersist
-                  ) {
-                    console.warn(
-                      `⚠️ Skipping TO allocation for unknown Warehouse Master store "${rawStore}" (item ${lineItem}). ` +
-                        (masterRowsForTo.length === 0
-                          ? "Warehouse Master is not loaded."
-                          : resolved.suggestions.length
-                          ? `Similar: ${resolved.suggestions.join(", ")}`
-                          : ""),
-                    );
-                    continue;
-                  }
-                  await db.runAsync(
-                    `INSERT INTO transfer_order_cache 
-                       (to_no, asn_no, store, item_code, allocated_qty) 
-                       VALUES (?, ?, ?, ?, ?)`,
-                    [
-                      toNo,
-                      normalizedASN,
-                      resolved.storeToPersist,
-                      lineItem,
-                      allocation.allocated_qty ||
-                        allocation.to_qty ||
-                        allocation.qty ||
-                        0,
-                    ],
-                  );
-                }
-              }
-              console.log(
-                `✅ Local cache updated from API (cache is for sync only, display always uses API)`,
-              );
-            } catch (saveError: any) {
-              console.warn(
-                `⚠️ Failed to update local cache from API:`,
-                saveError.message,
-              );
-              // Continue - cache update is optional, API data is primary
-            }
-
-            // Get store codes from API allocations (try all common field names)
-            const storeFromAlloc = (a: any) =>
-              a.store ||
-              a.store_code ||
-              a.warehouse ||
-              a.to_store ||
-              a.destination_store ||
-              a.destination ||
-              a.target_store ||
-              a.location_code ||
-              a.warehouse_code;
-            const allocationStoreCodes: string[] = Array.from(
-              new Set(
-                allocations
-                  .map((a: any) =>
-                    typeof a === "string" ? a : storeFromAlloc(a),
-                  )
-                  .filter((s: any) => s && String(s).trim() !== ""),
-              ),
-            ) as string[];
-
-            // If no stores from allocations, try direct store list (backend may send stores[] or store_codes[])
-            let storeCodes = allocationStoreCodes;
-            if (storeCodes.length === 0) {
-              const directStores =
-                toData?.stores ||
-                toData?.store_codes ||
-                toData?.destinations ||
-                toResponse?.stores ||
-                toResponse?.store_codes ||
-                [];
-              const directList = Array.isArray(directStores)
-                ? directStores
-                    .map((s: any) =>
-                      typeof s === "string"
-                        ? s
-                        : (s?.code ?? s?.store ?? s?.store_code ?? ""),
-                    )
-                    .filter(Boolean)
-                : [];
-              if (directList.length > 0) {
-                storeCodes = Array.from(new Set(directList)) as string[];
-                console.log(
-                  `📦 Store codes from TO direct list (stores/store_codes):`,
-                  storeCodes,
-                );
-              }
-            }
-
-            console.log(`📦 Store codes from API TO:`, storeCodes);
-            console.log(
-              `📦 Raw allocations from API:`,
-              allocations.slice(0, 5).map((a: any) => ({
-                store: storeFromAlloc(a),
-                item: a.item_code,
-                allocated_qty: a.allocated_qty || a.qty,
-              })),
-            );
-
-            setDistributionStores(
-              await canonicalStoresFromWarehouseMaster(
-                storeCodes,
-                preferredMasterRows,
-              ),
-            );
-          } else {
-            // No allocations in TO - try ASN details for stores (ASN may have store per line)
-            console.log(
-              `⚠️ No allocations/stores in TO response - trying ASN details...`,
-            );
-            try {
-              const asnRes = await apiService.getASN(activeASN);
-              const asnData = asnRes?.data || asnRes;
-              const details: any[] =
-                asnData?.details ||
-                asnData?.lines ||
-                asnData?.items ||
-                asnData?.data?.details ||
-                [];
-              const storeFromRow = (r: any) =>
-                r.store ||
-                r.store_code ||
-                r.destination ||
-                r.to_store ||
-                r.warehouse ||
-                r.destination_store;
-              const storesFromDetails = Array.from(
-                new Set(
-                  details
-                    .map((r: any) => storeFromRow(r))
-                    .filter((s: any) => s && String(s).trim() !== ""),
-                ),
-              ) as string[];
-              const directStoresFromASN =
-                asnData?.stores ||
-                asnData?.store_codes ||
-                asnData?.destinations ||
-                [];
-              const directList = Array.isArray(directStoresFromASN)
-                ? directStoresFromASN
-                    .map((s: any) =>
-                      typeof s === "string" ? s : (s?.code ?? s?.store ?? ""),
-                    )
-                    .filter(Boolean)
-                : [];
-              const allStoresFromASN =
-                storesFromDetails.length > 0 ? storesFromDetails : directList;
-              if (allStoresFromASN.length > 0) {
-                setDistributionStores(
-                  await canonicalStoresFromWarehouseMaster(
-                    allStoresFromASN,
-                    preferredMasterRows,
-                  ),
-                );
-                console.log(
-                  `✅ Stores from ASN details (TO had no allocations):`,
-                  allStoresFromASN,
-                );
-              } else {
-                setDistributionStores([]);
-              }
-            } catch (_) {
-              setDistributionStores([]);
+              resolvedToNo = String(toNoFromASN).trim();
+              setTransferOrder(resolvedToNo);
+              console.log(`✅ Transfer Order from ASN details: ${resolvedToNo}`);
             }
           }
-        } else {
-          // No Transfer Order found - show empty list
-          console.log(
-            `ℹ️ No Transfer Order found for ASN ${activeASN} (from API)`,
-          );
-          setTransferOrder(null);
-          setDistributionStores([]);
-        }
-      } catch (error: any) {
-        // Handle errors - check if offline
-        const errorMessage = error?.message || error?.toString() || "";
-        const isOffline =
-          errorMessage.includes("Network") ||
-          errorMessage.includes("fetch") ||
-          errorMessage.includes("Failed to fetch") ||
-          errorMessage.includes("Network request failed");
-
-        const is404Error =
-          errorMessage.includes("404") ||
-          errorMessage.includes("No transfer order found") ||
-          errorMessage.includes("not found") ||
-          errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
-
-        if (isOffline) {
-          // Device is offline - ask user to sync
+          const details: any[] =
+            asnData?.details ||
+            asnData?.lines ||
+            asnData?.items ||
+            asnData?.data?.details ||
+            [];
+          const storeFromRow = (r: any) =>
+            r.store ||
+            r.store_code ||
+            r.destination ||
+            r.to_store ||
+            r.warehouse ||
+            r.destination_store;
+          const storesFromDetails = Array.from(
+            new Set(
+              details
+                .map((r: any) => storeFromRow(r))
+                .filter((s: any) => s && String(s).trim() !== ""),
+            ),
+          ) as string[];
+          const directStoresFromASN =
+            asnData?.stores ||
+            asnData?.store_codes ||
+            asnData?.destinations ||
+            [];
+          const directList = Array.isArray(directStoresFromASN)
+            ? directStoresFromASN
+                .map((s: any) =>
+                  typeof s === "string" ? s : (s?.code ?? s?.store ?? ""),
+                )
+                .filter(Boolean)
+            : [];
+          const fromAsn =
+            storesFromDetails.length > 0 ? storesFromDetails : directList;
+          if (fromAsn.length > 0) {
+            storeCodes = fromAsn;
+            console.log(`✅ Store codes from ASN details:`, storeCodes);
+          }
+        } catch (asnErr: any) {
           console.warn(
-            `⚠️ BoxManagementScreen: Device is offline - cannot fetch Transfer Order`,
+            `⚠️ Could not get stores from ASN details:`,
+            asnErr?.message,
           );
-          Alert.alert(
-            "Offline Mode",
-            "Your device is currently offline.\n\n" +
-              "Transfer Order data must be fetched from the backend API.\n\n" +
-              "Please connect to the internet and sync data, or try again when online.",
-            [
-              {
-                text: "OK",
-                onPress: () => {
-                  setTransferOrder(null);
-                  setDistributionStores([]);
-                },
-              },
-            ],
-          );
-          setTransferOrder(null);
-          setDistributionStores([]);
-          return;
-        } else if (is404Error) {
-          // 404 is expected - ASN can be received without Transfer Order
-          console.log(
-            `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`,
-          );
-          setTransferOrder(null);
-          setDistributionStores([]);
-        } else {
-          // Other errors (500, etc.) - log as warning
-          console.warn(
-            "⚠️ BoxManagementScreen: Could not fetch transfer order from API:",
-            errorMessage,
-          );
-          Alert.alert(
-            "API Error",
-            `Failed to fetch Transfer Order from backend:\n\n${errorMessage}\n\nPlease try again or contact support.`,
-            [
-              {
-                text: "OK",
-                onPress: () => {
-                  setTransferOrder(null);
-                  setDistributionStores([]);
-                },
-              },
-            ],
-          );
-          setTransferOrder(null);
-          setDistributionStores([]);
         }
       }
 
-      // Final diagnostic: If TO exists but no stores, log a warning
-      if (transferOrder && distributionStores.length === 0) {
-        console.warn(
-          `⚠️ DIAGNOSTIC: TO ${transferOrder} exists but no stores found!`,
+      let canonicalStores: string[] = [];
+      if (storeCodes.length > 0) {
+        canonicalStores = await canonicalStoresFromWarehouseMaster(
+          storeCodes,
+          preferredMasterRows,
         );
-        console.warn(`⚠️ This could mean:`);
-        console.warn(`  1. TO allocations don't have store codes`);
-        console.warn(`  2. API didn't return store data`);
-        console.warn(`  3. Store codes in TO allocations are empty or null`);
+        setDistributionStores(canonicalStores);
+      } else {
+        setDistributionStores([]);
+      }
+
+      if (!online && loaded.source === "none") {
+        Alert.alert(
+          "Offline Mode",
+          "No Transfer Order data in local cache.\n\n" +
+            "Connect to the internet and open this screen again to load the Transfer Order, " +
+            "or sync master data if you were online before.",
+        );
+      }
+
+      if (resolvedToNo && canonicalStores.length === 0) {
         console.warn(
-          `⚠️ User will see "No stores found in Transfer Order" message`,
+          `⚠️ DIAGNOSTIC: TO ${resolvedToNo} exists but no stores matched Warehouse Master.`,
         );
         console.warn(
-          `⚠️ Note: Warehouses (WAREHOUSE, WH-MAIN, etc.) ARE now included in stores`,
+          `⚠️ Ensure Warehouse Master is synced and TO store codes match master codes.`,
         );
       }
     } catch (error: any) {
-      // Handle 404 errors gracefully - ASN can be received without Transfer Order
       const errorMessage = error?.message || error?.toString() || "";
       const is404Error =
         errorMessage.includes("404") ||
@@ -1206,20 +768,56 @@ export default function BoxManagementScreen() {
         errorMessage.includes("TRANSFER_ORDER_NOT_FOUND");
 
       if (is404Error) {
-        // 404 is expected - ASN can be received without Transfer Order
         console.log(
-          `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN} (this is OK - ASN can be received without Transfer Order)`,
+          `ℹ️ BoxManagementScreen: No transfer order found for ASN ${activeASN}`,
+        );
+        setTransferOrder(null);
+        setDistributionStores([]);
+        return;
+      }
+
+      console.warn(
+        "⚠️ BoxManagementScreen: Error loading transfer order and stores:",
+        errorMessage,
+      );
+
+      try {
+        const localRows = await dataService.getTransferOrderAllocations(activeASN);
+        if (localRows.length > 0) {
+          const toNo = String(localRows[0]?.to_no || "").trim() || null;
+          const storeCodes = Array.from(
+            new Set(localRows.map((r) => r.store).filter(Boolean)),
+          ) as string[];
+          if (toNo) setTransferOrder(toNo);
+          setDistributionStores(
+            await canonicalStoresFromWarehouseMaster(
+              storeCodes,
+              preferredMasterRows,
+            ),
+          );
+          return;
+        }
+      } catch {
+        /* fall through */
+      }
+
+      const isOffline =
+        errorMessage.includes("Network") ||
+        errorMessage.includes("fetch") ||
+        errorMessage.includes("Failed to fetch");
+      if (isOffline) {
+        Alert.alert(
+          "Offline Mode",
+          "Could not refresh Transfer Order from the server and no local cache was found.\n\n" +
+            "Please connect to the internet and try again.",
         );
       } else {
-        // Other errors (network, 500, etc.) - log as warning
-        console.warn(
-          "⚠️ BoxManagementScreen: Error loading transfer order and stores:",
-          errorMessage,
+        Alert.alert(
+          "Load Error",
+          `Failed to load Transfer Order:\n\n${errorMessage}`,
         );
       }
       setTransferOrder(null);
-      // Don't set default stores - only show stores that actually exist in TO allocations
-      // If there's an error, show empty list or only what's in the database
       setDistributionStores([]);
     }
   };
@@ -2255,17 +1853,23 @@ export default function BoxManagementScreen() {
   };
 
   const handleCloseBox = async (boxId: string) => {
-    // First, check if box is warehouse box to show appropriate warning
     let isWarehouseBox = false;
+    let isPutawayBox = boxId.startsWith("PAW-");
     try {
       const db = await getDatabase();
       if (db) {
-        const box = await db.getFirstAsync<{ store: string }>(
-          `SELECT store FROM box_cache WHERE box_id = ?`,
+        const box = await db.getFirstAsync<{ store: string; purpose: string }>(
+          `SELECT store, purpose FROM box_cache WHERE box_id = ?`,
           [boxId],
         );
         if (box) {
           isWarehouseBox = await dataService.isWarehouse(box.store || "");
+          const purpose = String(box.purpose || "")
+            .trim()
+            .toUpperCase();
+          if (purpose === "PUTAWAY") {
+            isPutawayBox = true;
+          }
         }
       }
     } catch (error: any) {
@@ -2275,10 +1879,14 @@ export default function BoxManagementScreen() {
       );
     }
 
-    // Show confirmation dialog before closing
+    const nextStepHint =
+      isPutawayBox || isWarehouseBox
+        ? "Once Closed, it will be available for Putaway."
+        : "Once Closed, it will be available for Packing.";
+
     Alert.alert(
       "Close Box",
-      "Is the Box completely Full?\n\nOnce Closed, it will be available for Putaway.",
+      `Is the Box completely Full?\n\n${nextStepHint}`,
       [
         {
           text: "Cancel",
@@ -3385,23 +2993,18 @@ export default function BoxManagementScreen() {
   const hasAnyClosedBox = boxes.some((box) => box.status === "Closed");
   const canProceed = boxes.length > 0 && hasAnyClosedBox;
 
-  // Filter Putaway boxes - exclude those packed into dispatched TCs and closed boxes
-  // Also exclude Transfer Cartons (TC-*) - they should not be shown in Putaway section
+  // Filter Putaway boxes for display (respects "Show only My Carton").
   const putawayBoxes = useMemo(() => {
+    const source = boxesForDisplay;
     if (!boxToTCMap || !dispatchedTCSet) {
-      // If maps not loaded yet, return all Putaway boxes (excluding closed and Transfer Cartons)
-      return boxesForDisplay.filter((b) => {
-        // Exclude Transfer Cartons (TC-*)
-        if (b.box_id?.startsWith("TC-")) {
-          return false;
-        }
+      return source.filter((b) => {
+        if (b.box_id?.startsWith("TC-")) return false;
         const isPutaway =
           b.purpose === "PUTAWAY" || b.box_id?.startsWith("PAW-");
         const isClosed =
           b.status === "Closed" ||
           b.status === "CLOSED" ||
           b.status === "closed";
-        // Exclude sealed/dispatched Transfer Cartons
         const isSealedOrDispatched =
           b.status === "Sealed" ||
           b.status === "SEALED" ||
@@ -3412,15 +3015,11 @@ export default function BoxManagementScreen() {
         return isPutaway && !isClosed && !isSealedOrDispatched;
       });
     }
-    return boxesForDisplay.filter((b) => {
-      // Exclude Transfer Cartons (TC-*)
-      if (b.box_id?.startsWith("TC-")) {
-        return false;
-      }
+    return source.filter((b) => {
+      if (b.box_id?.startsWith("TC-")) return false;
       if (b.purpose !== "PUTAWAY" && !b.box_id?.startsWith("PAW-")) {
         return false;
       }
-      // Exclude closed Putaway boxes (same as regular boxes)
       if (
         b.status === "Closed" ||
         b.status === "CLOSED" ||
@@ -3428,7 +3027,6 @@ export default function BoxManagementScreen() {
       ) {
         return false;
       }
-      // Exclude sealed/dispatched Transfer Cartons
       if (
         b.status === "Sealed" ||
         b.status === "SEALED" ||
@@ -3439,32 +3037,66 @@ export default function BoxManagementScreen() {
       ) {
         return false;
       }
-      // Check if box is packed into a dispatched TC
       const tcId = boxToTCMap.get(b.box_id);
       if (tcId && dispatchedTCSet.has(tcId)) {
-        return false; // Exclude dispatched boxes
+        return false;
       }
       return true;
     });
   }, [boxesForDisplay, boxToTCMap, dispatchedTCSet]);
 
-  // Check if there are Putaway boxes (to show the section even if no items without TO)
-  const hasPutawayBoxes = putawayBoxes.length > 0;
+  // Putaway section visibility must NOT depend on "Show only My Carton" filter.
+  const hasAnyPutawayBoxesOnAsn = useMemo(() => {
+    const source = boxes;
+    if (!boxToTCMap || !dispatchedTCSet) {
+      return source.some((b) => {
+        if (b.box_id?.startsWith("TC-")) return false;
+        const isPutaway =
+          b.purpose === "PUTAWAY" || b.box_id?.startsWith("PAW-");
+        const isClosed =
+          b.status === "Closed" ||
+          b.status === "CLOSED" ||
+          b.status === "closed";
+        return isPutaway && !isClosed;
+      });
+    }
+    return source.some((b) => {
+      if (b.box_id?.startsWith("TC-")) return false;
+      if (b.purpose !== "PUTAWAY" && !b.box_id?.startsWith("PAW-")) {
+        return false;
+      }
+      if (
+        b.status === "Closed" ||
+        b.status === "CLOSED" ||
+        b.status === "closed"
+      ) {
+        return false;
+      }
+      const tcId = boxToTCMap.get(b.box_id);
+      if (tcId && dispatchedTCSet.has(tcId)) {
+        return false;
+      }
+      return true;
+    });
+  }, [boxes, boxToTCMap, dispatchedTCSet]);
+
   const availablePutawayBoxQty = !transferOrder
     ? Math.max(0, totalASNQty - totalPutawayScannedQty)
     : remainingItemsQty;
-  // ✅ FIX: Show Putaway section if:
-  // 1. No TO exists (no transfer order) AND there's available quantity (totalASNQty > 0), OR
-  // 2. Remaining items > 0 (Total ASN - Total TO > 0), OR
-  // 3. There are Putaway boxes already created
-  // This allows creating Putaway boxes even when there's no Transfer Order but there's available quantity
+  // Putaway workflow visibility is qty-driven — not gated by the my-carton filter.
   const showPutawaySection =
-    (!transferOrder && availablePutawayBoxQty > 0) || // No TO but has available quantity
-    remainingItemsQty > 0 || // Has remaining items after TO allocation
-    hasPutawayBoxes; // Already has Putaway boxes
+    availablePutawayBoxQty > 0 ||
+    hasAnyPutawayBoxesOnAsn ||
+    hasItemsWithoutTO ||
+    (Boolean(transferOrder) && totalASNQty > totalTOAllocatedQty);
 
   return (
-    <ScrollView style={styles.container}>
+    <SafeAreaView style={styles.safeArea} edges={["top"]}>
+      <View style={styles.screenBody}>
+        <ScrollView
+          style={styles.container}
+          contentContainerStyle={styles.scrollContent}
+        >
       {/* Header with Back Button */}
       <View style={styles.headerContainer}>
         <TouchableOpacity
@@ -3483,18 +3115,27 @@ export default function BoxManagementScreen() {
       />
       <View
         style={{
-          flexDirection: "row",
-          alignItems: "center",
-          justifyContent: "space-between",
           paddingHorizontal: 16,
           paddingVertical: 8,
           backgroundColor: "#f5f5f5",
         }}
       >
-        <Text style={{ flex: 1, fontSize: 14, color: "#333" }}>
-          Show only My Carton
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <Text style={{ flex: 1, fontSize: 14, color: "#333" }}>
+            Show only My Carton
+          </Text>
+          <Switch value={onlyMyBoxes} onValueChange={setOnlyMyBoxes} />
+        </View>
+        <Text style={{ fontSize: 11, color: "#666", marginTop: 4 }}>
+          Filters store and putaway box lists only — does not hide Putaway
+          creation.
         </Text>
-        <Switch value={onlyMyBoxes} onValueChange={setOnlyMyBoxes} />
       </View>
       <View style={styles.content}>
         {/* Show Transfer Order info if available */}
@@ -3972,11 +3613,24 @@ export default function BoxManagementScreen() {
 
           return (
             Object.entries(warehouseBoxesByStore) as [string, any[]][]
-          ).map(([store, storeBoxes]) => (
+          ).map(([store, storeBoxes]) => {
+            const storeLabel = storeDisplayNameFromMaster(
+              store,
+              warehousesAndStores,
+            );
+            return (
             <View key={`warehouse-${store}`} style={styles.storeSection}>
               <View style={styles.storeSectionHeader}>
                 <View style={styles.storeSectionHeaderLeft}>
-                  <Text style={styles.storeSectionTitle}>{store}</Text>
+                  <Text style={styles.storeSectionTitle}>
+                    {store}
+                    {storeLabel ? (
+                      <Text style={styles.storeSectionNameInline}>
+                        {" "}
+                        — {storeLabel}
+                      </Text>
+                    ) : null}
+                  </Text>
                   <Text style={styles.storeSectionSubtitle}>
                     {storeBoxes.length}{" "}
                     {storeBoxes.length === 1 ? "box" : "boxes"}
@@ -4150,7 +3804,8 @@ export default function BoxManagementScreen() {
                 )}
               />
             </View>
-          ));
+            );
+          })
         })()}
 
         {/* Display all stores from TO as separate sections */}
@@ -4173,12 +3828,24 @@ export default function BoxManagementScreen() {
             ).length;
             const totalCount = storeBoxes.length;
             const isCreating = loading && selectedStore === store;
+            const storeLabel = storeDisplayNameFromMaster(
+              store,
+              warehousesAndStores,
+            );
 
             return (
               <View key={store} style={styles.storeSection}>
                 <View style={styles.storeSectionHeader}>
                   <View style={styles.storeSectionHeaderLeft}>
-                    <Text style={styles.storeSectionTitle}>{store}</Text>
+                    <Text style={styles.storeSectionTitle}>
+                      {store}
+                      {storeLabel ? (
+                        <Text style={styles.storeSectionNameInline}>
+                          {" "}
+                          — {storeLabel}
+                        </Text>
+                      ) : null}
+                    </Text>
                     <Text style={styles.storeSectionSubtitle}>
                       {totalCount} {totalCount === 1 ? "box" : "boxes"} •{" "}
                       {openCount} Open • {closedCount} Closed
@@ -4498,7 +4165,12 @@ export default function BoxManagementScreen() {
                 style={styles.storeSelector}
                 contentContainerStyle={styles.storeSelectorContent}
               >
-                {distributionStores.map((store) => (
+                {distributionStores.map((store) => {
+                  const storeLabel = storeDisplayNameFromMaster(
+                    store,
+                    warehousesAndStores,
+                  );
+                  return (
                   <TouchableOpacity
                     key={store}
                     style={[
@@ -4514,9 +4186,11 @@ export default function BoxManagementScreen() {
                       ]}
                     >
                       {store}
+                      {storeLabel ? `\n${storeLabel}` : ""}
                     </Text>
                   </TouchableOpacity>
-                ))}
+                  );
+                })}
               </ScrollView>
             )}
             {distributionStores.length > 0 && (
@@ -4686,6 +4360,10 @@ export default function BoxManagementScreen() {
             </Text>
           </View>
         )}
+      </View>
+
+      </ScrollView>
+      <ScreenFooterFrame />
       </View>
 
       {/* Box Items Modal */}
@@ -4878,14 +4556,25 @@ export default function BoxManagementScreen() {
           </View>
         </View>
       </Modal>
-    </ScrollView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: "#f5f5f5",
+  },
+  screenBody: {
+    flex: 1,
+  },
   container: {
     flex: 1,
     backgroundColor: "#f5f5f5",
+  },
+  scrollContent: {
+    flexGrow: 1,
+    paddingBottom: 12,
   },
   headerContainer: {
     backgroundColor: "#007AFF",
@@ -4893,6 +4582,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     paddingHorizontal: 16,
     paddingVertical: 12,
+    marginTop: 4,
     borderBottomWidth: 1,
     borderBottomColor: "rgba(255, 255, 255, 0.2)",
   },
@@ -5141,7 +4831,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: "center",
     marginTop: 24,
-    marginBottom: 16,
+    marginBottom: 8,
   },
   nextButtonText: {
     color: "#fff",
@@ -5577,6 +5267,11 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "#333",
     marginBottom: 4,
+  },
+  storeSectionNameInline: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#555",
   },
   storeSectionSubtitle: {
     fontSize: 14,

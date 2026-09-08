@@ -48,6 +48,7 @@ import {
   storeCodesMatchForTO,
   compactStoreCodeKey,
   parseBoxIdStoreSlug,
+  extractLeadingStoreCode,
 } from "../utils/box-id";
 import {
   itemCodesMatchForAllocation,
@@ -73,9 +74,193 @@ import {
   createdByFromSettings,
 } from "../utils/box-created-by";
 import { isDeviceOnline } from "../utils/network-check";
+import { getCurrentUserRole } from "../utils/user-role";
+
+type FinishCartonOptions = {
+  supervisorOverride?: boolean;
+  overrideReason?: string;
+  targetCartonId?: string;
+  ownerInboundSession?: string | null;
+};
+
+function parseExpectedSessionFromError(message: string): string | null {
+  return message.match(/Expected\s+(SESSION-[A-Z0-9-]+)/i)?.[1] ?? null;
+}
+
+async function fetchOwnerCartonLockFromServer(
+  asnNo: string,
+  cartonId: string
+): Promise<{
+  inbound_session: string | null;
+  locked_by: string | null;
+  device_id: string | null;
+} | null> {
+  try {
+    const response = await apiService.getCartonLockStatus({
+      asn_no: asnNo,
+      carton_id: cartonId,
+    });
+    const lock =
+      (response as any)?.lock ||
+      (response as any)?.data?.lock ||
+      null;
+    if (!lock) return null;
+    return {
+      inbound_session: lock.inbound_session
+        ? String(lock.inbound_session).trim()
+        : null,
+      locked_by: lock.locked_by ? String(lock.locked_by).trim() : null,
+      device_id: lock.device_id ? String(lock.device_id).trim() : null,
+    };
+  } catch {
+    return null;
+  }
+}
 
 const RECEIVED_WITH_SHORTAGE_STATUS = "Received with Shortage";
 const SHOW_SCAN_DETAILS_CARD = false;
+const LIVE_DISTRIBUTION_POLL_MS = 15000;
+
+type LiveDistributionStoreRow = {
+  store: string;
+  toQty: number;
+  scannedQty: number;
+  remainingQty: number;
+  openBoxes: string[];
+};
+
+type LiveDistributionSnapshot = {
+  itemCode: string;
+  itemName: string | null;
+  toNo: string | null;
+  serverTime: string | null;
+  fullyDistributed: boolean;
+  stores: LiveDistributionStoreRow[];
+};
+
+function readDistributionRemainingQty(store: any): number {
+  return Number(
+    store?.remaining_qty ??
+      store?.remainingQty ??
+      store?.remaining ??
+      store?.balance_qty ??
+      store?.balance ??
+      0
+  );
+}
+
+function parseLiveDistributionPayload(
+  payload: any,
+  fallbackItemCode: string
+): LiveDistributionSnapshot {
+  const storesRaw = Array.isArray(payload?.stores) ? payload.stores : [];
+  const stores: LiveDistributionStoreRow[] = storesRaw.map((store: any) => ({
+    store: String(store?.store || "").trim(),
+    toQty: Number(store?.to_qty ?? store?.toQty) || 0,
+    scannedQty: Number(store?.scanned_qty ?? store?.scannedQty) || 0,
+    remainingQty: readDistributionRemainingQty(store),
+    openBoxes: (Array.isArray(store?.open_boxes) ? store.open_boxes : [])
+      .map((b: any) => (typeof b === "string" ? b : b?.box_id))
+      .filter(Boolean)
+      .map((id: unknown) => String(id).trim()),
+  }));
+  const openStores = stores.filter((s) => s.remainingQty > 0);
+  const fullyDistributed =
+    payload?.fully_distributed === true ||
+    (stores.length > 0 && openStores.length === 0);
+
+  return {
+    itemCode: String(payload?.item_code || fallbackItemCode).trim(),
+    itemName: payload?.item_name ? String(payload.item_name).trim() : null,
+    toNo: payload?.to_no ? String(payload.to_no).trim() : null,
+    serverTime: payload?.server_time ? String(payload.server_time) : null,
+    fullyDistributed,
+    stores,
+  };
+}
+
+function parseBoxesApiResponse(response: unknown): any[] {
+  if (Array.isArray(response)) return response;
+  if (response && typeof response === "object") {
+    const r = response as Record<string, unknown>;
+    if (Array.isArray(r.boxes)) return r.boxes;
+    if (Array.isArray(r.data)) return r.data;
+    if (r.data && typeof r.data === "object") {
+      const d = r.data as Record<string, unknown>;
+      if (Array.isArray(d.boxes)) return d.boxes;
+    }
+    if (Array.isArray(r.items)) return r.items;
+    if (Array.isArray(r.results)) return r.results;
+  }
+  return [];
+}
+
+function isOpenBoxStatus(status: unknown): boolean {
+  const normalized = String(status ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  return !normalized || normalized === "OPEN";
+}
+
+async function enrichDistributionOpenBoxes(
+  snapshot: LiveDistributionSnapshot,
+  asn: string,
+  localBoxes: Array<{ box_id?: string; store?: string; status?: string }>,
+  masterRows: Array<{ code?: string | null; name?: string | null }>
+): Promise<LiveDistributionSnapshot> {
+  const stores = await Promise.all(
+    snapshot.stores.map(async (row) => {
+      if (row.openBoxes.length > 0) return row;
+
+      const resolved = canonicalStoreForToLine(row.store, masterRows);
+      const storeCode = String(
+        resolved.storeToPersist || extractLeadingStoreCode(row.store) || row.store
+      ).trim();
+
+      const localOpen = localBoxes
+        .filter((box) => {
+          if (!box?.box_id || !isOpenBoxStatus(box.status)) return false;
+          return (
+            storeCodesMatchForTO(box.store, row.store) ||
+            storeCodesMatchForTO(box.store, storeCode)
+          );
+        })
+        .map((box) => String(box.box_id).trim())
+        .filter(Boolean);
+
+      if (localOpen.length > 0) {
+        return { ...row, openBoxes: localOpen };
+      }
+
+      if (!storeCode) return row;
+
+      try {
+        const response = await apiService.getBoxes({
+          asn,
+          store: storeCode,
+          status: "OPEN",
+        });
+        const apiOpen = parseBoxesApiResponse(response)
+          .filter((box) => box?.box_id && isOpenBoxStatus(box.status))
+          .map((box) => String(box.box_id).trim())
+          .filter(Boolean);
+        if (apiOpen.length > 0) {
+          return { ...row, openBoxes: apiOpen };
+        }
+      } catch (error: any) {
+        console.warn(
+          `⚠️ enrichDistributionOpenBoxes: could not load boxes for ${storeCode}:`,
+          error?.message || error
+        );
+      }
+
+      return row;
+    })
+  );
+
+  return { ...snapshot, stores };
+}
 
 const isCompletedCartonStatus = (status?: string | null) => {
   const normalized = String(status || "").trim().toUpperCase();
@@ -376,7 +561,10 @@ export default function ReceiveSortScreen() {
   const [distributionDetailsLoading, setDistributionDetailsLoading] =
     useState(false);
   const [liveDistributionDetails, setLiveDistributionDetails] =
-    useState<any | null>(null);
+    useState<LiveDistributionSnapshot | null>(null);
+  const [liveDistributionError, setLiveDistributionError] = useState<
+    string | null
+  >(null);
   const [expectedItemsSearchQuery, setExpectedItemsSearchQuery] = useState("");
   const [scannedItemsSearchQuery, setScannedItemsSearchQuery] = useState("");
   const [manualQtyItem, setManualQtyItem] = useState<string | null>(null);
@@ -596,6 +784,179 @@ export default function ReceiveSortScreen() {
       console.warn("refreshScannedStateFromDb failed:", e?.message);
     }
   }, [activeASN, activeSession, lockedCarton]);
+
+  const storeDisplayPartsForDistribution = useCallback(
+    (storeRaw: string): { code: string; name: string | null } => {
+      const store = String(storeRaw || "").trim();
+      if (!store) return { code: "", name: null };
+
+      const masterRows = warehousesAndStores.map((ws: any) => ({
+        code: String(ws?.code || "").trim(),
+        name: String(ws?.name || "").trim(),
+      }));
+      const resolved = canonicalStoreForToLine(store, masterRows);
+      let code = String(
+        resolved.storeToPersist ||
+          extractLeadingStoreCode(store) ||
+          store
+      ).trim();
+
+      const master = warehousesAndStores.find(
+        (ws: any) =>
+          storeCodesMatchForTO(ws?.code, code) ||
+          storeCodesMatchForTO(ws?.code, store)
+      );
+      if (master?.code) {
+        code = String(master.code).trim();
+      }
+
+      let name: string | null = null;
+      const masterName = String(master?.name ?? "").trim();
+      if (masterName && masterName.toUpperCase() !== code.toUpperCase()) {
+        const prefix = new RegExp(
+          `^${code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[-–—]\\s*`,
+          "i"
+        );
+        name = masterName.replace(prefix, "").trim() || masterName;
+      }
+      if (!name) {
+        const longForm = store.match(/^[A-Za-z0-9]{2,12}\s*[-–—]\s*(.+)$/);
+        if (longForm?.[1]) name = longForm[1].trim();
+      }
+
+      return { code, name };
+    },
+    [warehousesAndStores]
+  );
+
+  const renderDistributionStoreHeader = (storeRaw: string) => {
+    const { code, name } = storeDisplayPartsForDistribution(storeRaw);
+    return (
+      <View style={styles.distributionStoreBlock}>
+        <Text style={styles.distributionStoreCode}>{code || storeRaw}</Text>
+        {name ? (
+          <Text style={styles.distributionStoreName} numberOfLines={2}>
+            {name}
+          </Text>
+        ) : null}
+      </View>
+    );
+  };
+
+  const refreshLiveDistribution = useCallback(
+    async (options?: { openModal?: boolean; silent?: boolean }) => {
+      if (!activeASN || !currentItem || workflowState !== "SCAN_BOX") {
+        return null;
+      }
+
+      if (!options?.silent) {
+        setDistributionDetailsLoading(true);
+      }
+      setLiveDistributionError(null);
+
+      try {
+        const online = await isDeviceOnline();
+        if (!online) {
+          setLiveDistributionError(
+            "Offline — live totals need network. Counts below may be device-only until you sync."
+          );
+          return null;
+        }
+
+        const response = await apiService.getReceiveSortDistributionDetails({
+          asn_no: activeASN,
+          inbound_session: activeSession || undefined,
+          item_code: currentItem,
+          carton_id: lockedCarton,
+        });
+        let snapshot = parseLiveDistributionPayload(
+          response?.data || response,
+          currentItem
+        );
+
+        let masterRows: Array<{ code?: string | null; name?: string | null }> =
+          [];
+        try {
+          masterRows = await dataService.getWarehouseStoreMasterRows();
+        } catch {
+          masterRows = warehousesAndStores.map((ws: any) => ({
+            code: ws?.code,
+            name: ws?.name,
+          }));
+        }
+
+        const localBoxes = await dataService.getBoxes(activeASN);
+        snapshot = await enrichDistributionOpenBoxes(
+          snapshot,
+          activeASN,
+          localBoxes,
+          masterRows
+        );
+
+        setLiveDistributionDetails(snapshot);
+
+        if (options?.openModal) {
+          if (snapshot.fullyDistributed) {
+            Alert.alert(
+              "Item Fully Distributed",
+              `Item ${snapshot.itemCode} has no remaining distribution quantity.`,
+              [{ text: "OK", onPress: () => refocusScanner() }]
+            );
+            return snapshot;
+          }
+          setShowDistributionDetailsModal(true);
+        }
+
+        return snapshot;
+      } catch (error: any) {
+        const msg =
+          error?.message ||
+          "Failed to load live distribution details from backend.";
+        setLiveDistributionError(msg);
+        if (options?.openModal) {
+          Alert.alert("Distribution Details", msg, [
+            { text: "OK", onPress: () => refocusScanner() },
+          ]);
+        }
+        return null;
+      } finally {
+        if (!options?.silent) {
+          setDistributionDetailsLoading(false);
+        }
+      }
+    },
+    [
+      activeASN,
+      activeSession,
+      currentItem,
+      lockedCarton,
+      refocusScanner,
+      warehousesAndStores,
+      workflowState,
+    ]
+  );
+
+  useEffect(() => {
+    if (workflowState !== "SCAN_BOX" || !currentItem || !activeASN) {
+      setLiveDistributionDetails(null);
+      setLiveDistributionError(null);
+      return;
+    }
+    void refreshLiveDistribution({ silent: true });
+  }, [workflowState, currentItem, activeASN, activeSession, lockedCarton, refreshLiveDistribution]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (workflowState !== "SCAN_BOX" || !currentItem || !activeASN) {
+        return undefined;
+      }
+      void refreshLiveDistribution({ silent: true });
+      const timer = setInterval(() => {
+        void refreshLiveDistribution({ silent: true });
+      }, LIVE_DISTRIBUTION_POLL_MS);
+      return () => clearInterval(timer);
+    }, [workflowState, currentItem, activeASN, refreshLiveDistribution])
+  );
 
   const loadSavedState = useCallback(async () => {
     if (!activeASN || !activeSession) return;
@@ -2719,21 +3080,32 @@ export default function ReceiveSortScreen() {
           Alert.alert("Info", `Resuming work on carton ${cartonId}`);
           return;
         } else {
-          // Locked by a different owner: never allow resume/takeover from this device.
+          setLoading(false);
+          await loadAvailableCartons();
+          const roleInfoOther = await getCurrentUserRole();
           Alert.alert(
             "Carton Already in Use",
             `Carton ${cartonId} is currently being processed by another user.\n\nLocked by: ${
               status.locked_by || "Unknown"
-            }\nStatus: ${status.status}\n\nPlease select a different carton.`,
-            [{ text: "OK", style: "cancel" as const }]
+            }\nStatus: ${status.status}\n\nPlease select a different carton, or a supervisor can finish it if the device is unavailable.`,
+            roleInfoOther.isSupervisorOrAdmin
+              ? [
+                  {
+                    text: "Supervisor Finish",
+                    onPress: () => {
+                      void promptSupervisorFinishCarton(cartonId, {
+                        lockedBy: status?.locked_by,
+                      });
+                    },
+                  },
+                  { text: "OK", style: "cancel" as const },
+                ]
+              : [{ text: "OK", style: "cancel" as const }]
           );
-          setLoading(false);
-          await loadAvailableCartons(); // Refresh available cartons
           return;
         }
       }
 
-      // Handle Pending status - automatically unload it first
       if (statusLower === "pending") {
         console.log(`📦 Carton ${cartonId} is Pending, auto-unloading...`);
         const pendingSettings = await getSettings();
@@ -2873,9 +3245,23 @@ export default function ReceiveSortScreen() {
             });
             setLoading(false);
             await loadAvailableCartons();
+            const roleInfo = await getCurrentUserRole();
             Alert.alert(
               "Carton already in use",
-              `This carton is already being received on another device (per server).\n\nUser: ${whoUser}\nDevice: ${whoDev}\n\nWait for them to finish or ask them to release the carton.`
+              `This carton is already being received on another device (per server).\n\nUser: ${whoUser}\nDevice: ${whoDev}\n\nWait for them to finish or ask a supervisor to complete it.`,
+              roleInfo.isSupervisorOrAdmin
+                ? [
+                    {
+                      text: "Supervisor Finish",
+                      onPress: () => {
+                        void promptSupervisorFinishCarton(cartonId, {
+                          lockedBy: whoUser,
+                        });
+                      },
+                    },
+                    { text: "OK", style: "cancel" as const },
+                  ]
+                : [{ text: "OK", style: "cancel" as const }]
             );
             return;
           }
@@ -3958,45 +4344,17 @@ export default function ReceiveSortScreen() {
         persistCartonId.length > 0 ? persistCartonId : null;
       const scannedOnIso = new Date().toISOString();
       const itemForRow = String(itemCode).trim();
-      try {
-        if (
-          !activeASN ||
-          !canonicalBoxId ||
-          !lockedCarton ||
-          !itemForRow ||
-          !settings.user_id
-        ) {
-          Alert.alert(
-            isPutawayBox ? "Putaway Not Allowed" : "Sort Not Allowed",
-            "Missing scan context. Please scan the supplier carton, then scan the item, then scan the destination BOX."
-          );
-          setLoading(false);
-          setIsProcessingScan(false);
-          return;
-        }
-        if (!(await requireOnlineForReceiving())) {
-          setLoading(false);
-          setIsProcessingScan(false);
-          return;
-        }
-        await apiService.scanSortBox({
-          purpose: isPutawayBox ? "PUTAWAY" : "STORE",
-          asn_no: activeASN,
-          box_id: canonicalBoxId,
-          carton_id: lockedCarton ?? undefined,
-          item_code: itemForRow,
-          qty: 1,
-          user_id: settings.user_id ?? "",
-          device_id: settings.device_id ?? "",
-        });
-      } catch (error: any) {
-        const payload = error?.data || error?.response?.data || {};
-        const msg =
-          payload?.message ||
-          error?.message ||
-          "Backend rejected this sort scan.";
-        Alert.alert(isPutawayBox ? "Putaway Not Allowed" : "Sort Not Allowed", msg);
-        showScanFeedback("err", msg);
+      if (
+        !activeASN ||
+        !canonicalBoxId ||
+        !lockedCarton ||
+        !itemForRow ||
+        !settings.user_id
+      ) {
+        Alert.alert(
+          isPutawayBox ? "Putaway Not Allowed" : "Sort Not Allowed",
+          "Missing scan context. Please scan the supplier carton, then scan the item, then scan the destination BOX."
+        );
         setLoading(false);
         setIsProcessingScan(false);
         return;
@@ -4027,6 +4385,21 @@ export default function ReceiveSortScreen() {
         ]
       );
 
+      await addEvent({
+        event_type: "SORT_TO_BOX",
+        asn_no: normalizedASN,
+        inbound_session: activeSession,
+        carton_id: lockedCarton ?? undefined,
+        item_code: itemForRow,
+        box_id: canonicalBoxId,
+        store: storeForToPersistence,
+        qty: 1,
+        device_id: settings.device_id ?? "",
+        user_id: settings.user_id ?? "",
+      }).catch((err) =>
+        console.warn("Error queueing SORT_TO_BOX event:", err?.message || err)
+      );
+
       // Update state
       setLastScannedItem(itemCode);
       setLastScannedBox(canonicalBoxId);
@@ -4035,14 +4408,13 @@ export default function ReceiveSortScreen() {
       // Clear currentItem to allow scanning next item
       setCurrentItemWithLog(null);
 
-      // Reload after backend-controlled sort. Do not queue SORT_TO_BOX here:
-      // /api/sort-box/scan already wrote the server event transactionally.
       try {
         await loadAvailableBoxes().catch((err) =>
           console.warn("Error loading boxes:", err)
         );
 
         await refreshScannedStateFromDb();
+        void refreshLiveDistribution({ silent: true });
 
         showScanFeedback(
           "ok",
@@ -4703,7 +5075,6 @@ export default function ReceiveSortScreen() {
       });
       return;
     }
-    if (!(await requireOnlineForReceiving())) return;
 
     const boxId = barcode.trim().toUpperCase();
     setLoading(true);
@@ -4715,17 +5086,9 @@ export default function ReceiveSortScreen() {
         );
       }
 
-      const scannedItem = await resolveItemFromBarcode(barcode);
-      if (scannedItem) {
-        Alert.alert(
-          "Wrong Scan Type",
-          `You scanned an item code (${scannedItem.item_code}), but you need to scan a BOX barcode.\n\nPlease scan a valid BOX barcode.`
-        );
-        setLoading(false);
-        return;
-      }
-
-      // Validate box exists and is active from Box Management
+      // Resolve destination BOX first — do not treat known box ids as item barcodes.
+      // (resolveItemFromBarcode partial matching can false-match short item codes like "15"
+      // inside BOX-006-171550.)
       const boxes = await dataService.getBoxes(activeASN);
       let box = boxes.find((b) => b.box_id === boxId);
       if (!box) {
@@ -4735,7 +5098,15 @@ export default function ReceiveSortScreen() {
         );
       }
       if (!box) {
-        // Reload boxes list
+        const scannedItem = await resolveItemFromBarcode(barcode);
+        if (scannedItem) {
+          Alert.alert(
+            "Wrong Scan Type",
+            `You scanned an item code (${scannedItem.item_code}), but you need to scan a BOX barcode.\n\nPlease scan a valid BOX barcode.`
+          );
+          setLoading(false);
+          return;
+        }
         await loadAvailableBoxes();
         Alert.alert(
           "BOX Not Found",
@@ -5963,21 +6334,113 @@ export default function ReceiveSortScreen() {
   };
 
   const handleFinishCartonInternal = async (
-    finishMode: "NORMAL" | "SHORTAGE" = "NORMAL"
+    finishMode: "NORMAL" | "SHORTAGE" = "NORMAL",
+    options?: FinishCartonOptions
   ) => {
-    if (!activeASN || !activeSession || !lockedCarton) return;
+    const cartonToFinish = options?.targetCartonId || lockedCarton;
+    if (!activeASN || !activeSession || !cartonToFinish) return;
 
     setLoading(true);
     try {
       const settings = await getSettings();
       const normalizedASN = normalizeASN(activeASN);
+      const supervisorOverride = options?.supervisorOverride === true;
+      const overrideReason = String(options?.overrideReason || "").trim();
 
-      // Get scanned items from database to build receive lines
-      const scannedItemsFromDB = await dataService.getScannedItems(
-        normalizedASN,
-        activeSession,
-        lockedCarton
-      );
+      let ownerSession = options?.ownerInboundSession || null;
+      if (supervisorOverride && !ownerSession) {
+        const lockInfo = await fetchOwnerCartonLockFromServer(
+          activeASN,
+          cartonToFinish
+        );
+        ownerSession = lockInfo?.inbound_session || null;
+      }
+
+      const sessionForReceiveLines =
+        supervisorOverride && ownerSession ? ownerSession : activeSession;
+
+      if (!supervisorOverride) {
+        try {
+          const lockInfo = await fetchOwnerCartonLockFromServer(
+            activeASN,
+            cartonToFinish
+          );
+          const lockOwner = String(lockInfo?.locked_by || "").trim();
+          const me = String(settings.user_id || settings.user_code || "").trim();
+          if (
+            lockOwner &&
+            me &&
+            lockOwner.toUpperCase() !== me.toUpperCase() &&
+            !settingsMatchCartonLockOwner(settings, lockOwner)
+          ) {
+            setLoading(false);
+            Alert.alert(
+              "Not your carton",
+              `This carton is locked by ${lockOwner}.\n\nOnly that picker (or a supervisor) can finish it.`
+            );
+            return;
+          }
+          if (
+            lockInfo?.inbound_session &&
+            lockInfo.inbound_session !== activeSession
+          ) {
+            setLoading(false);
+            const roleInfo = await getCurrentUserRole();
+            if (roleInfo.isSupervisorOrAdmin) {
+              Alert.alert(
+                "Wrong session",
+                `This carton belongs to session:\n${lockInfo.inbound_session}\n\nYour session:\n${activeSession}`,
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Supervisor Finish",
+                    onPress: () => {
+                      void handleFinishCartonInternal(finishMode, {
+                        supervisorOverride: true,
+                        overrideReason: "Session mismatch - supervisor completion",
+                        targetCartonId: cartonToFinish,
+                        ownerInboundSession: lockInfo.inbound_session,
+                      });
+                    },
+                  },
+                ]
+              );
+            } else {
+              Alert.alert(
+                "Wrong session",
+                `Resume the original session on the device that opened this carton:\n${lockInfo.inbound_session}`
+              );
+            }
+            return;
+          }
+        } catch {
+          /* lock-status API may be unavailable on older servers */
+        }
+      }
+
+      const itemsForFinish =
+        cartonToFinish === lockedCarton && cartonItems.length > 0
+          ? cartonItems
+          : await dataService.getCartonItems(activeASN, cartonToFinish);
+
+      const scannedItemsFromDB = supervisorOverride
+        ? await dataService.getScannedItems(
+            normalizedASN,
+            ownerSession || undefined,
+            cartonToFinish
+          ).then(async (rows) => {
+            if (rows.length > 0 || ownerSession) return rows;
+            return dataService.getScannedItems(
+              normalizedASN,
+              undefined,
+              cartonToFinish
+            );
+          })
+        : await dataService.getScannedItems(
+            normalizedASN,
+            activeSession,
+            cartonToFinish
+          );
 
       // Build receive lines from scanned items
       // Group by item_code (backend expects carton_id, not box_id)
@@ -5993,7 +6456,7 @@ export default function ReceiveSortScreen() {
 
       // Build a map of expected quantities by item_code (from cartonItems)
       const expectedQtyByItem = new Map<string, number>();
-      for (const cartonItem of cartonItems) {
+      for (const cartonItem of itemsForFinish) {
         expectedQtyByItem.set(
           cartonItem.item_code,
           cartonItem.shipped_qty || 0
@@ -6026,7 +6489,7 @@ export default function ReceiveSortScreen() {
 
       // Include every carton item (full state). Items not in scanned list get received_qty 0
       // so backend gets correct Recvd Qty for all items (e.g. 108228, 108230) and can UPSERT.
-      for (const cartonItem of cartonItems) {
+      for (const cartonItem of itemsForFinish) {
         const itemCode = cartonItem.item_code;
         if (!itemCode) continue;
         if (receiveLinesMap.has(itemCode)) continue;
@@ -6041,8 +6504,8 @@ export default function ReceiveSortScreen() {
       // Convert map to array - use lockedCarton as carton_id (backend requirement)
       // According to PDF section 12.5, parent_title should be inside each receive_line object
       const receiveLines = Array.from(receiveLinesMap.values()).map((line) => ({
-        parent_title: activeSession, // Session ID - must be inside each receive_line per PDF spec
-        carton_id: lockedCarton, // Backend expects carton_id
+        parent_title: sessionForReceiveLines,
+        carton_id: cartonToFinish,
         item_code: line.item_code,
         expected_qty: line.expected_qty,
         received_qty: line.received_qty,
@@ -6056,7 +6519,7 @@ export default function ReceiveSortScreen() {
             : (null as string | null),
       }));
 
-      console.log(`📦 Building receive lines for carton ${lockedCarton}:`, {
+      console.log(`📦 Building receive lines for carton ${cartonToFinish}:`, {
         totalLines: receiveLines.length,
         lines: receiveLines.map(
           (l) => `${l.item_code}: ${l.received_qty}/${l.expected_qty}`
@@ -6070,31 +6533,33 @@ export default function ReceiveSortScreen() {
       if (receiveLines.length > 0) {
         try {
           await apiService.createReceiveLines({
-            parent_title: activeSession, // ✅ REQUIRED: Session ID so backend applies to correct ASN
+            parent_title: sessionForReceiveLines,
             receive_lines: receiveLines,
           });
-          console.log(`✅ Receive lines created for carton ${lockedCarton} (parent_title=${activeSession})`);
+          console.log(
+            `✅ Receive lines created for carton ${cartonToFinish} (parent_title=${sessionForReceiveLines})`
+          );
           // ✅ Get updated received qty from backend so summary matches desktop
           await refreshASNReceivedQtyFromBackend();
         } catch (receiveLinesError: any) {
           console.warn(
-            `⚠️ Failed to create receive lines for carton ${lockedCarton}:`,
+            `⚠️ Failed to create receive lines for carton ${cartonToFinish}:`,
             receiveLinesError.message
           );
           setLoading(false);
           Alert.alert(
             "Receive Lines Not Updated",
-            `The server did not accept receive lines for carton ${lockedCarton}.\n\nMobile will not mark this carton as Received until the backend is updated.\n\n${receiveLinesError?.message || "Unknown error"}`
+            `The server did not accept receive lines for carton ${cartonToFinish}.\n\nMobile will not mark this carton as Received until the backend is updated.\n\n${receiveLinesError?.message || "Unknown error"}`
           );
           return;
         }
       } else {
         console.warn(
-          `⚠️ No scanned items found for carton ${lockedCarton}. Skipping receive lines creation.`
+          `⚠️ No scanned items found for carton ${cartonToFinish}. Skipping receive lines creation.`
         );
         Alert.alert(
           "No Items Scanned",
-          `No items were scanned for carton ${lockedCarton}.\n\nMobile will not mark this carton as Received because no receive lines can be sent to the backend.`,
+          `No items were scanned for carton ${cartonToFinish}.\n\nMobile will not mark this carton as Received because no receive lines can be sent to the backend.`,
           [{ text: "OK" }]
         );
         setLoading(false);
@@ -6102,29 +6567,80 @@ export default function ReceiveSortScreen() {
       }
 
       if (finishMode === "NORMAL") {
-        await apiService.completeCarton({
-          inbound_session: activeSession,
-          asn_no: normalizedASN,
-          carton_id: lockedCarton,
-          user_id: settings.user_id!,
-          device_id: settings.device_id!,
-        });
+        try {
+          await apiService.completeCarton({
+            inbound_session: sessionForReceiveLines,
+            asn_no: normalizedASN,
+            carton_id: cartonToFinish,
+            user_id: settings.user_id!,
+            device_id: settings.device_id!,
+            ...(supervisorOverride && overrideReason
+              ? { override_reason: overrideReason }
+              : {}),
+          });
+        } catch (completeError: any) {
+          const msg = String(completeError?.message || completeError || "");
+          const expectedSession = parseExpectedSessionFromError(msg);
+          if (
+            msg.includes("409") &&
+            (msg.toLowerCase().includes("inbound_session") ||
+              msg.toLowerCase().includes("locked by"))
+          ) {
+            setLoading(false);
+            const roleInfo = await getCurrentUserRole();
+            if (roleInfo.isSupervisorOrAdmin) {
+              Alert.alert(
+                "Cannot Finish — Session / Lock",
+                expectedSession
+                  ? `Server lock session:\n${expectedSession}\n\nYour session:\n${activeSession}`
+                  : msg,
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Supervisor Finish",
+                    onPress: () => {
+                      void handleFinishCartonInternal(finishMode, {
+                        supervisorOverride: true,
+                        overrideReason:
+                          "Session mismatch - supervisor completion",
+                        targetCartonId: cartonToFinish,
+                        ownerInboundSession: expectedSession,
+                      });
+                    },
+                  },
+                ]
+              );
+            } else {
+              Alert.alert(
+                "Cannot Finish",
+                expectedSession
+                  ? `This carton belongs to session ${expectedSession}.\n\nResume that session on the device that opened it, or ask a supervisor to finish.`
+                  : msg
+              );
+            }
+            return;
+          }
+          throw completeError;
+        }
       }
 
       const completedStatus =
         finishMode === "SHORTAGE" ? RECEIVED_WITH_SHORTAGE_STATUS : "Received";
+      const statusSessionForLocal =
+        supervisorOverride && ownerSession ? ownerSession : activeSession;
 
       console.log(`💾 Updating carton status to ${completedStatus} (server first, then local):`, {
-        carton: lockedCarton,
+        carton: cartonToFinish,
         asn: normalizedASN,
-        session: activeSession,
+        session: statusSessionForLocal,
         status: completedStatus,
+        supervisorOverride,
       });
 
       const pushReceived = await pushReceivedCartonStatusServerThenLocal({
         asnNoOriginal: activeASN,
-        inboundSession: activeSession,
-        cartonId: lockedCarton,
+        inboundSession: statusSessionForLocal,
+        cartonId: cartonToFinish,
         userId: settings.user_id!,
         deviceId: settings.device_id,
         status: completedStatus,
@@ -6143,17 +6659,17 @@ export default function ReceiveSortScreen() {
       // Immediately verify the update was saved
       const verifyStatus = await dataService.getCartonStatus(
         normalizedASN,
-        activeSession,
-        lockedCarton
+        statusSessionForLocal,
+        cartonToFinish
       );
-      console.log(`✅ Carton ${lockedCarton} status updated. Verification:`, {
+      console.log(`✅ Carton ${cartonToFinish} status updated. Verification:`, {
         status: verifyStatus?.status,
         session: verifyStatus?.inbound_session,
         locked_by: verifyStatus?.locked_by,
         updated_on: verifyStatus?.updated_on,
         match:
           verifyStatus?.status === completedStatus &&
-          verifyStatus?.inbound_session === activeSession,
+          verifyStatus?.inbound_session === statusSessionForLocal,
       });
 
       if (!verifyStatus || verifyStatus.status !== completedStatus) {
@@ -6225,22 +6741,25 @@ export default function ReceiveSortScreen() {
         // Don't block user flow if session update fails
       }
 
-      const finishedCarton = lockedCarton;
+      const finishedCarton = cartonToFinish;
       logStateChange("FINISH_CARTON", {
         carton: finishedCarton,
+        supervisorOverride,
         scannedItemsCount: scannedItems.length,
         scannedQuantitiesKeys: Object.keys(scannedQuantities),
       });
-      setLockedCartonWithLog(null);
-      setWorkflowStateWithLog("SELECT_CARTON");
-      setScannedItemsWithLog([]);
-      setScannedQuantitiesWithLog({});
-      setCurrentItemWithLog(null);
-      cartonLoadSeqRef.current += 1;
-      setCartonLinesLoading(false);
-      setCartonLinesLoadError(null);
-      setCartonItemsWithLog([]); // Clear carton items when finishing
-      setLastScannedItem(null);
+      if (lockedCarton === cartonToFinish) {
+        setLockedCartonWithLog(null);
+        setWorkflowStateWithLog("SELECT_CARTON");
+        setScannedItemsWithLog([]);
+        setScannedQuantitiesWithLog({});
+        setCurrentItemWithLog(null);
+        cartonLoadSeqRef.current += 1;
+        setCartonLinesLoading(false);
+        setCartonLinesLoadError(null);
+        setCartonItemsWithLog([]);
+        setLastScannedItem(null);
+      }
 
       if (activeASN && activeSession) {
         await clearWorkflowState(
@@ -6257,7 +6776,7 @@ export default function ReceiveSortScreen() {
 
       const updatedStatus = await dataService.getCartonStatus(
         normalizedASN,
-        activeSession,
+        statusSessionForLocal,
         finishedCarton
       );
       console.log(
@@ -6269,6 +6788,13 @@ export default function ReceiveSortScreen() {
         }
       );
 
+      if (supervisorOverride) {
+        Alert.alert(
+          "Carton completed (supervisor)",
+          `Carton ${finishedCarton} was marked Received on the server.\n\nCompleted by supervisor on behalf of the original picker session.`
+        );
+      }
+
       // State will be saved automatically via useEffect
     } catch (error: any) {
       Alert.alert("Error", error.message || "Failed to complete carton");
@@ -6276,6 +6802,60 @@ export default function ReceiveSortScreen() {
       setLoading(false);
     }
   };
+
+  const promptSupervisorFinishCarton = useCallback(
+    async (
+      cartonId: string,
+      context?: {
+        lockedBy?: string | null;
+        ownerSession?: string | null;
+        finishMode?: "NORMAL" | "SHORTAGE";
+      }
+    ) => {
+      const roleInfo = await getCurrentUserRole();
+      if (!roleInfo.isSupervisorOrAdmin) {
+        Alert.alert(
+          "Supervisor required",
+          "Only a supervisor or administrator can finish a carton started on another device."
+        );
+        return;
+      }
+
+      const lockInfo =
+        context?.ownerSession != null
+          ? {
+              inbound_session: context.ownerSession,
+              locked_by: context.lockedBy || null,
+              device_id: null,
+            }
+          : await fetchOwnerCartonLockFromServer(activeASN || "", cartonId);
+      const lockedBy =
+        context?.lockedBy || lockInfo?.locked_by || "original picker";
+      const ownerSession = lockInfo?.inbound_session || context?.ownerSession;
+
+      Alert.alert(
+        "Supervisor Finish Carton",
+        `Finish ${cartonId} on behalf of ${lockedBy}?\n\nUse only when the original device is unavailable. Sorted quantities must already be synced to the server.${
+          ownerSession ? `\n\nOwner session:\n${ownerSession}` : ""
+        }`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Device failure",
+            onPress: () => {
+              void handleFinishCartonInternal(context?.finishMode || "NORMAL", {
+                supervisorOverride: true,
+                overrideReason: "Device failure - supervisor completion",
+                targetCartonId: cartonId,
+                ownerInboundSession: ownerSession,
+              });
+            },
+          },
+        ]
+      );
+    },
+    [activeASN]
+  );
 
   const getScannerTitle = () => {
     switch (workflowState) {
@@ -7285,32 +7865,6 @@ export default function ReceiveSortScreen() {
              AND store = ?`,
           targetCartonParams,
         );
-        try {
-          if (!(await requireOnlineForReceiving())) {
-            setLoading(false);
-            return;
-          }
-          await apiService.adjustSortBox({
-            purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
-            asn_no: activeASN,
-            box_id: targetBox.box_id,
-            carton_id: lockedCarton ?? undefined,
-            item_code: editQtyModal.itemCode,
-            new_qty: (currentTargetBoxQtyRow?.total_qty || 0) + qtyDifference,
-            user_id: settings.user_id ?? "",
-            device_id: settings.device_id ?? "",
-          });
-        } catch (error: any) {
-          const payload = error?.data || error?.response?.data || {};
-          const msg =
-            payload?.message ||
-            error?.message ||
-            "Backend rejected this quantity update.";
-          Alert.alert("Quantity Update Not Allowed", msg);
-          setLoading(false);
-          return;
-        }
-
         // Update or insert in database
         // Handle both carton_id = null (BOX ID workflow) and carton_id = lockedCarton (old workflow)
         // Check both ASN formats to find existing records
@@ -7457,11 +8011,6 @@ export default function ReceiveSortScreen() {
           }))
         );
 
-        if (!(await requireOnlineForReceiving())) {
-          setLoading(false);
-          return;
-        }
-
         let remainingToRemove = itemsToRemove;
         let totalRemoved = 0;
         for (const item of itemsToDelete) {
@@ -7469,27 +8018,6 @@ export default function ReceiveSortScreen() {
 
           if (item.scanned_qty > remainingToRemove) {
             const nextQty = item.scanned_qty - remainingToRemove;
-            try {
-              await apiService.adjustSortBox({
-                purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
-                asn_no: activeASN,
-                box_id: item.box_id,
-                carton_id: item.carton_id || lockedCarton || undefined,
-                item_code: editQtyModal.itemCode,
-                new_qty: nextQty,
-                user_id: settings.user_id ?? "",
-                device_id: settings.device_id ?? "",
-              });
-            } catch (error: any) {
-              const payload = error?.data || error?.response?.data || {};
-              const msg =
-                payload?.message ||
-                error?.message ||
-                "Backend rejected this quantity update.";
-              Alert.alert("Quantity Update Not Allowed", msg);
-              setLoading(false);
-              return;
-            }
             // Reduce quantity in this record
             // Use the ASN format and carton_id found in the database record
             const itemCartonFilter = item.carton_id
@@ -7538,27 +8066,6 @@ export default function ReceiveSortScreen() {
             totalRemoved += remainingToRemove;
             remainingToRemove = 0;
           } else {
-            try {
-              await apiService.adjustSortBox({
-                purpose: editQtyModal.isPutaway ? "PUTAWAY" : "STORE",
-                asn_no: activeASN,
-                box_id: item.box_id,
-                carton_id: item.carton_id || lockedCarton || undefined,
-                item_code: editQtyModal.itemCode,
-                new_qty: 0,
-                user_id: settings.user_id ?? "",
-                device_id: settings.device_id ?? "",
-              });
-            } catch (error: any) {
-              const payload = error?.data || error?.response?.data || {};
-              const msg =
-                payload?.message ||
-                error?.message ||
-                "Backend rejected this quantity update.";
-              Alert.alert("Quantity Update Not Allowed", msg);
-              setLoading(false);
-              return;
-            }
             // Delete this entire record
             // Use the ASN format and carton_id found in the database record
             const itemCartonFilter = item.carton_id
@@ -7856,38 +8363,6 @@ export default function ReceiveSortScreen() {
         }
       }
 
-      // Create events for the quantity - use batch approach for better performance
-      // Create a single event with total quantity instead of multiple individual events
-      // This is much faster than creating qty * 2 individual events
-      try {
-        if (!(await requireOnlineForReceiving())) {
-          setLoading(false);
-          return;
-        }
-        await apiService.scanSortBox({
-          purpose: isWarehouseBox ? "PUTAWAY" : "STORE",
-          asn_no: activeASN,
-          box_id: manualQtyBox,
-          carton_id: lockedCarton ?? undefined,
-          item_code: manualQtyItem,
-          qty,
-          user_id: settings.user_id ?? "",
-          device_id: settings.device_id ?? "",
-        });
-      } catch (error: any) {
-        const payload = error?.data || error?.response?.data || {};
-        const msg =
-          payload?.message ||
-          error?.message ||
-          "Backend rejected this quantity scan.";
-        Alert.alert(
-          isWarehouseBox ? "Putaway Not Allowed" : "Sort Not Allowed",
-          msg,
-        );
-        setLoading(false);
-        return;
-      }
-
       await addEvent({
         event_type: "RECEIVE_ITEM_SCAN",
         asn_no: normalizedASN,
@@ -7895,6 +8370,19 @@ export default function ReceiveSortScreen() {
         carton_id: lockedCarton,
         item_code: manualQtyItem,
         qty: qty, // Use total quantity instead of creating multiple events
+        device_id: settings.device_id,
+        user_id: settings.user_id,
+      });
+
+      await addEvent({
+        event_type: "SORT_TO_BOX",
+        asn_no: normalizedASN,
+        inbound_session: activeSession,
+        carton_id: lockedCarton,
+        item_code: manualQtyItem,
+        box_id: manualQtyBox,
+        store: box.store,
+        qty,
         device_id: settings.device_id,
         user_id: settings.user_id,
       });
@@ -8517,75 +9005,88 @@ export default function ReceiveSortScreen() {
     if (!activeASN || !currentItem || workflowState !== "SCAN_BOX") {
       return;
     }
-
-    setDistributionDetailsLoading(true);
-    try {
-      const response = await apiService.getReceiveSortDistributionDetails({
-        asn_no: activeASN,
-        inbound_session: activeSession || undefined,
-        item_code: currentItem,
-        carton_id: lockedCarton,
-      });
-      const payload = response?.data || response;
-      const stores = Array.isArray(payload?.stores) ? payload.stores : [];
-      const readRemainingQty = (store: any) =>
-        Number(
-          store?.remaining_qty ??
-            store?.remainingQty ??
-            store?.remaining ??
-            store?.balance_qty ??
-            store?.balance ??
-            0
-        );
-      const openStores = stores.filter(
-        (store: any) => readRemainingQty(store) > 0
-      );
-      const fullyDistributed =
-        payload?.fully_distributed === true ||
-        (stores.length > 0 && openStores.length === 0);
-
-      if (fullyDistributed) {
-        setLiveDistributionDetails(null);
-        setShowDistributionDetailsModal(false);
-        Alert.alert(
-          "Item Fully Distributed",
-          `Item ${payload?.item_code || currentItem} has no remaining distribution quantity.`,
-          [{ text: "OK", onPress: () => refocusScanner() }]
-        );
-        return;
-      }
-
-      setLiveDistributionDetails({
-        itemCode: payload?.item_code || currentItem,
-        itemName: payload?.item_name || null,
-        toNo: payload?.to_no || null,
-        serverTime: payload?.server_time || null,
-        stores: openStores.map((store: any) => ({
-          store: String(store?.store || "").trim(),
-          toQty: Number(store?.to_qty) || 0,
-          scannedQty: Number(store?.scanned_qty) || 0,
-          remainingQty: readRemainingQty(store),
-          openBoxes: Array.isArray(store?.open_boxes) ? store.open_boxes : [],
-        })),
-      });
-      setShowDistributionDetailsModal(true);
-    } catch (error: any) {
-      Alert.alert(
-        "Distribution Details",
-        error?.message || "Failed to load live distribution details from backend.",
-        [{ text: "OK", onPress: () => refocusScanner() }]
-      );
-    } finally {
-      setDistributionDetailsLoading(false);
-    }
+    await refreshLiveDistribution({ openModal: true });
   }, [
     activeASN,
-    activeSession,
     currentItem,
-    lockedCarton,
-    refocusScanner,
+    refreshLiveDistribution,
     workflowState,
   ]);
+
+  const openBoxesForDistributionRow = useCallback(
+    (
+      rowStore: string,
+      serverOpenBoxes: string[]
+    ): { boxes: string[]; fromLocalFallback: boolean } => {
+      const server = (serverOpenBoxes || [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean);
+      if (server.length > 0) {
+        return { boxes: server, fromLocalFallback: false };
+      }
+
+      const masterRows = warehousesAndStores.map((ws: any) => ({
+        code: String(ws?.code || "").trim(),
+        name: String(ws?.name || "").trim(),
+      }));
+      const resolved = canonicalStoreForToLine(rowStore, masterRows);
+      const storeCode = String(
+        resolved.storeToPersist ||
+          extractLeadingStoreCode(rowStore) ||
+          rowStore
+      ).trim();
+
+      const local = availableBoxes
+        .filter((box) => {
+          const status = String(box?.status || "").trim().toUpperCase();
+          if (status !== "OPEN") return false;
+          return (
+            storeCodesMatchForTO(box.store, rowStore) ||
+            storeCodesMatchForTO(box.store, storeCode)
+          );
+        })
+        .map((box) => String(box.box_id || "").trim())
+        .filter(Boolean);
+      return { boxes: local, fromLocalFallback: local.length > 0 };
+    },
+    [availableBoxes, warehousesAndStores]
+  );
+
+  const renderDistributionOpenBoxes = (
+    rowStore: string,
+    serverOpenBoxes: string[]
+  ) => {
+    const { boxes, fromLocalFallback } = openBoxesForDistributionRow(
+      rowStore,
+      serverOpenBoxes
+    );
+    if (boxes.length === 0) {
+      return (
+        <Text style={styles.distributionNoBoxText}>
+          No open BOX found for this store.
+        </Text>
+      );
+    }
+    return (
+      <>
+        <Text style={styles.distributionBoxLabel}>
+          Open BOXes{fromLocalFallback ? " (on this device)" : ""}
+        </Text>
+        <View style={styles.distributionBoxesRow}>
+          {boxes.slice(0, 4).map((boxId) => (
+            <View key={`${rowStore}-${boxId}`} style={styles.distributionBoxChip}>
+              <Text style={styles.distributionBoxChipText}>{boxId}</Text>
+            </View>
+          ))}
+          {boxes.length > 4 && (
+            <Text style={styles.distributionMoreBoxes}>
+              +{boxes.length - 4} more
+            </Text>
+          )}
+        </View>
+      </>
+    );
+  };
 
   if (!activeASN || !activeSession) {
     return (
@@ -8943,6 +9444,103 @@ export default function ReceiveSortScreen() {
               {scanFeedback.kind === "ok" ? "✓ " : "⚠ "}
               {scanFeedback.text}
             </Text>
+          </View>
+        )}
+
+        {workflowState === "SCAN_BOX" && currentItem && (
+          <View style={styles.liveDistributionSection}>
+            <View style={styles.liveDistributionHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.liveDistributionTitle}>
+                  Live distribution (all devices)
+                </Text>
+                <Text style={styles.liveDistributionSubtitle}>
+                  Item {currentItem}
+                  {liveDistributionDetails?.toNo
+                    ? ` · TO ${liveDistributionDetails.toNo}`
+                    : ""}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.liveDistributionRefreshButton}
+                onPress={() => void refreshLiveDistribution()}
+                disabled={distributionDetailsLoading}
+              >
+                <Text style={styles.liveDistributionRefreshText}>
+                  {distributionDetailsLoading ? "..." : "Refresh"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {liveDistributionError ? (
+              <Text style={styles.liveDistributionErrorText}>
+                {liveDistributionError}
+              </Text>
+            ) : null}
+
+            {distributionDetailsLoading && !liveDistributionDetails ? (
+              <Text style={styles.liveDistributionLoadingText}>
+                Loading live totals from server…
+              </Text>
+            ) : liveDistributionDetails?.fullyDistributed ? (
+              <Text style={styles.liveDistributionCompleteText}>
+                Item fully distributed on server — no remaining TO quantity.
+              </Text>
+            ) : liveDistributionDetails &&
+              liveDistributionDetails.stores.filter(
+                (row) => row.remainingQty > 0
+              ).length > 0 ? (
+              liveDistributionDetails.stores
+                .filter((row) => row.remainingQty > 0)
+                .slice(0, 6)
+                .map((row, index) => (
+                  <View
+                    key={`${row.store}-${index}`}
+                    style={styles.distributionCard}
+                  >
+                    <View style={styles.distributionHeader}>
+                      {renderDistributionStoreHeader(row.store)}
+                      <Text
+                        style={[
+                          styles.distributionRemainingBadge,
+                          row.remainingQty === 0
+                            ? styles.distributionRemainingDone
+                            : row.remainingQty < 0
+                              ? styles.distributionRemainingOver
+                              : styles.distributionRemainingOpen,
+                        ]}
+                      >
+                        Rem {row.remainingQty}
+                      </Text>
+                    </View>
+                    <View style={styles.distributionQtyRow}>
+                      <Text style={styles.distributionQtyText}>
+                        TO {row.toQty}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.distributionQtyText,
+                          styles.distributionScannedText,
+                        ]}
+                      >
+                        Scanned {row.scannedQty}
+                      </Text>
+                    </View>
+                    {renderDistributionOpenBoxes(row.store, row.openBoxes)}
+                  </View>
+                ))
+            ) : liveDistributionDetails ? (
+              <Text style={styles.liveDistributionLoadingText}>
+                No open store lines with remaining quantity.
+              </Text>
+            ) : null}
+
+            {liveDistributionDetails?.serverTime ? (
+              <Text style={styles.liveDistributionUpdatedText}>
+                Updated{" "}
+                {new Date(liveDistributionDetails.serverTime).toLocaleTimeString()}
+              </Text>
+            ) : null}
           </View>
         )}
 
@@ -10102,11 +10700,11 @@ export default function ReceiveSortScreen() {
                     </Text>
                   )}
                   {liveDistributionDetails.stores
-                    .filter((row: any) => Number(row?.remainingQty || 0) > 0)
-                    .map((row: any, index: number) => (
+                    .filter((row: LiveDistributionStoreRow) => row.remainingQty > 0)
+                    .map((row: LiveDistributionStoreRow, index: number) => (
                     <View key={`${row.store}-${index}`} style={styles.distributionCard}>
                       <View style={styles.distributionHeader}>
-                        <Text style={styles.distributionStore}>{row.store}</Text>
+                        {renderDistributionStoreHeader(row.store)}
                         <Text
                           style={[
                             styles.distributionRemainingBadge,
@@ -10133,36 +10731,7 @@ export default function ReceiveSortScreen() {
                           Scanned {row.scannedQty}
                         </Text>
                       </View>
-                      <Text style={styles.distributionBoxLabel}>
-                        Open BOXes
-                      </Text>
-                      {row.openBoxes.length > 0 ? (
-                        <View style={styles.distributionBoxesRow}>
-                          {row.openBoxes.slice(0, 4).map((box: any) => {
-                            const boxId =
-                              typeof box === "string" ? box : box?.box_id;
-                            return (
-                            <View
-                              key={`${row.store}-${boxId}`}
-                              style={styles.distributionBoxChip}
-                            >
-                              <Text style={styles.distributionBoxChipText}>
-                                {boxId}
-                              </Text>
-                            </View>
-                            );
-                          })}
-                          {row.openBoxes.length > 4 && (
-                            <Text style={styles.distributionMoreBoxes}>
-                              +{row.openBoxes.length - 4} more
-                            </Text>
-                          )}
-                        </View>
-                      ) : (
-                        <Text style={styles.distributionNoBoxText}>
-                          No open BOX found for this store.
-                        </Text>
-                      )}
+                      {renderDistributionOpenBoxes(row.store, row.openBoxes)}
                     </View>
                   ))}
                 </View>
@@ -11836,6 +12405,22 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "#1565C0",
   },
+  distributionStoreBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  distributionStoreCode: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#0D47A1",
+    letterSpacing: 0.3,
+  },
+  distributionStoreName: {
+    marginTop: 2,
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#455A64",
+  },
   distributionRemainingBadge: {
     paddingHorizontal: 10,
     paddingVertical: 4,
@@ -11900,6 +12485,72 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#C62828",
     fontWeight: "600",
+  },
+  liveDistributionSection: {
+    marginHorizontal: 12,
+    marginTop: 8,
+    marginBottom: 4,
+    padding: 12,
+    borderRadius: 10,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#BBDEFB",
+  },
+  liveDistributionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    marginBottom: 8,
+    gap: 8,
+  },
+  liveDistributionTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#0D47A1",
+  },
+  liveDistributionSubtitle: {
+    marginTop: 2,
+    fontSize: 12,
+    color: "#546E7A",
+  },
+  liveDistributionRefreshButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: "#E3F2FD",
+    borderWidth: 1,
+    borderColor: "#90CAF9",
+  },
+  liveDistributionRefreshText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1565C0",
+  },
+  liveDistributionErrorText: {
+    fontSize: 12,
+    color: "#C62828",
+    marginBottom: 8,
+  },
+  liveDistributionLoadingText: {
+    fontSize: 13,
+    color: "#607D8B",
+    marginBottom: 4,
+  },
+  liveDistributionCompleteText: {
+    fontSize: 13,
+    color: "#2E7D32",
+    fontWeight: "600",
+  },
+  liveDistributionOpenBoxesText: {
+    marginTop: 4,
+    fontSize: 11,
+    color: "#37474F",
+  },
+  liveDistributionUpdatedText: {
+    marginTop: 8,
+    fontSize: 11,
+    color: "#78909C",
+    textAlign: "right",
   },
   lastItemCard: {
     backgroundColor: "#F5F5F5",

@@ -1,28 +1,15 @@
 /**
  * ScreenFooterFrame Component
- * 
- * A reusable bottom frame component that provides visual separation
- * at the bottom of screens. This component maintains consistent
- * styling across all screens in the application.
- * 
- * Usage:
- * import ScreenFooterFrame from '../components/ScreenFooterFrame';
- * 
- * export default function MyScreen() {
- *   return (
- *     <View style={styles.container}>
- *       <ScreenFooterFrame />
- *     </View>
- *   );
- * }
- * 
- * Component Name: ScreenFooterFrame
- * Design Pattern: Bottom Visual Separator / Footer Frame
- * Reusable: Yes - Can be used in any React Native project
+ *
+ * Bottom blue bar + optional safe-area fill so no grey strip shows above
+ * the system navigation bar / home indicator.
  */
 
-import React from 'react';
-import { View, StyleSheet } from 'react-native';
+import React from "react";
+import { Platform, View, StyleSheet } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+export const FOOTER_FRAME_BLUE = "#1E88E5";
 
 interface ScreenFooterFrameProps {
   height?: number;
@@ -31,29 +18,41 @@ interface ScreenFooterFrameProps {
 }
 
 export default function ScreenFooterFrame({
-  height = 40,
-  backgroundColor = '#1E88E5', // buttonBlue color
-  borderColor = '#E0E0E0', // borderLight color
+  height = 24,
+  backgroundColor = FOOTER_FRAME_BLUE,
+  borderColor = "#E0E0E0",
 }: ScreenFooterFrameProps) {
+  const insets = useSafeAreaInsets();
+  // Android nav bar is tinted app-wide; avoid stacking a thick bar + inset fill.
+  const bottomInsetFill =
+    Platform.OS === "android" ? 0 : Math.min(insets.bottom, 8);
+
   return (
-    <View
-      style={[
-        styles.footerFrame,
-        {
-          height,
-          backgroundColor,
-          borderTopColor: borderColor,
-        },
-      ]}
-    />
+    <View style={[styles.wrapper, { backgroundColor }]}>
+      <View
+        style={[
+          styles.footerFrame,
+          {
+            height,
+            backgroundColor,
+            borderTopColor: borderColor,
+          },
+        ]}
+      />
+      {bottomInsetFill > 0 ? (
+        <View style={{ height: bottomInsetFill, backgroundColor }} />
+      ) : null}
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  wrapper: {
+    width: "100%",
+  },
   footerFrame: {
     borderTopWidth: 1,
-    width: '100%',
-    // Ensure solid background, no transparency
+    width: "100%",
     opacity: 1,
   },
 });

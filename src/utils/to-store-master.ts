@@ -11,7 +11,39 @@ export type ToStoreMasterResolution = {
   suggestions: string[];
 };
 
-type MasterRow = { code?: string | null };
+type MasterRow = { code?: string | null; name?: string | null };
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * TO lines often use "002 - Unaizah - Almoosa - MAATC" while warehouse master code is "002".
+ */
+function masterCodePrefixesRawStore(raw: string, code: string): boolean {
+  const c = String(code ?? "").trim();
+  if (!c) return false;
+  const re = new RegExp(`^${escapeRegExp(c)}(\\s|-|$)`, "i");
+  return re.test(raw.trim());
+}
+
+function rawStoreStartsWithMasterName(raw: string, name: string): boolean {
+  const n = String(name ?? "").trim();
+  if (!n || n.length < 3) return false;
+  return raw.trim().toUpperCase().startsWith(n.toUpperCase());
+}
+
+function pickBestPrefixMasterMatch(
+  raw: string,
+  matches: MasterRow[]
+): MasterRow | null {
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
+  // Prefer the longest master code when several prefix-match (e.g. "032" vs "032 - ONLINE").
+  return [...matches].sort(
+    (a, b) => String(b.code ?? "").trim().length - String(a.code ?? "").trim().length
+  )[0];
+}
 
 /**
  * Aligns a Transfer Order store string with Warehouses & Stores master (`code`).
@@ -52,6 +84,34 @@ export function canonicalStoreForToLine(
         suggestions: [],
       };
     }
+  }
+
+  const byCodePrefix = masters.filter((m) =>
+    masterCodePrefixesRawStore(raw, String(m.code))
+  );
+  const codePrefixMatch = pickBestPrefixMasterMatch(raw, byCodePrefix);
+  if (codePrefixMatch) {
+    const c = String(codePrefixMatch.code).trim();
+    return {
+      storeToPersist: c,
+      normalized: c !== raw,
+      unknownInMaster: false,
+      suggestions: [],
+    };
+  }
+
+  const byNamePrefix = masters.filter((m) =>
+    rawStoreStartsWithMasterName(raw, String(m.name ?? ""))
+  );
+  const namePrefixMatch = pickBestPrefixMasterMatch(raw, byNamePrefix);
+  if (namePrefixMatch) {
+    const c = String(namePrefixMatch.code).trim();
+    return {
+      storeToPersist: c,
+      normalized: c !== raw,
+      unknownInMaster: false,
+      suggestions: [],
+    };
   }
 
   const fuzzy = masters.filter((m) => storeCodesMatchForTO(m.code, raw));

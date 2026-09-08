@@ -15,6 +15,7 @@ import {
   StyleSheet,
   ActivityIndicator,
   Alert,
+  Platform,
 } from "react-native";
 import { AppProvider, useApp } from "./src/context/AppContext";
 import { getDatabase } from "./src/database/database";
@@ -586,8 +587,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Set button style to 'light' for white icons
-    NavigationBar.setButtonStyleAsync("light");
+    if (Platform.OS !== "android") return;
+    // Match ScreenFooterFrame blue so the system nav bar is not grey below the footer.
+    NavigationBar.setBackgroundColorAsync("#1E88E5").catch(() => {});
+    NavigationBar.setButtonStyleAsync("light").catch(() => {});
   }, []);
 
   const initializeApp = async () => {

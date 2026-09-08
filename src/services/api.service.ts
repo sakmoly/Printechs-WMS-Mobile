@@ -1,5 +1,5 @@
 import { getSettings, saveSettings } from "./settings.service";
-import { ScanEvent } from "../types";
+import { ScanEvent, Settings } from "../types";
 import { joinApiUrl, normalizeApiBaseUrl } from "../utils/apiUrl";
 import { parseAuthErrorPayload, throwAuthError } from "../utils/password-auth";
 
@@ -1979,8 +1979,19 @@ export const apiService = {
     carton_id: string;
     user_id: string;
     device_id: string;
+    override_reason?: string;
   }) => {
     return makeRequest("/api/carton/complete", "POST", data);
+  },
+
+  getCartonLockStatus: async (params: {
+    asn_no: string;
+    carton_id: string;
+  }) => {
+    const query = new URLSearchParams();
+    query.set("asn_no", params.asn_no.trim());
+    query.set("carton_id", params.carton_id.trim());
+    return makeRequest(`/api/carton/lock-status?${query.toString()}`, "GET");
   },
 
   updateCartonStatus: async (data: {
@@ -2805,9 +2816,16 @@ export const apiService = {
 
             if (token) {
               const expiresAt = new Date(Date.now() + expiresIn * 1000);
+              const loginRole =
+                responseData.data?.user?.role ||
+                responseData.user?.role ||
+                null;
               await saveSettings({
                 auth_token: token,
                 auth_token_expires: expiresAt.toISOString(),
+                ...(loginRole
+                  ? ({ user_role: String(loginRole) } as Partial<Settings>)
+                  : {}),
               });
               console.log("✅ Login successful");
               return token;

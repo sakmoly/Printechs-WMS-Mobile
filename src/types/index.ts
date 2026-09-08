@@ -6,6 +6,8 @@ export interface Settings {
   device_id?: string | null;
   user_id?: string | null;
   user_code?: string | null;
+  /** WMS role from login (operator, supervisor, admin, …). */
+  user_role?: string | null;
   password?: string | null;
   demo_mode: number;
   active_asn?: string | null;
