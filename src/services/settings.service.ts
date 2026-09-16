@@ -153,6 +153,18 @@ export const getSettings = async (): Promise<Settings> => {
     });
   }
 
+  // One-time migration: old warehouse server IP → current API host
+  const apiUrl = String(result.api_url ?? "").trim();
+  if (apiUrl.includes("192.168.103.8")) {
+    const migrated = normalizeApiBaseUrl(
+      apiUrl.replace(/192\.168\.103\.8/g, "192.168.103.219")
+    );
+    result.api_url = migrated;
+    saveSettings({ api_url: migrated }).catch((err) => {
+      console.warn("⚠️ Failed to migrate API URL to 192.168.103.219:", err);
+    });
+  }
+
   return result;
 };
 

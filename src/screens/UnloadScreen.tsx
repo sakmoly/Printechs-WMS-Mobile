@@ -38,6 +38,7 @@ import {
   parseAsnPayloadForCartonLock,
   isOtherScannerLock,
 } from "../utils/inbound-carton-lock-from-asn";
+import { getCurrentUserRole } from "../utils/user-role";
 
 function actorFromUnloadLine(line: Record<string, unknown> | null | undefined): string {
   if (!line) return "";
@@ -188,6 +189,7 @@ export default function UnloadScreen() {
     user_id?: string | null;
     user_code?: string | null;
   }>({});
+  const [isSupervisorOrAdmin, setIsSupervisorOrAdmin] = useState(false);
 
   useEffect(() => {
     loadCartons();
@@ -198,10 +200,12 @@ export default function UnloadScreen() {
 
     const normalizedASN = normalizeASN(activeASN);
     const currentSettings = await getSettings();
+    const roleInfo = await getCurrentUserRole();
     setCurrentLockOwner({
       user_id: currentSettings.user_id,
       user_code: currentSettings.user_code,
     });
+    setIsSupervisorOrAdmin(roleInfo.isSupervisorOrAdmin);
     console.log("🔄 UnloadScreen: Loading cartons...", {
       activeASN, // Original format
       normalizedASN, // Normalized format
@@ -1720,8 +1724,11 @@ export default function UnloadScreen() {
               const isReceivingByCurrentUser =
                 item.status === "Receiving" &&
                 settingsMatchCartonLockOwner(currentLockOwner, item.locked_by);
+              const canTakeOverReceiving =
+                item.status === "Receiving" &&
+                (isReceivingByCurrentUser || isSupervisorOrAdmin);
               const isActionable =
-                isUnloadedByCurrentUser || isReceivingByCurrentUser;
+                isUnloadedByCurrentUser || canTakeOverReceiving;
               const isReadOnlyUnloaded =
                 item.status === "Unloaded" && !isUnloadedByCurrentUser;
 
@@ -1733,7 +1740,7 @@ export default function UnloadScreen() {
                   isReadOnlyUnloaded && styles.cartonItemDisabled,
                 ]}
                 disabled={
-                  (item.status === "Receiving" && !isReceivingByCurrentUser) ||
+                  (item.status === "Receiving" && !canTakeOverReceiving) ||
                   isReadOnlyUnloaded
                 }
                 onPress={async () => {
@@ -1771,43 +1778,48 @@ export default function UnloadScreen() {
                     return;
                   }
 
-                  // Also allow clicking on Receiving cartons if locked by current user
+                  // Receiving: owner resume, or supervisor / orphan takeover
                   if (item.status === "Receiving") {
                     const settings = settingsTap;
+                    const lockedBy = String(item.locked_by || "").trim();
                     const isLockedByCurrentUser = settingsMatchCartonLockOwner(
                       settings,
-                      item.locked_by
+                      lockedBy
                     );
-                    console.log(`🔍 Checking carton ${cartonId} lock status:`, {
-                      locked_by: item.locked_by,
-                      current_user: settings.user_id,
-                      current_user_code: settings.user_code,
-                      is_same_user: isLockedByCurrentUser,
-                    });
-                    // Check if locked_by exists and matches current user
-                    if (item.locked_by && isLockedByCurrentUser) {
-                      console.log(
-                        `📦 Resuming work on carton: ${cartonId} (locked by current user: ${settings.user_id})`
-                      );
+                    const roleInfo = await getCurrentUserRole();
+                    const canTakeOver =
+                      isLockedByCurrentUser ||
+                      roleInfo.isSupervisorOrAdmin ||
+                      !lockedBy;
+
+                    if (canTakeOver) {
+                      if (lockedBy && !isLockedByCurrentUser) {
+                        Alert.alert(
+                          roleInfo.isSupervisorOrAdmin
+                            ? "Take over carton"
+                            : "Resume orphaned carton",
+                          lockedBy
+                            ? `Carton ${cartonId} is locked by ${lockedBy}.\n\nContinue as supervisor?`
+                            : `Carton ${cartonId} is Receiving with no lock owner.\n\nContinue and receive on this device?`,
+                          [
+                            { text: "Cancel", style: "cancel" },
+                            {
+                              text: "Continue",
+                              onPress: () => goToReceiveSort(cartonId),
+                            },
+                          ]
+                        );
+                        return;
+                      }
                       goToReceiveSort(cartonId);
                       return;
-                    } else if (item.locked_by) {
-                      Alert.alert(
-                        "Carton Already Locked",
-                        `Carton ${cartonId} is already locked by ${item.locked_by}.\n\nYou cannot continue this carton from this device.`
-                      );
-                      return;
-                    } else {
-                      // No locked_by info - shouldn't happen but handle it
-                      console.warn(
-                        `⚠️ Carton ${cartonId} is Receiving but has no locked_by info`
-                      );
-                      Alert.alert(
-                        "Carton Status Error",
-                        `Carton ${cartonId} is in an invalid state. Please contact support.`
-                      );
-                      return;
                     }
+
+                    Alert.alert(
+                      "Carton Already Locked",
+                      `Carton ${cartonId} is already locked by ${lockedBy}.\n\nYou cannot continue this carton from this device.`
+                    );
+                    return;
                   }
 
                   // Received cartons cannot be clicked

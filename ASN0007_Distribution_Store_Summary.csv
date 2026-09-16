@@ -1,0 +1,15 @@
+store_code,store_name,box_count,open_boxes,closed_boxes,total_sorted_qty
+002,002 - Unaizah - Almoosa - MAATC,1,0,1,102
+004,004 - Alras - Almoosa - MAATC,1,0,1,102
+006,006 - Alhfof - Almoosa - MAATC,19,2,17,947
+007,007 - Buridah - Almoosa - MAATC,19,3,16,886
+011,011 - Hail - Almoosa - MAATC,19,3,16,898
+019,019 - Geel Alnaka - MAATC,35,3,32,1268
+028,028 - North of Buridah Almoosa - MAATC,19,3,16,899
+031,031 - Al Mousa Tabuk - MAATC,19,3,16,818
+033,033 - Sample Location - MAATC,10,2,8,140
+034,034 - Lacaly Jeddah - MAATC,43,3,40,1312
+035,035 - Lacali - MAATC,43,3,40,1356
+036,036 - Lacaly Dareen Mall - MAATC,43,2,41,1328
+037,037 - Lacaly AlMahmal - MAATC,44,2,42,1246
+WH-MAIN,WH-MAIN (Warehouse Putaway),15,9,6,1368

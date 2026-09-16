@@ -1,0 +1,316 @@
+store_code,showroom,distribution_carton,box_status,total_qty,item_lines
+002,002 - Unaizah - Almoosa - MAATC,002-S-20,Closed,102,27
+004,004 - Alras - Almoosa - MAATC,004-S-13,Closed,102,27
+006,006 - Alhfof - Almoosa - MAATC,006-A-02,Closed,2,1
+006,006 - Alhfof - Almoosa - MAATC,006-A-03,Closed,63,43
+006,006 - Alhfof - Almoosa - MAATC,006-A-04,Closed,79,42
+006,006 - Alhfof - Almoosa - MAATC,006-A-05,Closed,10,5
+006,006 - Alhfof - Almoosa - MAATC,006-A-06,Open,3,1
+006,006 - Alhfof - Almoosa - MAATC,006-J-01,Closed,63,37
+006,006 - Alhfof - Almoosa - MAATC,006-J-02,Closed,50,37
+006,006 - Alhfof - Almoosa - MAATC,006-J-03,Closed,37,23
+006,006 - Alhfof - Almoosa - MAATC,006-U-1,Open,28,16
+006,006 - Alhfof - Almoosa - MAATC,006-U-10,Closed,77,46
+006,006 - Alhfof - Almoosa - MAATC,006-U-11,Closed,12,5
+006,006 - Alhfof - Almoosa - MAATC,006-U-12,Closed,12,5
+006,006 - Alhfof - Almoosa - MAATC,006-U-13,Closed,12,5
+006,006 - Alhfof - Almoosa - MAATC,006-U-14,Closed,55,34
+006,006 - Alhfof - Almoosa - MAATC,006-U-20,Closed,201,43
+006,006 - Alhfof - Almoosa - MAATC,006-U-21,Closed,46,23
+006,006 - Alhfof - Almoosa - MAATC,006-U-22,Closed,21,11
+006,006 - Alhfof - Almoosa - MAATC,006-U-8,Closed,92,53
+006,006 - Alhfof - Almoosa - MAATC,006-U-9,Closed,84,47
+007,007 - Buridah - Almoosa - MAATC,007-A-01,Closed,8,4
+007,007 - Buridah - Almoosa - MAATC,007-A-02,Closed,62,42
+007,007 - Buridah - Almoosa - MAATC,007-A-03,Closed,87,46
+007,007 - Buridah - Almoosa - MAATC,007-A-06,Open,3,1
+007,007 - Buridah - Almoosa - MAATC,007-J-01,Closed,62,36
+007,007 - Buridah - Almoosa - MAATC,007-J-02,Closed,44,34
+007,007 - Buridah - Almoosa - MAATC,007-J-03,Closed,35,21
+007,007 - Buridah - Almoosa - MAATC,007-S-1,Closed,190,42
+007,007 - Buridah - Almoosa - MAATC,007-S-11,Closed,80,46
+007,007 - Buridah - Almoosa - MAATC,007-S-14,Closed,74,41
+007,007 - Buridah - Almoosa - MAATC,007-S-15,Closed,77,49
+007,007 - Buridah - Almoosa - MAATC,007-S-16,Closed,12,5
+007,007 - Buridah - Almoosa - MAATC,007-S-17,Closed,12,5
+007,007 - Buridah - Almoosa - MAATC,007-S-18,Closed,12,5
+007,007 - Buridah - Almoosa - MAATC,007-S-19,Closed,46,23
+007,007 - Buridah - Almoosa - MAATC,007-S-6,Open,21,11
+007,007 - Buridah - Almoosa - MAATC,007-U-21,Closed,41,27
+007,007 - Buridah - Almoosa - MAATC,007-U-22,Closed,20,10
+011,011 - Hail - Almoosa - MAATC,011-A-01,Closed,8,4
+011,011 - Hail - Almoosa - MAATC,011-A-02,Closed,63,43
+011,011 - Hail - Almoosa - MAATC,011-A-03,Closed,86,45
+011,011 - Hail - Almoosa - MAATC,011-A-06,Open,4,2
+011,011 - Hail - Almoosa - MAATC,011-J-01,Closed,60,35
+011,011 - Hail - Almoosa - MAATC,011-J-02,Closed,48,36
+011,011 - Hail - Almoosa - MAATC,011-J-03,Closed,35,21
+011,011 - Hail - Almoosa - MAATC,011-U-1,Closed,187,41
+011,011 - Hail - Almoosa - MAATC,011-U-16,Closed,12,5
+011,011 - Hail - Almoosa - MAATC,011-U-17,Closed,12,5
+011,011 - Hail - Almoosa - MAATC,011-U-18,Closed,12,5
+011,011 - Hail - Almoosa - MAATC,011-U-19,Closed,46,23
+011,011 - Hail - Almoosa - MAATC,011-U-2,Open,21,11
+011,011 - Hail - Almoosa - MAATC,011-U-21,Closed,47,29
+011,011 - Hail - Almoosa - MAATC,011-U-22,Closed,21,11
+011,011 - Hail - Almoosa - MAATC,011-U-6,Closed,80,46
+011,011 - Hail - Almoosa - MAATC,011-U-7,Closed,80,50
+011,011 - Hail - Almoosa - MAATC,011-U-8,Closed,76,43
+019,019 - Geel Alnaka - MAATC,019-A-01,Closed,8,4
+019,019 - Geel Alnaka - MAATC,019-A-02,Closed,78,54
+019,019 - Geel Alnaka - MAATC,019-A-03,Closed,93,54
+019,019 - Geel Alnaka - MAATC,019-A-05,Open,4,2
+019,019 - Geel Alnaka - MAATC,019-J-01,Closed,76,46
+019,019 - Geel Alnaka - MAATC,019-J-02,Closed,72,54
+019,019 - Geel Alnaka - MAATC,019-J-03,Closed,41,25
+019,019 - Geel Alnaka - MAATC,019-S-1,Closed,211,42
+019,019 - Geel Alnaka - MAATC,019-S-10,Closed,11,6
+019,019 - Geel Alnaka - MAATC,019-S-11,Open,23,13
+019,019 - Geel Alnaka - MAATC,019-S-17,Closed,72,47
+019,019 - Geel Alnaka - MAATC,019-S-18,Closed,85,50
+019,019 - Geel Alnaka - MAATC,019-S-19,Closed,76,55
+019,019 - Geel Alnaka - MAATC,019-S-20,Closed,83,56
+019,019 - Geel Alnaka - MAATC,019-S-6,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-S-7,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-S-8,Closed,11,7
+019,019 - Geel Alnaka - MAATC,019-S-9,Closed,11,6
+019,019 - Geel Alnaka - MAATC,019-U-21,Closed,11,6
+019,019 - Geel Alnaka - MAATC,019-U-23,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-24,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-25,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-26,Closed,11,6
+019,019 - Geel Alnaka - MAATC,019-U-27,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-28,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-29,Closed,11,7
+019,019 - Geel Alnaka - MAATC,019-U-30,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-31,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-32,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-33,Closed,11,7
+019,019 - Geel Alnaka - MAATC,019-U-35,Closed,11,5
+019,019 - Geel Alnaka - MAATC,019-U-44,Closed,64,34
+019,019 - Geel Alnaka - MAATC,019-U-45,Closed,55,37
+019,019 - Geel Alnaka - MAATC,019-U-46,Closed,29,17
+028,028 - North of Buridah Almoosa - MAATC,028-A-01,Closed,8,4
+028,028 - North of Buridah Almoosa - MAATC,028-A-02,Closed,58,38
+028,028 - North of Buridah Almoosa - MAATC,028-A-03,Closed,77,42
+028,028 - North of Buridah Almoosa - MAATC,028-A-06,Open,4,2
+028,028 - North of Buridah Almoosa - MAATC,028-J-01,Closed,62,36
+028,028 - North of Buridah Almoosa - MAATC,028-J-02,Closed,44,34
+028,028 - North of Buridah Almoosa - MAATC,028-J-03,Closed,39,23
+028,028 - North of Buridah Almoosa - MAATC,028-S-1,Open,21,11
+028,028 - North of Buridah Almoosa - MAATC,028-S-11,Closed,81,48
+028,028 - North of Buridah Almoosa - MAATC,028-S-12,Closed,84,51
+028,028 - North of Buridah Almoosa - MAATC,028-S-13,Closed,76,43
+028,028 - North of Buridah Almoosa - MAATC,028-S-16,Closed,186,41
+028,028 - North of Buridah Almoosa - MAATC,028-S-6,Closed,12,5
+028,028 - North of Buridah Almoosa - MAATC,028-S-7,Closed,12,5
+028,028 - North of Buridah Almoosa - MAATC,028-S-8,Closed,12,5
+028,028 - North of Buridah Almoosa - MAATC,028-U-38,Closed,28,14
+028,028 - North of Buridah Almoosa - MAATC,028-U-39,Closed,46,29
+028,028 - North of Buridah Almoosa - MAATC,028-U-40,Closed,49,24
+031,031 - Al Mousa Tabuk - MAATC,031-A-01,Closed,8,4
+031,031 - Al Mousa Tabuk - MAATC,031-A-02,Closed,56,37
+031,031 - Al Mousa Tabuk - MAATC,031-A-03,Closed,74,41
+031,031 - Al Mousa Tabuk - MAATC,031-A-06,Open,4,2
+031,031 - Al Mousa Tabuk - MAATC,031-J-01,Closed,58,35
+031,031 - Al Mousa Tabuk - MAATC,031-J-02,Closed,42,32
+031,031 - Al Mousa Tabuk - MAATC,031-J-03,Closed,33,20
+031,031 - Al Mousa Tabuk - MAATC,031-U-1,Closed,156,40
+031,031 - Al Mousa Tabuk - MAATC,031-U-12,Open,21,11
+031,031 - Al Mousa Tabuk - MAATC,031-U-16,Closed,12,5
+031,031 - Al Mousa Tabuk - MAATC,031-U-17,Closed,12,5
+031,031 - Al Mousa Tabuk - MAATC,031-U-18,Closed,12,5
+031,031 - Al Mousa Tabuk - MAATC,031-U-19,Closed,47,23
+031,031 - Al Mousa Tabuk - MAATC,031-U-21,Closed,43,27
+031,031 - Al Mousa Tabuk - MAATC,031-U-22,Closed,21,11
+031,031 - Al Mousa Tabuk - MAATC,031-U-6,Closed,84,53
+031,031 - Al Mousa Tabuk - MAATC,031-U-7,Closed,84,47
+031,031 - Al Mousa Tabuk - MAATC,031-U-8,Closed,51,30
+033,033 - Sample Location - MAATC,033SAMPLE,Closed,5,5
+033,033 - Sample Location - MAATC,033SAMPLE-02,Closed,29,29
+033,033 - Sample Location - MAATC,033SAMPLE-03,Closed,51,51
+033,033 - Sample Location - MAATC,033SAMPLE12,Open,3,3
+033,033 - Sample Location - MAATC,033SAMPLE19,Closed,13,13
+033,033 - Sample Location - MAATC,033SAPLE-001,Closed,21,21
+033,033 - Sample Location - MAATC,033SMAPLE7,Closed,5,5
+033,033 - Sample Location - MAATC,33SAMPLE26,Closed,13,13
+034,034 - Lacaly Jeddah - MAATC,034-A-01,Closed,8,4
+034,034 - Lacaly Jeddah - MAATC,034-A-02,Closed,77,49
+034,034 - Lacaly Jeddah - MAATC,034-A-03,Closed,85,49
+034,034 - Lacaly Jeddah - MAATC,034-A-06,Open,4,2
+034,034 - Lacaly Jeddah - MAATC,034-J-01,Closed,70,43
+034,034 - Lacaly Jeddah - MAATC,034-J-02,Closed,75,53
+034,034 - Lacaly Jeddah - MAATC,034-J-03,Closed,51,33
+034,034 - Lacaly Jeddah - MAATC,034-J-04,Closed,37,21
+034,034 - Lacaly Jeddah - MAATC,034-J-05,Closed,31,17
+034,034 - Lacaly Jeddah - MAATC,034-U-1,Closed,43,13
+034,034 - Lacaly Jeddah - MAATC,034-U-10,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-11,Closed,83,50
+034,034 - Lacaly Jeddah - MAATC,034-U-12,Closed,80,50
+034,034 - Lacaly Jeddah - MAATC,034-U-13,Closed,79,46
+034,034 - Lacaly Jeddah - MAATC,034-U-14,Closed,81,48
+034,034 - Lacaly Jeddah - MAATC,034-U-16,Closed,65,33
+034,034 - Lacaly Jeddah - MAATC,034-U-17,Open,24,13
+034,034 - Lacaly Jeddah - MAATC,034-U-2,Closed,120,35
+034,034 - Lacaly Jeddah - MAATC,034-U-21,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-22,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-23,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-24,Closed,11,5
+034,034 - Lacaly Jeddah - MAATC,034-U-25,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-26,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-27,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-28,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-29,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-30,Closed,12,7
+034,034 - Lacaly Jeddah - MAATC,034-U-31,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-32,Closed,12,7
+034,034 - Lacaly Jeddah - MAATC,034-U-33,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-34,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-35,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-36,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-37,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-38,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-39,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-40,Closed,12,5
+034,034 - Lacaly Jeddah - MAATC,034-U-6,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-7,Closed,12,7
+034,034 - Lacaly Jeddah - MAATC,034-U-8,Closed,12,6
+034,034 - Lacaly Jeddah - MAATC,034-U-9,Closed,12,5
+035,035 - Lacali - MAATC,035-A-01,Closed,8,4
+035,035 - Lacali - MAATC,035-A-02,Closed,73,47
+035,035 - Lacali - MAATC,035-A-03,Closed,88,51
+035,035 - Lacali - MAATC,035-A-06,Open,4,2
+035,035 - Lacali - MAATC,035-J-01,Closed,68,42
+035,035 - Lacali - MAATC,035-J-02,Closed,70,50
+035,035 - Lacali - MAATC,035-J-03,Closed,33,19
+035,035 - Lacali - MAATC,035-U-1,Closed,84,48
+035,035 - Lacali - MAATC,035-U-15,Closed,218,42
+035,035 - Lacali - MAATC,035-U-16,Closed,12,5
+035,035 - Lacali - MAATC,035-U-17,Closed,12,5
+035,035 - Lacali - MAATC,035-U-18,Closed,12,5
+035,035 - Lacali - MAATC,035-U-19,Closed,12,6
+035,035 - Lacali - MAATC,035-U-20,Closed,12,5
+035,035 - Lacali - MAATC,035-U-21,Closed,12,7
+035,035 - Lacali - MAATC,035-U-22,Closed,12,5
+035,035 - Lacali - MAATC,035-U-23,Closed,12,6
+035,035 - Lacali - MAATC,035-U-24,Closed,12,7
+035,035 - Lacali - MAATC,035-U-25,Closed,12,7
+035,035 - Lacali - MAATC,035-U-26,Closed,12,5
+035,035 - Lacali - MAATC,035-U-27,Closed,12,5
+035,035 - Lacali - MAATC,035-U-28,Closed,12,6
+035,035 - Lacali - MAATC,035-U-29,Closed,12,6
+035,035 - Lacali - MAATC,035-U-3,Closed,76,45
+035,035 - Lacali - MAATC,035-U-30,Closed,12,5
+035,035 - Lacali - MAATC,035-U-31,Closed,12,5
+035,035 - Lacali - MAATC,035-U-32,Closed,12,5
+035,035 - Lacali - MAATC,035-U-33,Closed,12,5
+035,035 - Lacali - MAATC,035-U-34,Closed,11,4
+035,035 - Lacali - MAATC,035-U-35,Closed,11,6
+035,035 - Lacali - MAATC,035-U-36,Closed,11,6
+035,035 - Lacali - MAATC,035-U-37,Closed,11,4
+035,035 - Lacali - MAATC,035-U-38,Closed,11,4
+035,035 - Lacali - MAATC,035-U-39,Closed,11,4
+035,035 - Lacali - MAATC,035-U-4,Closed,79,51
+035,035 - Lacali - MAATC,035-U-40,Closed,11,4
+035,035 - Lacali - MAATC,035-U-41,Closed,11,4
+035,035 - Lacali - MAATC,035-U-43,Closed,64,33
+035,035 - Lacali - MAATC,035-U-46,Closed,31,17
+035,035 - Lacali - MAATC,035-U-47,Closed,52,34
+035,035 - Lacali - MAATC,035-U-5,Closed,81,50
+035,035 - Lacali - MAATC,035-U-6,Open,23,13
+036,036 - Lacaly Dareen Mall - MAATC,036-A-01,Closed,8,4
+036,036 - Lacaly Dareen Mall - MAATC,036-A-02,Closed,69,45
+036,036 - Lacaly Dareen Mall - MAATC,036-A-03,Closed,78,46
+036,036 - Lacaly Dareen Mall - MAATC,036-A-04,Closed,5,3
+036,036 - Lacaly Dareen Mall - MAATC,036-A-05,Open,4,2
+036,036 - Lacaly Dareen Mall - MAATC,036-J-01,Closed,67,42
+036,036 - Lacaly Dareen Mall - MAATC,036-J-02,Closed,70,50
+036,036 - Lacaly Dareen Mall - MAATC,036-J-03,Closed,34,20
+036,036 - Lacaly Dareen Mall - MAATC,036-J-20,Closed,56,30
+036,036 - Lacaly Dareen Mall - MAATC,036-U-1,Closed,83,51
+036,036 - Lacaly Dareen Mall - MAATC,036-U-10,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-16,Open,22,12
+036,036 - Lacaly Dareen Mall - MAATC,036-U-19,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-20,Closed,205,41
+036,036 - Lacaly Dareen Mall - MAATC,036-U-21,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-22,Closed,12,7
+036,036 - Lacaly Dareen Mall - MAATC,036-U-23,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-24,Closed,12,7
+036,036 - Lacaly Dareen Mall - MAATC,036-U-25,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-26,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-27,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-28,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-29,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-3,Closed,63,36
+036,036 - Lacaly Dareen Mall - MAATC,036-U-30,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-31,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-32,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-33,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-34,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-35,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-36,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-37,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-38,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-39,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-4,Closed,83,47
+036,036 - Lacaly Dareen Mall - MAATC,036-U-40,Closed,12,6
+036,036 - Lacaly Dareen Mall - MAATC,036-U-46,Closed,31,17
+036,036 - Lacaly Dareen Mall - MAATC,036-U-47,Closed,50,32
+036,036 - Lacaly Dareen Mall - MAATC,036-U-5,Closed,88,56
+036,036 - Lacaly Dareen Mall - MAATC,036-U-6,Closed,12,7
+036,036 - Lacaly Dareen Mall - MAATC,036-U-7,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-8,Closed,12,5
+036,036 - Lacaly Dareen Mall - MAATC,036-U-9,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,002-S-12,Closed,82,47
+037,037 - Lacaly AlMahmal - MAATC,019-U-34,Closed,11,4
+037,037 - Lacaly AlMahmal - MAATC,019-U-36,Closed,11,6
+037,037 - Lacaly AlMahmal - MAATC,019-U-37,Closed,11,4
+037,037 - Lacaly AlMahmal - MAATC,019-U-38,Closed,11,4
+037,037 - Lacaly AlMahmal - MAATC,019-U-39,Closed,11,6
+037,037 - Lacaly AlMahmal - MAATC,019-U-40,Closed,11,4
+037,037 - Lacaly AlMahmal - MAATC,019-U-41,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,019-U-42,Closed,11,4
+037,037 - Lacaly AlMahmal - MAATC,019-U-43,Closed,8,8
+037,037 - Lacaly AlMahmal - MAATC,037-A-01,Closed,8,4
+037,037 - Lacaly AlMahmal - MAATC,037-A-02,Closed,69,45
+037,037 - Lacaly AlMahmal - MAATC,037-A-03,Closed,76,44
+037,037 - Lacaly AlMahmal - MAATC,037-A-04,Closed,5,3
+037,037 - Lacaly AlMahmal - MAATC,037-A-20,Open,1,1
+037,037 - Lacaly AlMahmal - MAATC,037-J-01,Closed,64,40
+037,037 - Lacaly AlMahmal - MAATC,037-J-02,Closed,69,49
+037,037 - Lacaly AlMahmal - MAATC,037-J-03,Closed,34,20
+037,037 - Lacaly AlMahmal - MAATC,037-U-1,Closed,139,41
+037,037 - Lacaly AlMahmal - MAATC,037-U-16,Closed,84,53
+037,037 - Lacaly AlMahmal - MAATC,037-U-17,Closed,80,51
+037,037 - Lacaly AlMahmal - MAATC,037-U-18,Closed,63,36
+037,037 - Lacaly AlMahmal - MAATC,037-U-21,Closed,12,6
+037,037 - Lacaly AlMahmal - MAATC,037-U-22,Closed,12,7
+037,037 - Lacaly AlMahmal - MAATC,037-U-23,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-24,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-25,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-26,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-27,Closed,12,6
+037,037 - Lacaly AlMahmal - MAATC,037-U-28,Closed,12,6
+037,037 - Lacaly AlMahmal - MAATC,037-U-29,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-30,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-31,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-32,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-33,Closed,12,7
+037,037 - Lacaly AlMahmal - MAATC,037-U-34,Closed,12,7
+037,037 - Lacaly AlMahmal - MAATC,037-U-35,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-36,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-37,Closed,12,6
+037,037 - Lacaly AlMahmal - MAATC,037-U-38,Closed,12,5
+037,037 - Lacaly AlMahmal - MAATC,037-U-39,Closed,54,28
+037,037 - Lacaly AlMahmal - MAATC,037-U-46,Closed,31,17
+037,037 - Lacaly AlMahmal - MAATC,037-U-47,Closed,51,32
+037,037 - Lacaly AlMahmal - MAATC,037-U-6,Open,23,12
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY-001,Open,501,71
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY-04,Closed,109,9
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY038,Closed,85,10
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY17,Closed,117,17
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY19,Closed,3,1
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY2,Closed,212,32
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY33,Open,11,6
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY55,Open,1,1
+WH-MAIN,WH-MAIN (Warehouse Putaway),PUTAWAY71,Closed,329,41

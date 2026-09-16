@@ -7,5 +7,5 @@
  * Note: Once a user saves settings, these defaults will NOT override their saved values.
  */
 
-export const DEFAULT_API_URL = ""; // Set your default API URL here, e.g., "http://192.168.1.100:3000"
+export const DEFAULT_API_URL = "http://192.168.103.219:3000";
 export const DEFAULT_DEMO_MODE = 0; // 0 = off, 1 = on
