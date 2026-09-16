@@ -436,6 +436,80 @@ export default function PickingScanCartonScreen() {
     }
   };
 
+  const handleChangeBinLocation = () => {
+    Alert.alert(
+      "Change Bin Location",
+      "Scan a different bin for the remaining items?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Change",
+          onPress: async () => {
+            try {
+              const session = await pickingSessionService.loadSession(
+                materialRequestTitle
+              );
+              if (session) {
+                await pickingSessionService.saveSession({
+                  ...session,
+                  bin_location: null,
+                  carton_id: null,
+                  updated_at: new Date().toISOString(),
+                });
+              }
+            } catch (error: any) {
+              console.warn(
+                "⚠️ Failed to clear bin from picking session:",
+                error?.message || error
+              );
+            }
+            (navigation as any).navigate("PickingScanBin", {
+              materialRequestTitle,
+              sessionId,
+            });
+          },
+        },
+      ]
+    );
+  };
+
+  const handleChangeCartonId = () => {
+    Alert.alert(
+      "Change Carton ID",
+      "Scan a different carton at this bin?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Change",
+          onPress: async () => {
+            setCartonId("");
+            setCartonInfo(null);
+            setCartonValidated(false);
+            cartonInputRef.current?.clear();
+            try {
+              const session = await pickingSessionService.loadSession(
+                materialRequestTitle
+              );
+              if (session) {
+                await pickingSessionService.saveSession({
+                  ...session,
+                  carton_id: null,
+                  updated_at: new Date().toISOString(),
+                });
+              }
+            } catch (error: any) {
+              console.warn(
+                "⚠️ Failed to clear carton from picking session:",
+                error?.message || error
+              );
+            }
+            setTimeout(() => cartonInputRef.current?.focus(), 200);
+          },
+        },
+      ]
+    );
+  };
+
   // Navigate to next screen after carton is validated
   const handleContinue = async () => {
     if (!cartonId || !cartonId.trim()) {
@@ -515,7 +589,32 @@ export default function PickingScanCartonScreen() {
       </View>
 
       <View style={styles.infoSection}>
-        <Text style={styles.binText}>Bin: {binLocation || "N/A"}</Text>
+        <View style={styles.binLocationRow}>
+          <Text style={styles.binText} numberOfLines={2}>
+            Bin: {binLocation || "N/A"}
+          </Text>
+          {binLocation ? (
+            <TouchableOpacity
+              style={styles.changeLocationButton}
+              onPress={handleChangeBinLocation}
+            >
+              <Text style={styles.changeLocationButtonText}>Change Location</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+        {cartonValidated && cartonId ? (
+          <View style={styles.cartonLocationRow}>
+            <Text style={styles.cartonSummaryText} numberOfLines={2}>
+              CTN: {cartonId}
+            </Text>
+            <TouchableOpacity
+              style={styles.changeCartonButton}
+              onPress={handleChangeCartonId}
+            >
+              <Text style={styles.changeCartonButtonText}>Change Carton</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
         <View style={styles.taskBadge}>
           <Text style={styles.taskText}>Task: {taskId}</Text>
         </View>
@@ -620,10 +719,57 @@ const styles = StyleSheet.create({
     paddingHorizontal: PickingTheme.spacing.lg,
     paddingBottom: PickingTheme.spacing.md,
   },
+  binLocationRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: PickingTheme.spacing.sm,
+    marginBottom: PickingTheme.spacing.sm,
+  },
+  cartonLocationRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: PickingTheme.spacing.sm,
+    marginBottom: PickingTheme.spacing.sm,
+  },
   binText: {
     ...PickingTheme.typography.h1,
     color: PickingTheme.colors.textWhite,
-    marginBottom: PickingTheme.spacing.sm,
+    flex: 1,
+    fontSize: 18,
+  },
+  cartonSummaryText: {
+    ...PickingTheme.typography.body,
+    color: PickingTheme.colors.textWhite,
+    flex: 1,
+    fontWeight: "600",
+  },
+  changeLocationButton: {
+    backgroundColor: "rgba(255, 255, 255, 0.3)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.5)",
+  },
+  changeLocationButtonText: {
+    color: PickingTheme.colors.textWhite,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  changeCartonButton: {
+    backgroundColor: "rgba(255, 255, 255, 0.3)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.5)",
+  },
+  changeCartonButtonText: {
+    color: PickingTheme.colors.textWhite,
+    fontSize: 12,
+    fontWeight: "600",
   },
   taskBadge: {
     backgroundColor: "rgba(255,255,255,0.2)",
